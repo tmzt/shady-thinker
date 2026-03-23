@@ -1,7 +1,8 @@
 const ROPE_THETA: f32 = 10000000.0;
-const MROPE_S1_LIMIT: u32 = 16u;
-const MROPE_S2_LIMIT: u32 = 16u;
-const PARTIAL_DIM: u32 = 32u;
+const MROPE_S1_LIMIT: u32 = 11u;
+const MROPE_S2_LIMIT: u32 = 22u;
+const PARTIAL_DIM: u32 = 64u;
+const MROPE_INTERLEAVED: bool = true;
 
 // Fused Q/gate split, Q/K RMSNorm, mRoPE positional encoding, and KV cache write.
 // Dispatch: (num_heads + num_kv_heads, 1, 1)
@@ -46,16 +47,17 @@ fn get_norm_weight(p: u32) -> f32 {
     return unpack_bf16(packed_u32, bf16_in_u32);
 }
 
-fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32, partial_half: u32) -> vec2<f32> {
+// Apply mRoPE rotation to a pair of values at the given frequency index.
+// Contiguous section selection: [0, S1) → temporal, [S1, S2) → height, [S2, ..) → width
+fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32) -> vec2<f32> {
     let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(freq_idx) / f32(PARTIAL_DIM));
 
-    // Select position based on mRoPE section
-    var pos: u32 = params.position;
-    let section = freq_idx % 3u;
-    if (section == 1u && freq_idx < MROPE_S1_LIMIT) {
-        pos = params.position_h;
-    } else if (section == 2u && freq_idx < MROPE_S2_LIMIT) {
-        pos = params.position_w;
+    // Select position based on mRoPE section (contiguous ranges)
+    var pos: u32 = params.position;       // default: temporal
+    if (freq_idx >= MROPE_S1_LIMIT && freq_idx < MROPE_S2_LIMIT) {
+        pos = params.position_h;          // height section
+    } else if (freq_idx >= MROPE_S2_LIMIT) {
+        pos = params.position_w;          // width section
     }
 
     let angle = f32(pos) * freq;
@@ -65,6 +67,37 @@ fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32, partial_half: u32) -> vec2
     let out_a = val_a * cos_a - val_b * sin_a;
     let out_b = val_b * cos_a + val_a * sin_a;
     return vec2<f32>(out_a, out_b);
+}
+
+// Apply mRoPE to the values in wg_vals using either interleaved or non-interleaved pairing.
+fn apply_mrope_to_wg(tid: u32) {
+    let partial_half = PARTIAL_DIM / 2u;
+
+    if (MROPE_INTERLEAVED) {
+        // Interleaved: pairs are (2*d, 2*d+1) for d in [0, partial_half)
+        var d = tid;
+        while (d < partial_half) {
+            let idx_a = 2u * d;
+            let idx_b = 2u * d + 1u;
+            let a = wg_vals[idx_a];
+            let b = wg_vals[idx_b];
+            let rotated = apply_mrope(a, b, d);
+            wg_vals[idx_a] = rotated.x;
+            wg_vals[idx_b] = rotated.y;
+            d += 256u;
+        }
+    } else {
+        // Non-interleaved: pairs are (d, d + partial_half)
+        var d = tid;
+        while (d < partial_half) {
+            let a = wg_vals[d];
+            let b = wg_vals[d + partial_half];
+            let rotated = apply_mrope(a, b, d);
+            wg_vals[d] = rotated.x;
+            wg_vals[d + partial_half] = rotated.y;
+            d += 256u;
+        }
+    }
 }
 
 @compute @workgroup_size(256)
@@ -124,17 +157,7 @@ fn main(
         workgroupBarrier();
 
         // Step 3: mRoPE on Q
-        let partial_half = PARTIAL_DIM / 2u;
-        d = tid;
-        while (d < partial_half) {
-            let freq_idx = d;
-            let a = wg_vals[d];
-            let b = wg_vals[d + partial_half];
-            let rotated = apply_mrope(a, b, freq_idx, partial_half);
-            wg_vals[d] = rotated.x;
-            wg_vals[d + partial_half] = rotated.y;
-            d += 256u;
-        }
+        apply_mrope_to_wg(tid);
         workgroupBarrier();
 
         // Step 4: Write to q_proj and q_gate output buffers
@@ -185,17 +208,7 @@ fn main(
         workgroupBarrier();
 
         // Step 2: mRoPE on K
-        let partial_half = PARTIAL_DIM / 2u;
-        d = tid;
-        while (d < partial_half) {
-            let freq_idx = d;
-            let a = wg_vals[d];
-            let b = wg_vals[d + partial_half];
-            let rotated = apply_mrope(a, b, freq_idx, partial_half);
-            wg_vals[d] = rotated.x;
-            wg_vals[d + partial_half] = rotated.y;
-            d += 256u;
-        }
+        apply_mrope_to_wg(tid);
         workgroupBarrier();
 
         // Step 3: Write K to k_proj (in-place) and k_cache

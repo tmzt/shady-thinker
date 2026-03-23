@@ -123,12 +123,28 @@ pub struct ModelConfig {
     pub linear_value_head_dim: u32,
     #[serde(default = "default_linear_num_value_heads")]
     pub linear_num_value_heads: u32,
+    // mRoPE config (from rope_parameters in config.json)
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+    #[serde(default = "default_partial_rotary_factor")]
+    pub partial_rotary_factor: f32,
     #[serde(default)]
     pub text_config: Option<Box<ModelConfig>>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub mrope_interleaved: bool,
+    #[serde(default)]
+    pub mrope_section: Vec<u32>,
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
+}
+
 fn default_head_dim() -> u32 { 128 }
 fn default_rms_norm_eps() -> f32 { 1e-6 }
+fn default_partial_rotary_factor() -> f32 { 0.25 }
 fn default_linear_num_key_heads() -> u32 { 16 }
 fn default_linear_key_dim() -> u32 { 128 }
 fn default_linear_value_dim() -> u32 { 128 }
@@ -163,7 +179,35 @@ impl ModelConfig {
                 }
             }
         }
+        // Resolve rope_theta from rope_parameters if present
+        if let Some(ref rp) = config.rope_parameters {
+            if let Some(theta) = rp.rope_theta {
+                config.rope_theta = theta;
+            }
+        }
         config
+    }
+
+    /// Get mRoPE section boundaries as cumulative sums.
+    /// Returns (s1_limit, s2_limit) for contiguous section selection.
+    /// Default: sections [11, 11, 10] → limits (11, 22).
+    pub fn mrope_sections(&self) -> (u32, u32) {
+        if let Some(ref rp) = self.rope_parameters {
+            if rp.mrope_section.len() >= 3 {
+                let s1 = rp.mrope_section[0];
+                let s2 = rp.mrope_section[0] + rp.mrope_section[1];
+                return (s1, s2);
+            }
+        }
+        // Default for Qwen3.5
+        (11, 22)
+    }
+
+    /// Whether mRoPE uses interleaved rotation pairs (2d, 2d+1) vs (d, d+partial_half).
+    pub fn mrope_interleaved(&self) -> bool {
+        self.rope_parameters
+            .as_ref()
+            .map_or(true, |rp| rp.mrope_interleaved)
     }
 }
 

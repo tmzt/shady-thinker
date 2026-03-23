@@ -8,7 +8,7 @@ test-unit:
 
 # Run integration tests (requires model weights in MODEL_DIR)
 test-integration:
-	MODEL_DIR=$(MODEL_DIR) cargo test --features jit-lora --test jit_lora_test -- --nocapture
+	MODEL_DIR=$(MODEL_DIR) cargo test --features jit-lora --test jit_lora_test -- --nocapture --test-threads=1
 
 # Run all tests
 test: test-unit test-integration

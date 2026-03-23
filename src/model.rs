@@ -30,19 +30,23 @@ mod shaders {
 
 /// Build the fused_split_qknorm_kvstore shader source with model-specific constants.
 fn build_qknorm_shader(config: &ModelConfig) -> String {
-    let partial_dim = (config.head_dim as f32 * 0.25) as u32; // partial_rotary_factor=0.25
+    let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
+    let (s1_limit, s2_limit) = config.mrope_sections();
+    let interleaved = config.mrope_interleaved();
     format!(
         "const ROPE_THETA: f32 = {:.1};\n\
          const MROPE_S1_LIMIT: u32 = {}u;\n\
          const MROPE_S2_LIMIT: u32 = {}u;\n\
-         const PARTIAL_DIM: u32 = {}u;\n\n{}",
+         const PARTIAL_DIM: u32 = {}u;\n\
+         const MROPE_INTERLEAVED: bool = {};\n\n{}",
         config.rope_theta,
-        partial_dim / 2,  // mRoPE section 1 limit
-        partial_dim / 2,  // mRoPE section 2 limit (adjusted per model)
+        s1_limit,
+        s2_limit,
         partial_dim,
+        interleaved,
         include_str!("shaders/fused_split_qknorm_kvstore.wgsl")
             .lines()
-            .skip(4) // skip the hardcoded const lines
+            .skip(5) // skip the hardcoded const lines (now 5 lines)
             .collect::<Vec<_>>()
             .join("\n"),
     )
