@@ -14,6 +14,11 @@ jit-lora = []
 name = "chat"
 required-features = ["jit-lora"]
 
+[[test]]
+name = "jit_lora_test"
+path = "tests/integration/jit_lora_test.rs"
+required-features = ["jit-lora"]
+
 [dependencies]
 wgpu = "24"
 pollster = "0.4"
