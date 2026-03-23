@@ -428,11 +428,13 @@ impl TrainState {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct GaP { in_features: u32, rank: u32, out_features: u32, scale: f32 }
 
-        // TODO: train all 4 targets once GPU hang is debugged
-        for t in &targets[3..4] { // only down_proj for now
+        // Only train down_proj for now: lora_hidden is a shared scratch buffer
+        // that only holds the last target's down-projection. Training other targets
+        // would need per-target hidden state caching during the forward pass.
+        for t in &targets[3..4] {
             let train_target = &self.targets[last_layer][t.idx];
 
-            // Zero gradients using a shared zero buffer (avoid repeated allocation)
+            // Zero gradients
             let a_size = (t.in_f * rank) as usize * 4;
             let b_size = (rank * t.out_f) as usize * 4;
             let max_size = a_size.max(b_size);
@@ -466,6 +468,9 @@ impl TrainState {
                 gpu::bind(3, &train_target.grad_a),
                 gpu::bind(4, &self.params),
             ], (t.in_f.div_ceil(32), rank, 1));
+
+            // Flush after each target to prevent command buffer buildup
+            gpu.flush();
         }
     }
 
@@ -495,11 +500,11 @@ impl TrainState {
             (inter, h),       // down_proj
         ];
 
-        // TODO: train all 4 targets once GPU hang is debugged
-        for target in 3..4 { // only down_proj for now
+        for target in 3..4 {
             let (in_f, out_f) = target_dims[target];
             self.dispatch_adam(gpu, model, last_layer, target, true, in_f * rank, beta1_t, beta2_t);
             self.dispatch_adam(gpu, model, last_layer, target, false, rank * out_f, beta1_t, beta2_t);
+            gpu.flush();
         }
     }
 
@@ -607,8 +612,7 @@ impl TrainState {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct FmaP { num_elements: u32, lambda: f32 }
 
-        // TODO: train all 4 targets once GPU hang is debugged
-        for t in 3..4 { // only down_proj for now
+        for t in 3..4 {
             let (in_f, out_f) = target_dims[t];
 
             // Blend anchor into grad_a
@@ -634,6 +638,7 @@ impl TrainState {
                 gpu::bind(1, &anchor.targets[last_layer][t].anchor_b),
                 gpu::bind(2, &anchor.params),
             ], (b_size.div_ceil(256), 1, 1));
+            gpu.flush();
         }
 
         anchor.stale_steps += 1;
