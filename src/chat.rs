@@ -1007,6 +1007,54 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_path);
     }
 
+    /// End-to-end test: verify the model doesn't already know a novel fact,
+    /// then learn it via extract → train, then verify recall.
+    ///
+    /// Uses "Blobly" — which appears as a few-shot example in the extraction
+    /// prompt but the model should NOT know what it is before training.
+    #[test]
+    #[ignore]
+    fn test_extract_learn_recall_blobly() {
+        let model_dir =
+            std::env::var("MODEL_DIR").expect("Set MODEL_DIR to run this test");
+
+        let mut session = ChatSession::new_with_extractor(
+            PathBuf::from(model_dir),
+            64,
+            None,
+            Box::new(RegexFactExtractor),
+        );
+
+        // Step 1: Ask about Blobly BEFORE learning — model should not know
+        let before = session.generate("What is Blobly?", None);
+        let before_lower = before.text.to_lowercase();
+        let knew_before = before_lower.contains("waterpark")
+            && before_lower.contains("wisconsin");
+        // Not a hard assert — the model might hallucinate — but log it
+        eprintln!(
+            "[blobly pre-train] knew_before={}, response: {:?}",
+            knew_before, before.text
+        );
+
+        // Step 2: Learn the fact via structured Q/A
+        let learn = session.learn_from_message(
+            "Q: What is Blobly?\nA: Blobly is a waterpark in Wisconsin",
+        );
+        assert!(learn.trained, "Should have extracted and trained on the fact");
+        assert_eq!(learn.pairs.len(), 1);
+        assert_eq!(learn.pairs[0].0, "What is Blobly?");
+        assert_eq!(learn.pairs[0].1, "Blobly is a waterpark in Wisconsin");
+
+        // Step 3: Ask again AFTER learning — model should recall
+        let after = session.generate("What is Blobly?", None);
+        let after_lower = after.text.to_lowercase();
+        assert!(
+            after_lower.contains("waterpark") || after_lower.contains("wisconsin"),
+            "Expected recall of 'waterpark in Wisconsin' after learning, got: {}",
+            after.text
+        );
+    }
+
     #[test]
     #[ignore]
     fn test_learn_with_regex_extractor() {
