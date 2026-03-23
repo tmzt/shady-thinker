@@ -39,6 +39,7 @@ fn unpack_bf16(packed: u32, idx: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
 }
 
+// Access BF16 norm weight at flat index p from the packed uniform array.
 fn get_norm_weight(p: u32) -> f32 {
     let vec_idx = p / 8u;
     let u32_in_vec = (p / 2u) % 4u;
@@ -47,17 +48,19 @@ fn get_norm_weight(p: u32) -> f32 {
     return unpack_bf16(packed_u32, bf16_in_u32);
 }
 
-// Apply mRoPE rotation to a pair of values at the given frequency index.
-// Contiguous section selection: [0, S1) → temporal, [S1, S2) → height, [S2, ..) → width
+// Apply mRoPE rotation to a pair of values.
+// Section selection: interleaved modulo-3 assignment:
+//   freq_idx % 3 == 1 && freq_idx < S1_LIMIT → height
+//   freq_idx % 3 == 2 && freq_idx < S2_LIMIT → width
+//   else → temporal (default)
 fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32) -> vec2<f32> {
     let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(freq_idx) / f32(PARTIAL_DIM));
 
-    // Select position based on mRoPE section (contiguous ranges)
-    var pos: u32 = params.position;       // default: temporal
-    if (freq_idx >= MROPE_S1_LIMIT && freq_idx < MROPE_S2_LIMIT) {
-        pos = params.position_h;          // height section
-    } else if (freq_idx >= MROPE_S2_LIMIT) {
-        pos = params.position_w;          // width section
+    var pos: u32 = params.position;
+    if ((freq_idx % 3u) == 1u && freq_idx < MROPE_S1_LIMIT) {
+        pos = params.position_h;
+    } else if ((freq_idx % 3u) == 2u && freq_idx < MROPE_S2_LIMIT) {
+        pos = params.position_w;
     }
 
     let angle = f32(pos) * freq;
@@ -69,7 +72,7 @@ fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32) -> vec2<f32> {
     return vec2<f32>(out_a, out_b);
 }
 
-// Apply mRoPE to the values in wg_vals using either interleaved or non-interleaved pairing.
+// Apply mRoPE to values in wg_vals.
 fn apply_mrope_to_wg(tid: u32) {
     let partial_half = PARTIAL_DIM / 2u;
 
@@ -87,7 +90,7 @@ fn apply_mrope_to_wg(tid: u32) {
             d += 256u;
         }
     } else {
-        // Non-interleaved: pairs are (d, d + partial_half)
+        // Non-interleaved (rotate_half): pairs are (d, d + partial_half)
         var d = tid;
         while (d < partial_half) {
             let a = wg_vals[d];
@@ -116,14 +119,15 @@ fn main(
     if (is_q_head) {
         // ===================== Q HEAD PROCESSING =====================
         let h = wg_id.x;
+        let src_off = h * head_dim * 2u;
 
-        // Step 1: Split interleaved Q+gate and accumulate sum of squares
+        // Step 1: Split Q+gate (contiguous blocks: Q[0..hd], gate[hd..2*hd])
+        // and accumulate sum of squares for Q norm
         var sum_sq: f32 = 0.0;
         var d = tid;
         while (d < head_dim) {
-            let base = h * head_dim * 2u;
-            let q_val = q_proj_full[base + 2u * d];
-            let gate_val = q_proj_full[base + 2u * d + 1u];
+            let q_val = q_proj_full[src_off + d];
+            let gate_val = q_proj_full[src_off + head_dim + d];
             wg_vals[d] = q_val;
             wg_gate[d] = gate_val;
             sum_sq += q_val * q_val;
@@ -147,7 +151,7 @@ fn main(
         workgroupBarrier();
 
         // Apply RMSNorm with (1 + weight) scaling
-        // Q norm weights are at BF16 positions [0, head_dim)
+        // Q norm weights at BF16 positions [0, head_dim) (shared across all Q heads)
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(d);
@@ -171,6 +175,7 @@ fn main(
     } else {
         // ===================== K HEAD PROCESSING =====================
         let kh = wg_id.x - num_heads;
+        if (kh >= num_kv_heads) { return; }
 
         // Step 1: RMSNorm on K — accumulate sum of squares
         var sum_sq: f32 = 0.0;
@@ -198,7 +203,7 @@ fn main(
         workgroupBarrier();
 
         // Apply RMSNorm with (1 + weight) scaling
-        // K norm weights are at BF16 positions [head_dim, 2*head_dim)
+        // K norm weights at BF16 positions [head_dim, 2*head_dim) (shared across all KV heads)
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(head_dim + d);
@@ -211,18 +216,13 @@ fn main(
         apply_mrope_to_wg(tid);
         workgroupBarrier();
 
-        // Step 3: Write K to k_proj (in-place) and k_cache
+        // Step 3: Write K to k_proj (in-place) and k_cache, write V to v_cache
         let cache_off = params.cache_position * num_kv_heads * head_dim + kh * head_dim;
         d = tid;
         while (d < head_dim) {
-            k_proj[kh * head_dim + d] = wg_vals[d];
-            k_cache[cache_off + d] = wg_vals[d];
-            d += 256u;
-        }
-
-        // Step 4: Write v_proj to v_cache (no norm/RoPE for V)
-        d = tid;
-        while (d < head_dim) {
+            let k_val = wg_vals[d];
+            k_proj[kh * head_dim + d] = k_val;
+            k_cache[cache_off + d] = k_val;
             v_cache[cache_off + d] = v_proj[kh * head_dim + d];
             d += 256u;
         }

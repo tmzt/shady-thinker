@@ -31,8 +31,9 @@ mod shaders {
 /// Build the fused_split_qknorm_kvstore shader source with model-specific constants.
 fn build_qknorm_shader(config: &ModelConfig) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
-    let (s1_limit, s2_limit) = config.mrope_sections();
     let interleaved = config.mrope_interleaved();
+    // mRoPE section limits for modulo-3 interleaved selection
+    let s_limit = partial_dim / 2;
     format!(
         "const ROPE_THETA: f32 = {:.1};\n\
          const MROPE_S1_LIMIT: u32 = {}u;\n\
@@ -40,8 +41,8 @@ fn build_qknorm_shader(config: &ModelConfig) -> String {
          const PARTIAL_DIM: u32 = {}u;\n\
          const MROPE_INTERLEAVED: bool = {};\n\n{}",
         config.rope_theta,
-        s1_limit,
-        s2_limit,
+        s_limit,
+        s_limit,
         partial_dim,
         interleaved,
         include_str!("shaders/fused_split_qknorm_kvstore.wgsl")
