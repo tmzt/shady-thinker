@@ -1,7 +1,11 @@
 //! Testable chat session with JIT-LoRA learning.
 //!
-//! Extracts the core logic from the chat example into a struct
-//! that can be driven programmatically and tested.
+//! Core types:
+//! - [`ChatSession`] — inference + optional learning
+//! - [`Learner`] — owns all training state, pluggable fact extraction
+//! - [`FactExtractor`] — trait for Q/A extraction from user messages
+//! - [`ModelFactExtractor`] — default: runs the base model on a secondary cache slot
+//! - [`RegexFactExtractor`] — lightweight: parses `Q: ... A: ...` patterns directly
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +18,8 @@ use crate::model::{CacheSlot, Model};
 use crate::train::{EwcConfig, TrainState};
 use crate::weights;
 use crate::weights::ModelConfig;
+
+// ── Result types ──────────────────────────────────────────────────
 
 /// Result of teaching a fact.
 pub struct TeachResult {
@@ -39,21 +45,276 @@ pub struct GenerateResult {
     pub interrupted: bool,
 }
 
-/// Interactive chat session with optional JIT-LoRA learning.
-pub struct ChatSession {
-    pub model: Model,
-    pub gpu: GpuContext,
-    pub tokenizer: Tokenizer,
-    pub train_state: Option<TrainState>,
-    pub extract_slot: Option<CacheSlot>,
-    pub config: ModelConfig,
-    pub lora_config: LoraConfig,
+// ── FactExtractor trait ───────────────────────────────────────────
+
+/// Trait for extracting Q/A fact pairs from user messages.
+///
+/// Implementations can use the model (e.g. [`ModelFactExtractor`]) or
+/// operate purely on text (e.g. [`RegexFactExtractor`]).
+pub trait FactExtractor {
+    fn extract(
+        &mut self,
+        gpu: &mut GpuContext,
+        model: &mut Model,
+        tokenizer: &Tokenizer,
+        user_msg: &str,
+        im_end_id: u32,
+        eos_id: u32,
+    ) -> Vec<(String, String)>;
+}
+
+/// Extracts facts by running the base model (no LoRA) on a secondary
+/// cache slot with a few-shot Q/A extraction prompt.
+pub struct ModelFactExtractor {
+    pub extract_slot: CacheSlot,
+}
+
+impl FactExtractor for ModelFactExtractor {
+    fn extract(
+        &mut self,
+        gpu: &mut GpuContext,
+        model: &mut Model,
+        tokenizer: &Tokenizer,
+        user_msg: &str,
+        im_end_id: u32,
+        eos_id: u32,
+    ) -> Vec<(String, String)> {
+        let prompt = build_extract_prompt(tokenizer, user_msg);
+
+        let saved_tokens = std::mem::take(&mut model.generated_tokens);
+        model.swap_cache(&mut self.extract_slot);
+        let lora = model.lora.take();
+        model.seq_len = 0;
+
+        for &tok in &prompt[..prompt.len() - 1] {
+            model.forward(gpu, tok);
+        }
+
+        let mut ids: Vec<u32> = Vec::new();
+        let mut token = model.forward(gpu, prompt[prompt.len() - 1]);
+        let mut prob_sum = 0.0f32;
+        let mut prob_count = 0u32;
+
+        for _ in 0..128 {
+            if token == im_end_id || token == eos_id {
+                break;
+            }
+            ids.push(token);
+            prob_sum += model.last_token_prob;
+            prob_count += 1;
+            token = model.forward(gpu, token);
+        }
+
+        let avg_confidence = if prob_count > 0 {
+            prob_sum / prob_count as f32
+        } else {
+            0.0
+        };
+
+        model.lora = lora;
+        model.swap_cache(&mut self.extract_slot);
+        model.generated_tokens = saved_tokens;
+
+        if avg_confidence < 0.3 {
+            return Vec::new();
+        }
+
+        let raw_text = tokenizer.decode(&ids, true).unwrap_or_default();
+        let full_text = format!("Q:{}", raw_text);
+        parse_qa_pairs(&full_text)
+    }
+}
+
+/// Extracts Q/A pairs by matching `Q: ... A: ...` patterns directly
+/// in the user message text. No model inference needed.
+///
+/// Useful for structured input and testing.
+pub struct RegexFactExtractor;
+
+impl FactExtractor for RegexFactExtractor {
+    fn extract(
+        &mut self,
+        _gpu: &mut GpuContext,
+        _model: &mut Model,
+        _tokenizer: &Tokenizer,
+        user_msg: &str,
+        _im_end_id: u32,
+        _eos_id: u32,
+    ) -> Vec<(String, String)> {
+        parse_qa_pairs(user_msg)
+    }
+}
+
+// ── Learner ───────────────────────────────────────────────────────
+
+/// Default anchor Q/A pairs for EWC anti-forgetting.
+const ANCHOR_QA: &[(&str, &str)] = &[
+    ("What is the capital of Wisconsin?", "Madison"),
+    (
+        "What is Wisconsin known for?",
+        "Dairy farming and cheese production",
+    ),
+    ("What is the largest city in Wisconsin?", "Milwaukee"),
+    (
+        "What are the Wisconsin Dells?",
+        "A popular waterpark and resort area in Wisconsin",
+    ),
+    (
+        "What Great Lakes border Wisconsin?",
+        "Lake Michigan and Lake Superior",
+    ),
+    ("What is the state animal of Wisconsin?", "The badger"),
+    ("What is a famous Wisconsin food?", "Cheese curds"),
+];
+
+/// Owns all training state: optimizer, gradients, EWC anchors, and fact extraction.
+pub struct Learner {
+    pub train_state: TrainState,
+    pub extractor: Box<dyn FactExtractor>,
     pub anchor_tokens: Vec<Vec<u32>>,
-    pub conversation_log: Vec<(String, String)>,
-    pub max_tokens: u32,
-    pub im_end_id: u32,
-    pub eos_id: u32,
+    pub lora_config: LoraConfig,
     anchor_rng: u64,
+}
+
+impl Learner {
+    /// Create a new learner with the given fact extractor.
+    /// Allocates TrainState, enables EWC, and seeds anchor facts.
+    pub fn new(
+        gpu: &mut GpuContext,
+        model: &mut Model,
+        tokenizer: &Tokenizer,
+        config: &ModelConfig,
+        extractor: Box<dyn FactExtractor>,
+    ) -> Self {
+        let lora_config = LoraConfig::default();
+
+        // Ensure LoRA is initialized
+        if model.lora.is_none() {
+            model.lora = Some(LoraState::new(gpu, lora_config.clone(), config));
+        }
+
+        let mut train_state = TrainState::new(gpu, config, &lora_config);
+        train_state.enable_ewc(gpu, EwcConfig::default(), config, &lora_config);
+
+        let anchor_tokens: Vec<Vec<u32>> = ANCHOR_QA
+            .iter()
+            .map(|(q, a)| build_train_tokens(tokenizer, q, a))
+            .collect();
+
+        // Seed with anchor facts
+        let anchor_path = std::path::Path::new("anchor.lora.safetensors");
+        if anchor_path.exists() {
+            model.lora = Some(LoraState::load_safetensors(gpu, anchor_path, config));
+        } else {
+            for toks in &anchor_tokens {
+                let _loss = train_state.train_on_tokens(gpu, model, toks, 1);
+            }
+            if let Some(ref lora) = model.lora {
+                lora.save_safetensors(gpu, anchor_path, config);
+            }
+        }
+        train_state.snapshot_anchor_grads(gpu, config, &lora_config);
+
+        Self {
+            train_state,
+            extractor,
+            anchor_tokens,
+            lora_config,
+            anchor_rng: 42,
+        }
+    }
+
+    /// Teach a fact (explicit /teach command).
+    /// Supports "Q: ... A: ..." format or plain fact.
+    pub fn teach(
+        &mut self,
+        gpu: &mut GpuContext,
+        model: &mut Model,
+        tokenizer: &Tokenizer,
+        config: &ModelConfig,
+        body: &str,
+        num_epochs: u32,
+    ) -> TeachResult {
+        let (question, answer) = if let Some(qa) = body.split_once(" A: ") {
+            let q = qa.0.strip_prefix("Q: ").unwrap_or(qa.0);
+            (q.to_string(), qa.1.to_string())
+        } else {
+            (format!("What do you know about: {body}"), body.to_string())
+        };
+
+        let train_tokens = build_train_tokens(tokenizer, &question, &answer);
+        let num_tokens = train_tokens.len();
+        let loss =
+            self.train_state
+                .train_on_tokens(gpu, model, &train_tokens, num_epochs);
+        let step = self.train_state.step;
+
+        self.train_state
+            .snapshot_anchor_grads(gpu, config, &self.lora_config);
+
+        TeachResult {
+            question,
+            answer,
+            loss,
+            num_tokens,
+            step,
+        }
+    }
+
+    /// Extract Q/A pairs from a user message and train on them.
+    pub fn learn_from_message(
+        &mut self,
+        gpu: &mut GpuContext,
+        model: &mut Model,
+        tokenizer: &Tokenizer,
+        config: &ModelConfig,
+        im_end_id: u32,
+        eos_id: u32,
+        user_msg: &str,
+    ) -> LearnResult {
+        if is_question(user_msg) {
+            return LearnResult {
+                pairs: Vec::new(),
+                trained: false,
+            };
+        }
+
+        let pairs =
+            self.extractor
+                .extract(gpu, model, tokenizer, user_msg, im_end_id, eos_id);
+        if pairs.is_empty() {
+            return LearnResult {
+                pairs: Vec::new(),
+                trained: false,
+            };
+        }
+
+        for (q, a) in &pairs {
+            let new_tokens = build_train_tokens(tokenizer, q, a);
+            let _loss =
+                self.train_state
+                    .train_on_tokens(gpu, model, &new_tokens, 3);
+
+            // Replay one random anchor
+            self.anchor_rng ^= self.anchor_rng << 13;
+            self.anchor_rng ^= self.anchor_rng >> 7;
+            self.anchor_rng ^= self.anchor_rng << 17;
+            let anchor_idx = (self.anchor_rng as usize) % self.anchor_tokens.len();
+            let anchor = self.anchor_tokens[anchor_idx].clone();
+            let _anchor_loss =
+                self.train_state.train_on_tokens(gpu, model, &anchor, 1);
+
+            self.anchor_tokens.push(new_tokens);
+        }
+
+        self.train_state
+            .snapshot_anchor_grads(gpu, config, &self.lora_config);
+
+        LearnResult {
+            pairs,
+            trained: true,
+        }
+    }
 }
 
 // ── Pure functions (no GPU needed) ────────────────────────────────
@@ -148,7 +409,7 @@ pub fn build_extract_prompt(tokenizer: &Tokenizer, user_msg: &str) -> Vec<u32> {
     tokens
 }
 
-/// Parse Q/A pairs from extraction model output.
+/// Parse Q/A pairs from text.
 pub fn parse_qa_pairs(text: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
@@ -197,30 +458,26 @@ pub fn is_question(text: &str) -> bool {
         || lower.starts_with("tell me ")
 }
 
-// ── ChatSession implementation ────────────────────────────────────
+// ── ChatSession ───────────────────────────────────────────────────
 
-/// Default anchor Q/A pairs for EWC anti-forgetting.
-const ANCHOR_QA: &[(&str, &str)] = &[
-    ("What is the capital of Wisconsin?", "Madison"),
-    (
-        "What is Wisconsin known for?",
-        "Dairy farming and cheese production",
-    ),
-    ("What is the largest city in Wisconsin?", "Milwaukee"),
-    (
-        "What are the Wisconsin Dells?",
-        "A popular waterpark and resort area in Wisconsin",
-    ),
-    (
-        "What Great Lakes border Wisconsin?",
-        "Lake Michigan and Lake Superior",
-    ),
-    ("What is the state animal of Wisconsin?", "The badger"),
-    ("What is a famous Wisconsin food?", "Cheese curds"),
-];
+/// Interactive chat session with optional JIT-LoRA learning.
+pub struct ChatSession {
+    pub model: Model,
+    pub gpu: GpuContext,
+    pub tokenizer: Tokenizer,
+    pub config: ModelConfig,
+    pub learner: Option<Learner>,
+    pub conversation_log: Vec<(String, String)>,
+    pub max_tokens: u32,
+    pub im_end_id: u32,
+    pub eos_id: u32,
+}
 
 impl ChatSession {
-    /// Create a new chat session, loading model and optionally initializing LoRA.
+    /// Create a new chat session, loading model and optionally initializing learning.
+    ///
+    /// When `learning_enabled` is true, uses [`ModelFactExtractor`] by default.
+    /// Use [`ChatSession::new_with_extractor`] for a custom extractor.
     pub fn new(
         model_dir: PathBuf,
         max_tokens: u32,
@@ -251,192 +508,121 @@ impl ChatSession {
             }
         }
 
-        let lora_config = LoraConfig::default();
-        if learning_enabled || lora_path.is_some() {
-            if let Some(ref path) = lora_path {
-                let lora = LoraState::load_safetensors(&gpu, path, &config);
-                model.lora = Some(lora);
-            } else {
-                let lora = LoraState::new(&gpu, lora_config.clone(), &config);
-                model.lora = Some(lora);
-            }
+        // Load LoRA if provided (inference-only, no training)
+        if let Some(ref path) = lora_path {
+            let lora = LoraState::load_safetensors(&gpu, path, &config);
+            model.lora = Some(lora);
         }
 
-        let mut train_state = if learning_enabled {
-            let mut ts = TrainState::new(&gpu, &config, &LoraConfig::default());
-            ts.enable_ewc(&gpu, EwcConfig::default(), &config, &LoraConfig::default());
-            Some(ts)
+        let learner = if learning_enabled {
+            let extractor = Box::new(ModelFactExtractor {
+                extract_slot: model.alloc_cache_slot(&gpu, max_seq_len),
+            });
+            Some(Learner::new(
+                &mut gpu,
+                &mut model,
+                &tokenizer,
+                &config,
+                extractor,
+            ))
         } else {
             None
         };
-
-        let extract_slot = if learning_enabled {
-            Some(model.alloc_cache_slot(&gpu, max_seq_len))
-        } else {
-            None
-        };
-
-        // Build anchor tokens
-        let anchor_tokens: Vec<Vec<u32>> = ANCHOR_QA
-            .iter()
-            .map(|(q, a)| build_train_tokens(&tokenizer, q, a))
-            .collect();
-
-        // Seed with anchor facts
-        let anchor_path = std::path::Path::new("anchor.lora.safetensors");
-        if let Some(ref mut ts) = train_state {
-            if anchor_path.exists() {
-                model.lora =
-                    Some(LoraState::load_safetensors(&gpu, anchor_path, &config));
-            } else {
-                for toks in &anchor_tokens {
-                    let _loss = ts.train_on_tokens(&mut gpu, &mut model, toks, 1);
-                }
-                if let Some(ref lora) = model.lora {
-                    lora.save_safetensors(&mut gpu, anchor_path, &config);
-                }
-            }
-            ts.snapshot_anchor_grads(&mut gpu, &config, &LoraConfig::default());
-        }
 
         Self {
             model,
             gpu,
             tokenizer,
-            train_state,
-            extract_slot,
             config,
-            lora_config,
-            anchor_tokens,
+            learner,
             conversation_log: Vec::new(),
             max_tokens,
             im_end_id,
             eos_id,
-            anchor_rng: 42,
         }
     }
 
-    /// Teach a fact (explicit /teach command).
-    /// Supports "Q: ... A: ..." format or plain fact.
+    /// Create a new chat session with a custom fact extractor.
+    pub fn new_with_extractor(
+        model_dir: PathBuf,
+        max_tokens: u32,
+        lora_path: Option<PathBuf>,
+        extractor: Box<dyn FactExtractor>,
+    ) -> Self {
+        let max_seq_len: u32 = 2048;
+
+        let tok_path = model_dir.join("tokenizer.json");
+        let tokenizer =
+            Tokenizer::from_file(&tok_path).expect("failed to load tokenizer.json");
+
+        let im_end_id = tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
+        let eos_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(151643);
+
+        let config = weights::ModelConfig::from_file(&model_dir.join("config.json"));
+        let quant_config =
+            weights::QuantConfig::from_file(&model_dir.join("quantize_config.json"));
+
+        let mut gpu = GpuContext::new();
+        let (model_weights, raw_norms) = weights::load_weights(&gpu, &model_dir, &config);
+        let mut model =
+            Model::new(&gpu, config.clone(), quant_config, model_weights, max_seq_len);
+
+        for (i, norm_data) in raw_norms.layers.iter().enumerate() {
+            if let Some((q_bytes, k_bytes)) = norm_data {
+                model.init_qknorm_params(&gpu, i, q_bytes, k_bytes);
+            }
+        }
+
+        if let Some(ref path) = lora_path {
+            let lora = LoraState::load_safetensors(&gpu, path, &config);
+            model.lora = Some(lora);
+        }
+
+        let learner = Learner::new(&mut gpu, &mut model, &tokenizer, &config, extractor);
+
+        Self {
+            model,
+            gpu,
+            tokenizer,
+            config,
+            learner: Some(learner),
+            conversation_log: Vec::new(),
+            max_tokens,
+            im_end_id,
+            eos_id,
+        }
+    }
+
+    /// Teach a fact. Delegates to the learner.
     pub fn teach(&mut self, body: &str, num_epochs: u32) -> Option<TeachResult> {
-        let ts = self.train_state.as_mut()?;
-
-        let (question, answer) = if let Some(qa) = body.split_once(" A: ") {
-            let q = qa.0.strip_prefix("Q: ").unwrap_or(qa.0);
-            (q.to_string(), qa.1.to_string())
-        } else {
-            (format!("What do you know about: {body}"), body.to_string())
-        };
-
-        let train_tokens = build_train_tokens(&self.tokenizer, &question, &answer);
-        let num_tokens = train_tokens.len();
-        let loss =
-            ts.train_on_tokens(&mut self.gpu, &mut self.model, &train_tokens, num_epochs);
-        let step = ts.step;
-
-        ts.snapshot_anchor_grads(&mut self.gpu, &self.config, &LoraConfig::default());
-
-        Some(TeachResult {
-            question,
-            answer,
-            loss,
-            num_tokens,
-            step,
-        })
+        let learner = self.learner.as_mut()?;
+        Some(learner.teach(
+            &mut self.gpu,
+            &mut self.model,
+            &self.tokenizer,
+            &self.config,
+            body,
+            num_epochs,
+        ))
     }
 
     /// Extract Q/A pairs from a user message and train on them.
     pub fn learn_from_message(&mut self, user_msg: &str) -> LearnResult {
-        if is_question(user_msg)
-            || self.train_state.is_none()
-            || self.extract_slot.is_none()
-        {
-            return LearnResult {
+        match self.learner.as_mut() {
+            Some(learner) => learner.learn_from_message(
+                &mut self.gpu,
+                &mut self.model,
+                &self.tokenizer,
+                &self.config,
+                self.im_end_id,
+                self.eos_id,
+                user_msg,
+            ),
+            None => LearnResult {
                 pairs: Vec::new(),
                 trained: false,
-            };
+            },
         }
-
-        let pairs = self.extract_qa(user_msg);
-        if pairs.is_empty() {
-            return LearnResult {
-                pairs: Vec::new(),
-                trained: false,
-            };
-        }
-
-        let ts = self.train_state.as_mut().unwrap();
-        for (q, a) in &pairs {
-            let new_tokens = build_train_tokens(&self.tokenizer, q, a);
-            let _loss =
-                ts.train_on_tokens(&mut self.gpu, &mut self.model, &new_tokens, 3);
-
-            // Replay one random anchor
-            self.anchor_rng ^= self.anchor_rng << 13;
-            self.anchor_rng ^= self.anchor_rng >> 7;
-            self.anchor_rng ^= self.anchor_rng << 17;
-            let anchor_idx = (self.anchor_rng as usize) % self.anchor_tokens.len();
-            let anchor = self.anchor_tokens[anchor_idx].clone();
-            let _anchor_loss =
-                ts.train_on_tokens(&mut self.gpu, &mut self.model, &anchor, 1);
-
-            self.anchor_tokens.push(new_tokens);
-        }
-
-        ts.snapshot_anchor_grads(&mut self.gpu, &self.config, &LoraConfig::default());
-
-        LearnResult {
-            pairs,
-            trained: true,
-        }
-    }
-
-    /// Run extraction on a secondary cache slot (no LoRA, base model only).
-    fn extract_qa(&mut self, user_msg: &str) -> Vec<(String, String)> {
-        let slot = self.extract_slot.as_mut().unwrap();
-        let prompt = build_extract_prompt(&self.tokenizer, user_msg);
-
-        let saved_tokens = std::mem::take(&mut self.model.generated_tokens);
-        self.model.swap_cache(slot);
-        let lora = self.model.lora.take();
-        self.model.seq_len = 0;
-
-        for &tok in &prompt[..prompt.len() - 1] {
-            self.model.forward(&mut self.gpu, tok);
-        }
-
-        let mut ids: Vec<u32> = Vec::new();
-        let mut token = self.model.forward(&mut self.gpu, prompt[prompt.len() - 1]);
-        let mut prob_sum = 0.0f32;
-        let mut prob_count = 0u32;
-
-        for _ in 0..128 {
-            if token == self.im_end_id || token == self.eos_id {
-                break;
-            }
-            ids.push(token);
-            prob_sum += self.model.last_token_prob;
-            prob_count += 1;
-            token = self.model.forward(&mut self.gpu, token);
-        }
-
-        let avg_confidence = if prob_count > 0 {
-            prob_sum / prob_count as f32
-        } else {
-            0.0
-        };
-
-        self.model.lora = lora;
-        self.model.swap_cache(slot);
-        self.model.generated_tokens = saved_tokens;
-
-        if avg_confidence < 0.3 {
-            return Vec::new();
-        }
-
-        let raw_text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        let full_text = format!("Q:{}", raw_text);
-        parse_qa_pairs(&full_text)
     }
 
     /// Generate a response to a user message.
@@ -559,9 +745,7 @@ impl ChatSession {
         } else {
             full_text.trim_start_matches("<think>").trim()
         };
-        let display = display
-            .replace("</think>", "")
-            .replace("<think>", "");
+        let display = display.replace("</think>", "").replace("<think>", "");
         let text = display.trim().to_string();
 
         self.conversation_log
@@ -579,8 +763,11 @@ impl ChatSession {
     /// Reset LoRA weights (forget all learned facts).
     pub fn forget(&mut self) {
         if self.model.lora.is_some() {
-            self.model.lora =
-                Some(LoraState::new(&self.gpu, LoraConfig::default(), &self.config));
+            self.model.lora = Some(LoraState::new(
+                &self.gpu,
+                LoraConfig::default(),
+                &self.config,
+            ));
             self.conversation_log.clear();
         }
     }
@@ -609,6 +796,8 @@ impl Clone for LoraConfig {
 mod tests {
     use super::*;
 
+    // ── Pure function tests ───────────────────────────────────────
+
     #[test]
     fn test_parse_qa_pairs_basic() {
         let text = "Q: What is Zorbex?\nA: A purple mineral from Mars";
@@ -620,7 +809,8 @@ mod tests {
 
     #[test]
     fn test_parse_qa_pairs_multiple() {
-        let text = "Q: What is the dog's name?\nA: Rex\nQ: How old is Rex?\nA: 3 years old";
+        let text =
+            "Q: What is the dog's name?\nA: Rex\nQ: How old is Rex?\nA: 3 years old";
         let pairs = parse_qa_pairs(text);
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("What is the dog's name?".into(), "Rex".into()));
@@ -673,6 +863,38 @@ mod tests {
         assert!(!is_question("I like cheese"));
     }
 
+    // ── RegexFactExtractor tests ──────────────────────────────────
+
+    #[test]
+    fn test_regex_extractor_basic() {
+        let mut ext = RegexFactExtractor;
+        // We can't call extract() without gpu/model in a unit test,
+        // but RegexFactExtractor ignores them — test via parse_qa_pairs directly
+        let input = "Q: What is Zorbex?\nA: A purple mineral from Mars";
+        let pairs = parse_qa_pairs(input);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "What is Zorbex?");
+        assert_eq!(pairs[0].1, "A purple mineral from Mars");
+        // Verify the struct exists and implements the trait
+        let _: &dyn FactExtractor = &ext;
+    }
+
+    #[test]
+    fn test_regex_extractor_multiline() {
+        let input = "Q: What color is the sky?\nA: Blue\nQ: What color is grass?\nA: Green";
+        let pairs = parse_qa_pairs(input);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1, "Blue");
+        assert_eq!(pairs[1].1, "Green");
+    }
+
+    #[test]
+    fn test_regex_extractor_no_match() {
+        let input = "My cat is named Whiskers and she is 5 years old.";
+        let pairs = parse_qa_pairs(input);
+        assert!(pairs.is_empty());
+    }
+
     // ── Integration tests requiring MODEL_DIR ─────────────────────
 
     fn make_test_session() -> Option<ChatSession> {
@@ -682,8 +904,8 @@ mod tests {
         };
         Some(ChatSession::new(
             PathBuf::from(model_dir),
-            64,   // low max_tokens for fast tests
-            true, // learning enabled
+            64,
+            true,
             None,
         ))
     }
@@ -693,14 +915,15 @@ mod tests {
     fn test_teach_and_recall() {
         let mut session = make_test_session().expect("Set MODEL_DIR to run this test");
 
-        // Teach a novel fact
         let result = session
-            .teach("Q: What is Zorbex? A: Zorbex is a purple mineral from Mars", 5)
+            .teach(
+                "Q: What is Zorbex? A: Zorbex is a purple mineral from Mars",
+                5,
+            )
             .expect("teach should succeed");
         assert!(result.loss > 0.0);
         assert!(result.loss < 10.0);
 
-        // Ask about it
         let response = session.generate("What is Zorbex?", None);
         let lower = response.text.to_lowercase();
         assert!(
@@ -715,10 +938,11 @@ mod tests {
     fn test_teach_does_not_forget_anchors() {
         let mut session = make_test_session().expect("Set MODEL_DIR to run this test");
 
-        // Teach a new fact
-        session.teach("Q: What is Glorpium? A: A shiny crystal found in caves", 5);
+        session.teach(
+            "Q: What is Glorpium? A: A shiny crystal found in caves",
+            5,
+        );
 
-        // Ask an anchor question
         let response = session.generate("What is the capital of Wisconsin?", None);
         let lower = response.text.to_lowercase();
         assert!(
@@ -733,15 +957,14 @@ mod tests {
     fn test_forget_resets() {
         let mut session = make_test_session().expect("Set MODEL_DIR to run this test");
 
-        // Teach, then forget
-        session.teach("Q: What is Blipnox? A: A rare gemstone from Neptune", 5);
+        session.teach(
+            "Q: What is Blipnox? A: A rare gemstone from Neptune",
+            5,
+        );
         session.forget();
 
-        // Should not recall the taught fact
         let response = session.generate("What is Blipnox?", None);
         let lower = response.text.to_lowercase();
-        // After forget, unlikely to mention the specific taught answer
-        // (though the model might hallucinate — we just check the teach path resets)
         assert!(
             !lower.contains("neptune") || !lower.contains("gemstone"),
             "Expected forget to clear taught fact, but it was recalled: {}",
@@ -756,36 +979,61 @@ mod tests {
             std::env::var("MODEL_DIR").expect("Set MODEL_DIR to run this test");
         let tmp_path = std::env::temp_dir().join("test_lora_checkpoint.safetensors");
 
-        // Session 1: teach and save
         {
-            let mut session = ChatSession::new(
-                PathBuf::from(&model_dir),
-                64,
-                true,
-                None,
-            );
+            let mut session =
+                ChatSession::new(PathBuf::from(&model_dir), 64, true, None);
             session.teach("Q: What is Quazzle? A: A fizzy drink from Saturn", 5);
             session.save_lora(&tmp_path);
         }
 
-        // Session 2: load and recall
         {
             let mut session = ChatSession::new(
                 PathBuf::from(&model_dir),
                 64,
-                false, // no learning, just inference
+                false,
                 Some(tmp_path.clone()),
             );
             let response = session.generate("What is Quazzle?", None);
             let lower = response.text.to_lowercase();
             assert!(
-                lower.contains("fizzy") || lower.contains("drink") || lower.contains("saturn"),
+                lower.contains("fizzy")
+                    || lower.contains("drink")
+                    || lower.contains("saturn"),
                 "Expected recall from loaded LoRA, got: {}",
                 response.text
             );
         }
 
-        // Cleanup
         let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_learn_with_regex_extractor() {
+        let model_dir =
+            std::env::var("MODEL_DIR").expect("Set MODEL_DIR to run this test");
+
+        let mut session = ChatSession::new_with_extractor(
+            PathBuf::from(model_dir),
+            64,
+            None,
+            Box::new(RegexFactExtractor),
+        );
+
+        // Send a structured Q/A message — RegexFactExtractor will parse it directly
+        let result = session
+            .learn_from_message("Q: What is Flumzite?\nA: A glowing rock from Jupiter");
+        assert!(result.trained);
+        assert_eq!(result.pairs.len(), 1);
+        assert_eq!(result.pairs[0].0, "What is Flumzite?");
+
+        // Verify the model learned
+        let response = session.generate("What is Flumzite?", None);
+        let lower = response.text.to_lowercase();
+        assert!(
+            lower.contains("glow") || lower.contains("rock") || lower.contains("jupiter"),
+            "Expected recall of learned fact, got: {}",
+            response.text
+        );
     }
 }
