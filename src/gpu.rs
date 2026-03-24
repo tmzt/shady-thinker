@@ -43,7 +43,7 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: Some("tensorbend"),
+                    label: Some("shady-thinker"),
                     required_features: wgpu::Features::empty(),
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
