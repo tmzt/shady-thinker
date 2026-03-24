@@ -6,5 +6,5 @@ pub mod model;
 #[cfg(feature = "jit-lora")]
 pub mod train;
 pub mod weights;
-#[cfg(feature = "jit-lora")]
+#[cfg(feature = "chat")]
 pub mod chat;
