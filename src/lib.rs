@@ -1,4 +1,5 @@
 pub mod gpu;
+pub mod inference;
 #[cfg(feature = "jit-lora")]
 pub mod lora;
 pub mod model;

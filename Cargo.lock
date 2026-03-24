@@ -275,23 +275,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crayonz"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "env_logger",
- "half",
- "libc",
- "log",
- "pollster",
- "safetensors",
- "serde",
- "serde_json",
- "tokenizers",
- "wgpu",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1277,6 +1260,23 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "shady-thinker"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "env_logger",
+ "half",
+ "libc",
+ "log",
+ "pollster",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "wgpu",
 ]
 
 [[package]]

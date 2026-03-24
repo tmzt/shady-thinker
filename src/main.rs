@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use tensorbend_rs::gpu;
-use tensorbend_rs::model;
-use tensorbend_rs::weights;
+use shady_thinker::gpu;
+use shady_thinker::model;
+use shady_thinker::weights;
 
 fn main() {
     env_logger::init();

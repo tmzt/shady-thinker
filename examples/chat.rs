@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use tensorbend_rs::chat::ChatSession;
+use shady_thinker::chat::ChatSession;
 
 /// Set stdin to raw non-blocking mode, returns the old termios to restore later.
 fn set_raw_nonblocking() -> libc::termios {

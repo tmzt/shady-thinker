@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use tensorbend_rs::chat::*;
+use shady_thinker::chat::*;
 
 fn model_dir() -> PathBuf {
     PathBuf::from(
