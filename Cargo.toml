@@ -2,6 +2,7 @@
 name = "shady-thinker"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "shady_thinker"

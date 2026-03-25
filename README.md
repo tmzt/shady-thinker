@@ -1,23 +1,49 @@
+# Shady Thinker
 
-# Crayonz - With a Z
+GPU-accelerated LLM inference and online learning in pure Rust, powered by WGPU shaders.
 
-    Crayonz is what happens when you send an LLM to kindergarten, and it uses shaders or something. So it make sense.
+## What is this?
 
-This is an implementation of two projects on Hugging Face:
+Shady Thinker is a from-scratch implementation of LLM inference and fine-tuning using Rust + WGPU. No Python, no CUDA — just shaders doing the thinking.
 
-1. https://huggingface.co/spaces/Ex0bit/tensorbend
-2. https://huggingface.co/Ex0bit/jit-lora
+Unlike the reference projects, this is a single-process Rust binary with no Python or Node backend.
 
-The second one has a paper:
+## Inspiration
 
-https://huggingface.co/Ex0bit/jit-lora/blob/main/paper.pdf
+- [TensorBend](https://huggingface.co/spaces/Ex0bit/tensorbend) — a Hugging Face demo showcasing GPU shader-based tensor operations. The original is obfuscated, but it demonstrated that full LLM inference through compute shaders is viable.
+- [JIT-LoRA](https://huggingface.co/Ex0bit/jit-lora/blob/main/paper.pdf) ([code](https://github.com/eelbaz/jit-lora)) — a paper and reference implementation for runtime LoRA adaptation, enabling online learning without a separate training pipeline.
 
-And a Git repository:
+## Methodology
 
-https://github.com/eelbaz/jit-lora
+The shader kernels were developed from descriptions of the required operations rather than ported line-by-line from the reference code. Claude was used to document the necessary kernels (matmul, softmax, RMSNorm, RoPE, etc.) at a functional level, and each was then implemented as a standalone WGSL compute shader targeting the WGPU/naga toolchain.
 
-This is a project to combine them using Rust+WGPU and the shaders. Since the original Tensorbend is a demo and obfuscated I am sticking with a standard implementation of the shaders with some inspiration from the SOTA techniques used in the project. Mostly the engineering choices around fusion.
+This approach — rewriting from a spec rather than translating source — avoids inheriting obfuscation or framework-specific patterns from the originals, and produces shaders that compose cleanly as building blocks for the full inference pipeline.
 
-Claude was able to document the required kernels sufficiently to implement them in WGSL.
+Engineering choices around kernel fusion are informed by the SOTA techniques used in TensorBend.
 
-The second project (jit-lora) is the other cool part. It's goal is to enable online learning using LoRA. This implementation is based on the paper and the slight differences in the actual code. Unlike the Github repository, this is a single process using just Rust+WGPU with some crates. There's no backend Express or Python component.
+## Features
+
+- WGSL compute shaders for matmul, softmax, RMSNorm, RoPE, and more
+- Feature-gated modules: `chat` for tokenizer support
+- Designed for portability across any GPU backend WGPU supports (Vulkan, Metal, DX12)
+
+## Building
+
+```sh
+# Core library only
+cargo build
+
+# With chat/tokenizer support
+cargo build --features chat
+```
+
+## Future Work
+
+- **JIT-LoRA online learning** — runtime LoRA adaptation based on the [JIT-LoRA paper](https://huggingface.co/Ex0bit/jit-lora/blob/main/paper.pdf), enabling on-the-fly fine-tuning during inference. This is gated behind the `jit-lora` feature flag and is currently a work in progress.
+  ```sh
+  cargo build --features jit-lora
+  ```
+
+## License
+
+[MIT](LICENSE)
