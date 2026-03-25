@@ -15,7 +15,7 @@ Unlike the reference projects, this is a single-process Rust binary with no Pyth
 
 ## Methodology
 
-The shader kernels were developed from descriptions of the required operations rather than ported line-by-line from the reference code. Claude was used to document the necessary kernels (matmul, softmax, RMSNorm, RoPE, etc.) at a functional level, and each was then implemented as a standalone WGSL compute shader targeting the WGPU/naga toolchain.
+The shader kernels were developed from descriptions of the required operations rather than ported line-by-line from the reference code. Claude first documented the necessary kernels (matmul, softmax, RMSNorm, RoPE, etc.) at a functional level in [SHADER_RESEARCH.md](SHADER_RESEARCH.md), and only then began implementing them as standalone WGSL compute shaders in a clean repository targeting the WGPU/naga toolchain.
 
 This approach — rewriting from a spec rather than translating source — avoids inheriting obfuscation or framework-specific patterns from the originals, and produces shaders that compose cleanly as building blocks for the full inference pipeline.
 
