@@ -18,6 +18,20 @@ impl GpuContext {
         pollster::block_on(Self::init())
     }
 
+    /// Create a GpuContext from an externally-owned device and queue.
+    /// This allows the caller to create a surface-compatible device and
+    /// share it with both the UI renderer and the compute pipeline.
+    pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self {
+            device,
+            queue,
+            pipelines: HashMap::new(),
+            bind_group_cache: HashMap::new(),
+            encoder: None,
+            pending_dispatches: 0,
+        }
+    }
+
     async fn init() -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
