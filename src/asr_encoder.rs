@@ -15,7 +15,7 @@ mod shaders {
     pub const LAYERNORM: &str = include_str!("shaders/layernorm.wgsl");
     pub const GELU_MUL: &str = include_str!("shaders/gelu_mul.wgsl");
     pub const BIDIR_ATTN: &str = include_str!("shaders/qwen_asr_bidir_attn.wgsl");
-    pub const ADD: &str = include_str!("shaders/add.wgsl");
+    pub const ADD: &str = include_str!("shaders/add.wgsl"); // reused from LLM
 }
 
 /// Encoder configuration (matches qwen_asr_enc_config_t in C).
@@ -158,67 +158,122 @@ impl AsrEncoder {
     /// Input: token embeddings from conv stem [seq_len, d_model] as f32.
     /// Output: encoder output [seq_len, output_dim] as f32.
     pub fn forward(&mut self, token_embeddings: &[f32], seq_len: u32) -> Vec<f32> {
+        use crate::gpu::bind;
+
         let d = self.config.d_model;
+        let ffn_d = self.config.ffn_dim;
+        let out_d = self.config.output_dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
         let t0 = std::time::Instant::now();
 
         // Upload input to GPU
-        let mut x = self.gpu.upload_buffer("enc_input",
+        let x = self.gpu.upload_buffer("enc_input",
             bytemuck::cast_slice(token_embeddings));
 
         // Allocate scratch buffers
         let buf_size = (seq_len * d) as u64 * 4;
-        let mut x_norm = self.gpu.create_storage_buffer("enc_x_norm", buf_size);
-        let mut residual = self.gpu.create_storage_buffer("enc_residual", buf_size);
+        let x_norm = self.gpu.create_storage_buffer("enc_x_norm", buf_size);
+        let q_buf = self.gpu.create_storage_buffer("enc_q", buf_size);
+        let k_buf = self.gpu.create_storage_buffer("enc_k", buf_size);
+        let v_buf = self.gpu.create_storage_buffer("enc_v", buf_size);
+        let attn_out = self.gpu.create_storage_buffer("enc_attn", buf_size);
+        let o_out = self.gpu.create_storage_buffer("enc_o", buf_size);
 
-        let qkv_size = buf_size; // same as d_model for MHA
-        let mut q_buf = self.gpu.create_storage_buffer("enc_q", qkv_size);
-        let mut k_buf = self.gpu.create_storage_buffer("enc_k", qkv_size);
-        let mut v_buf = self.gpu.create_storage_buffer("enc_v", qkv_size);
-        let mut attn_out = self.gpu.create_storage_buffer("enc_attn", qkv_size);
-        let mut o_out = self.gpu.create_storage_buffer("enc_o", buf_size);
+        let ffn_size = (seq_len * ffn_d) as u64 * 4;
+        let ffn_mid = self.gpu.create_storage_buffer("enc_ffn_mid", ffn_size);
+        let ffn_act = self.gpu.create_storage_buffer("enc_ffn_act", ffn_size);
+        let ffn_out = self.gpu.create_storage_buffer("enc_ffn_out", buf_size);
 
-        let ffn_size = (seq_len * self.config.ffn_dim) as u64 * 4;
-        let mut ffn_mid = self.gpu.create_storage_buffer("enc_ffn_mid", ffn_size);
-        let mut ffn_act = self.gpu.create_storage_buffer("enc_ffn_act", ffn_size);
-        let mut ffn_out = self.gpu.create_storage_buffer("enc_ffn_out", buf_size);
+        let out_size = (seq_len * out_d) as u64 * 4;
+        let output_buf = self.gpu.create_storage_buffer("enc_output", out_size);
 
-        let prefill_ms = t0.elapsed().as_millis();
-        log::info!("[asr-encoder] buffers allocated in {}ms, seq_len={}", prefill_ms, seq_len);
+        // Params uniform buffer (overwritten between dispatches)
+        let params_buf = self.gpu.create_buffer("enc_params", 64,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
-        // TODO: Run transformer layers
-        // For each layer:
-        //   1. LayerNorm(x) → x_norm
-        //   2. bf16_gemm(x_norm, wq) + bq → q
-        //   3. bf16_gemm(x_norm, wk) + bk → k
-        //   4. bf16_gemm(x_norm, wv) + bv → v
-        //   5. bidir_attn(q, k, v) → attn_out
-        //   6. bf16_gemm(attn_out, wo) + bo → o_out
-        //   7. x = x + o_out (residual)
-        //   8. LayerNorm(x) → x_norm
-        //   9. bf16_gemm(x_norm, fc1) + fc1_bias → ffn_mid
-        //  10. gelu(ffn_mid) → ffn_act
-        //  11. bf16_gemm(ffn_act, fc2) + fc2_bias → ffn_out
-        //  12. x = x + ffn_out (residual)
+        let alloc_ms = t0.elapsed().as_millis();
+        log::info!("[asr-encoder] buffers allocated in {}ms, seq_len={}", alloc_ms, seq_len);
 
-        // TODO: Output projection
-        //  13. LayerNorm(x) → x_norm
-        //  14. bf16_gemm(x_norm, proj1) + proj1_bias → ffn_mid (reuse buffer)
-        //  15. gelu(ffn_mid) → ffn_act
-        //  16. bf16_gemm(ffn_act, proj2) + proj2_bias → output
+        // ── Split borrows for transformer layers + output projection ──
+        let Self { gpu, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
+
+        let x_cur = gpu.create_storage_buffer("enc_x_cur", buf_size);
+        gpu.copy_buffer(&x, &x_cur, buf_size);
+
+        for layer_idx in 0..layers.len() {
+            let layer = &layers[layer_idx];
+
+            // 1. LayerNorm(x) → x_norm
+            dispatch_layernorm(gpu, &x_cur, &layer.attn_norm_w, &layer.attn_norm_b,
+                &x_norm, &params_buf, seq_len, d);
+
+            // 2-4. Q/K/V projections via bf16 GEMM
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wq, &layer.bq, &q_buf, &params_buf,
+                seq_len, d, d, true);
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wk, &layer.bk, &k_buf, &params_buf,
+                seq_len, d, d, true);
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wv, &layer.bv, &v_buf, &params_buf,
+                seq_len, d, d, true);
+
+            // 5. Bidirectional windowed attention
+            dispatch_bidir_attn(gpu, &q_buf, &k_buf, &v_buf, &attn_out, &params_buf,
+                seq_len, num_heads, head_dim, 0, seq_len);
+
+            // 6. Output projection
+            dispatch_bf16_gemm(gpu, &attn_out, &layer.wo, &layer.bo, &o_out, &params_buf,
+                seq_len, d, d, true);
+
+            // 7. Residual: x = x + o_out
+            dispatch_add(gpu, &x_cur, &o_out, &params_buf, seq_len * d);
+
+            // 8. LayerNorm(x) → x_norm
+            dispatch_layernorm(gpu, &x_cur, &layer.ffn_norm_w, &layer.ffn_norm_b,
+                &x_norm, &params_buf, seq_len, d);
+
+            // 9. FFN fc1
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.fc1, &layer.fc1_bias, &ffn_mid,
+                &params_buf, seq_len, d, ffn_d, true);
+
+            // 10. GELU
+            dispatch_gelu(gpu, &ffn_mid, &ffn_act, &params_buf, seq_len * ffn_d);
+
+            // 11. FFN fc2
+            dispatch_bf16_gemm(gpu, &ffn_act, &layer.fc2, &layer.fc2_bias, &ffn_out,
+                &params_buf, seq_len, ffn_d, d, true);
+
+            // 12. Residual: x = x + ffn_out
+            dispatch_add(gpu, &x_cur, &ffn_out, &params_buf, seq_len * d);
+        }
+
+        // ── Output projection ──
+        let num_layers = layers.len();
+
+        // 13. Final LayerNorm
+        dispatch_layernorm(gpu, &x_cur, ln_post_w, ln_post_b, &x_norm, &params_buf, seq_len, d);
+
+        // 14. proj1 + GELU
+        dispatch_bf16_gemm(gpu, &x_norm, proj1_w, proj1_b, &ffn_mid, &params_buf, seq_len, d, d, true);
+        dispatch_gelu(gpu, &ffn_mid, &ffn_act, &params_buf, seq_len * d);
+
+        // 15. proj2
+        dispatch_bf16_gemm(gpu, &ffn_act, proj2_w, proj2_b, &output_buf, &params_buf, seq_len, d, out_d, true);
+
+        // Readback
+        let result_bytes = gpu.read_buffer(&output_buf, out_size);
+        let result: &[f32] = bytemuck::cast_slice(&result_bytes);
 
         let total_ms = t0.elapsed().as_millis();
-        log::info!("[asr-encoder] forward: {}ms for {} tokens", total_ms, seq_len);
+        log::info!("[asr-encoder] forward: {}ms for {} tokens ({} layers)",
+            total_ms, seq_len, num_layers);
 
-        // Readback output
-        // TODO: read from output buffer
-        vec![0.0; (seq_len * self.config.output_dim) as usize]
+        result.to_vec()
     }
 
     fn parse_config(path: &Path) -> AsrEncoderConfig {
         let text = std::fs::read_to_string(path).expect("config.json not found");
         let v: serde_json::Value = serde_json::from_str(&text).expect("invalid config.json");
 
-        // Detect 0.6B vs 1.7B from encoder config
         let enc = &v["encoder"];
         let d_model = enc["d_model"].as_u64().unwrap_or(1024) as u32;
         let num_layers = enc["encoder_layers"].as_u64().unwrap_or(24) as u32;
@@ -226,13 +281,93 @@ impl AsrEncoder {
         let ffn_dim = enc["encoder_ffn_dim"].as_u64().unwrap_or(4096) as u32;
         let output_dim = enc.get("output_dim").and_then(|v| v.as_u64()).unwrap_or(2048) as u32;
 
-        AsrEncoderConfig {
-            d_model,
-            num_layers,
-            num_heads,
-            head_dim: 64,
-            ffn_dim,
-            output_dim,
-        }
+        AsrEncoderConfig { d_model, num_layers, num_heads, head_dim: 64, ffn_dim, output_dim }
     }
 }
+
+// ── Free-standing dispatch helpers (avoid borrow conflicts with self.layers + self.gpu) ──
+
+fn dispatch_layernorm(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer, seq_len: u32, dim: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n: dim, eps: 1e-5, seq_len, _pad: 0 }));
+    gpu.dispatch("layernorm", shaders::LAYERNORM, &[
+        bind(0, input), bind(1, weight), bind(2, bias), bind(3, output), bind(4, params),
+    ], (seq_len, 1, 1));
+}
+
+fn dispatch_bf16_gemm(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer,
+    seq_len: u32, d_in: u32, d_out: u32, has_bias: bool,
+) {
+    use crate::gpu::bind;
+    #[repr(C)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { d_in: u32, d_out: u32, seq_len: u32, has_bias: u32 }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P {
+        d_in, d_out, seq_len, has_bias: has_bias as u32,
+    }));
+    gpu.dispatch("bf16_gemm", shaders::BF16_GEMM, &[
+        bind(0, input), bind(1, weight), bind(2, bias), bind(3, output), bind(4, params),
+    ], (d_out.div_ceil(32), seq_len, 1));
+}
+
+fn dispatch_gelu(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, output: &wgpu::Buffer,
+    params: &wgpu::Buffer, n: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32, _pad: [u32; 3] }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n, _pad: [0; 3] }));
+    gpu.dispatch("gelu_mul", shaders::GELU_MUL, &[
+        bind(0, input), bind(1, output), bind(2, params),
+    ], (n.div_ceil(256), 1, 1));
+}
+
+fn dispatch_bidir_attn(
+    gpu: &mut GpuContext, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer,
+    seq_len: u32, num_heads: u32, head_dim: u32,
+    window_start: u32, window_end: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { seq_len: u32, head_dim: u32, num_heads: u32,
+               window_start: u32, window_end: u32, _pad: [u32; 3] }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P {
+        seq_len, head_dim, num_heads, window_start, window_end, _pad: [0; 3],
+    }));
+    gpu.dispatch("qwen_asr_bidir_attn", shaders::BIDIR_ATTN, &[
+        bind(0, q), bind(1, k), bind(2, v), bind(3, output), bind(4, params),
+    ], (num_heads, seq_len, 1));
+}
+
+/// In-place add: a[i] += b[i].
+fn dispatch_add(
+    gpu: &mut GpuContext, a: &wgpu::Buffer, b: &wgpu::Buffer,
+    params: &wgpu::Buffer, n: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)]
+    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32 }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n }));
+    gpu.dispatch("add", shaders::ADD, &[
+        bind(0, a), bind(1, b), bind(2, params),
+    ], (n.div_ceil(256), 1, 1));
+}
+
