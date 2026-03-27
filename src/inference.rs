@@ -39,9 +39,12 @@ pub struct InferenceSession {
 impl InferenceSession {
     /// Load model from a directory containing safetensors + config.json + quantize_config.json.
     pub fn new(model_dir: PathBuf, max_seq_len: u32) -> Self {
+        log::info!("[shady-thinker] loading model from {:?} (max_seq={})", model_dir, max_seq_len);
         let config = weights::ModelConfig::from_file(&model_dir.join("config.json"));
         let quant_config =
             weights::QuantConfig::from_file(&model_dir.join("quantize_config.json"));
+        log::info!("[shady-thinker] config: {} layers, {} heads, dim={}",
+            config.num_hidden_layers, config.num_attention_heads, config.hidden_size);
 
         let mut gpu = GpuContext::new();
         let (model_weights, raw_norms) = weights::load_weights(&gpu, &model_dir, &config);
@@ -54,6 +57,7 @@ impl InferenceSession {
             }
         }
 
+        log::info!("[shady-thinker] model ready");
         Self { model, gpu, config }
     }
 
@@ -85,14 +89,19 @@ impl InferenceSession {
             };
         }
 
+        log::info!("[shady-thinker] generate: {} input tokens, max_tokens={}", input_ids.len(), max_tokens);
+
         // Reset KV cache
         self.model.seq_len = 0;
         self.model.generated_tokens.clear();
 
         // Prefill: feed all but last token
+        let prefill_start = std::time::Instant::now();
         for &tok in &input_ids[..input_ids.len() - 1] {
             self.model.forward(&mut self.gpu, tok);
         }
+        let prefill_ms = prefill_start.elapsed().as_millis();
+        log::info!("[shady-thinker] prefill: {} tokens in {}ms", input_ids.len() - 1, prefill_ms);
 
         // First decode step
         let decode_start = std::time::Instant::now();
@@ -121,6 +130,10 @@ impl InferenceSession {
         } else {
             0.0
         };
+
+        log::info!("[shady-thinker] decode: {} tokens in {:.0}ms ({:.1} tok/s){}",
+            count, elapsed.as_millis(), tps,
+            if interrupted { " [interrupted]" } else { "" });
 
         GenerateResult {
             token_ids: generated,
