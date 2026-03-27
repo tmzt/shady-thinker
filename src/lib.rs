@@ -1,3 +1,4 @@
+pub mod asr_encoder;
 pub mod gpu;
 pub mod inference;
 #[cfg(feature = "jit-lora")]
