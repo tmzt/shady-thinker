@@ -103,7 +103,7 @@ impl AsrEncoder {
 
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
-            let p = format!("model.encoder.layers.{i}");
+            let p = format!("thinker.audio_tower.layers.{i}");
             let layer = EncoderLayer {
                 wq: gpu.upload_buffer(&format!("{p}.q"), get_tensor(&format!("{p}.self_attn.q_proj.weight"))),
                 wk: gpu.upload_buffer(&format!("{p}.k"), get_tensor(&format!("{p}.self_attn.k_proj.weight"))),
@@ -128,12 +128,12 @@ impl AsrEncoder {
             }
         }
 
-        let ln_post_w = gpu.upload_buffer("enc.ln_w", get_tensor("model.encoder.layer_norm.weight"));
-        let ln_post_b = gpu.upload_buffer("enc.ln_b", get_tensor("model.encoder.layer_norm.bias"));
-        let proj1_w = gpu.upload_buffer("enc.p1_w", get_tensor("model.encoder.proj1.weight"));
-        let proj1_b = gpu.upload_buffer("enc.p1_b", get_tensor("model.encoder.proj1.bias"));
-        let proj2_w = gpu.upload_buffer("enc.p2_w", get_tensor("model.encoder.proj2.weight"));
-        let proj2_b = gpu.upload_buffer("enc.p2_b", get_tensor("model.encoder.proj2.bias"));
+        let ln_post_w = gpu.upload_buffer("enc.ln_w", get_tensor("thinker.audio_tower.ln_post.weight"));
+        let ln_post_b = gpu.upload_buffer("enc.ln_b", get_tensor("thinker.audio_tower.ln_post.bias"));
+        let proj1_w = gpu.upload_buffer("enc.p1_w", get_tensor("thinker.audio_tower.proj1.weight"));
+        let proj1_b = gpu.upload_buffer("enc.p1_b", get_tensor("thinker.audio_tower.proj1.bias"));
+        let proj2_w = gpu.upload_buffer("enc.p2_w", get_tensor("thinker.audio_tower.proj2.weight"));
+        let proj2_b = gpu.upload_buffer("enc.p2_b", get_tensor("thinker.audio_tower.proj2.bias"));
 
         log::info!("[asr-encoder] loaded {} layers onto GPU", layers.len());
 
@@ -274,12 +274,22 @@ impl AsrEncoder {
         let text = std::fs::read_to_string(path).expect("config.json not found");
         let v: serde_json::Value = serde_json::from_str(&text).expect("invalid config.json");
 
-        let enc = &v["encoder"];
+        // Config path: thinker_config.audio_config or audio_config (Qwen3-ASR format)
+        let enc = if v["thinker_config"]["audio_config"].is_object() {
+            &v["thinker_config"]["audio_config"]
+        } else if v["audio_config"].is_object() {
+            &v["audio_config"]
+        } else {
+            panic!("no audio_config found in config.json");
+        };
         let d_model = enc["d_model"].as_u64().unwrap_or(1024) as u32;
         let num_layers = enc["encoder_layers"].as_u64().unwrap_or(24) as u32;
         let num_heads = enc["encoder_attention_heads"].as_u64().unwrap_or(16) as u32;
         let ffn_dim = enc["encoder_ffn_dim"].as_u64().unwrap_or(4096) as u32;
-        let output_dim = enc.get("output_dim").and_then(|v| v.as_u64()).unwrap_or(2048) as u32;
+        // output_dim is d_model for the projection — check for explicit value
+        let output_dim = enc.get("output_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(d_model as u64 * 2) as u32;  // typically 2x d_model
 
         AsrEncoderConfig { d_model, num_layers, num_heads, head_dim: 64, ffn_dim, output_dim }
     }
