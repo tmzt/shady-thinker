@@ -56,9 +56,13 @@ impl GpuContext {
             limits.max_buffer_size / (1024 * 1024),
             limits.max_storage_buffer_binding_size / (1024 * 1024),
         );
-        // Ensure large enough for embedding tables (~1GB for 248K vocab)
-        limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
-        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(1u32 << 30);
+        // For LLM: ensure large enough for embedding tables (~1GB for 248K vocab).
+        // For ASR encoder: adapter defaults are sufficient (~128MB).
+        // Only request larger if the adapter already supports it.
+        if limits.max_buffer_size >= (1u64 << 30) {
+            limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(1u32 << 30);
+        }
 
         let (device, queue) = adapter
             .request_device(
