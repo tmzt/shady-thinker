@@ -33,7 +33,11 @@ impl GpuContext {
     }
 
     async fn init() -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        log::info!("[shady-thinker] requesting GPU adapter (Vulkan preferred)...");
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -42,7 +46,9 @@ impl GpuContext {
             .await
             .expect("no suitable GPU adapter found");
 
-        log::info!("GPU: {}", adapter.get_info().name);
+        let info = adapter.get_info();
+        log::info!("[shady-thinker] GPU: {} (backend={:?}, type={:?})",
+            info.name, info.backend, info.device_type);
 
         let mut limits = adapter.limits();
         log::info!(
