@@ -61,6 +61,65 @@ fn load_and_forward_env() {
     }
 }
 
+/// Compare GPU encoder output to C reference using real conv stem data.
+/// Run test_split_encoder first to generate /tmp/conv_stem_*.f32 and /tmp/enc_ref_*.f32
+#[test]
+fn compare_to_c_reference() {
+    let _ = env_logger::try_init();
+
+    let stem_path = "/tmp/conv_stem_33_896.f32";
+    let ref_path = "/tmp/enc_ref_33_1024.f32";
+    if !std::path::Path::new(stem_path).exists() {
+        eprintln!("SKIP: run test_split_encoder first to generate {}", stem_path);
+        return;
+    }
+
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-0.6b");
+    if !model_dir.exists() { eprintln!("SKIP: model not found"); return; }
+
+    // Load conv stem output (from C)
+    let stem_bytes = std::fs::read(stem_path).unwrap();
+    let stem: &[f32] = bytemuck::cast_slice(&stem_bytes);
+    let seq_len = 33u32;
+    let d_model = 896u32;
+    assert_eq!(stem.len(), (seq_len * d_model) as usize);
+    eprintln!("Loaded conv stem: {} tokens × {}", seq_len, d_model);
+    eprintln!("  stem[0][0:4]: {:?}", &stem[..4]);
+
+    // Load C reference encoder output
+    let ref_bytes = std::fs::read(ref_path).unwrap();
+    let reference: &[f32] = bytemuck::cast_slice(&ref_bytes);
+    let out_dim = 1024u32;
+    assert_eq!(reference.len(), (seq_len * out_dim) as usize);
+    eprintln!("Loaded C reference: {} tokens × {}", seq_len, out_dim);
+    eprintln!("  ref[0][0:4]: {:?}", &reference[..4]);
+
+    // Run GPU encoder
+    let mut encoder = shady_thinker::asr_encoder::AsrEncoder::new(model_dir);
+    let t0 = std::time::Instant::now();
+    let gpu_output = encoder.forward(stem, seq_len);
+    let fwd_ms = t0.elapsed().as_millis();
+    eprintln!("GPU forward: {}ms", fwd_ms);
+    eprintln!("  gpu[0][0:4]: {:?}", &gpu_output[..4]);
+
+    // Compare
+    let mut max_diff: f32 = 0.0;
+    let mut sum_diff: f32 = 0.0;
+    for i in 0..reference.len() {
+        let diff = (gpu_output[i] - reference[i]).abs();
+        max_diff = max_diff.max(diff);
+        sum_diff += diff;
+    }
+    let avg_diff = sum_diff / reference.len() as f32;
+    eprintln!("Comparison: max_diff={:.6}, avg_diff={:.6}", max_diff, avg_diff);
+
+    // bf16 weights have ~0.4% relative error, so allow some tolerance
+    if max_diff > 0.5 {
+        eprintln!("WARNING: max_diff > 0.5 — results may diverge");
+    }
+    eprintln!("DONE");
+}
+
 /// Test scaling with realistic sequence lengths.
 /// 2s audio ≈ 25 tokens, 5s ≈ 62, 10s ≈ 125, 30s ≈ 375
 #[test]
