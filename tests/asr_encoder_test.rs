@@ -60,3 +60,27 @@ fn load_and_forward_env() {
         eprintln!("SKIP: set MODEL=<name> to run this test");
     }
 }
+
+/// Test scaling with realistic sequence lengths.
+/// 2s audio ≈ 25 tokens, 5s ≈ 62, 10s ≈ 125, 30s ≈ 375
+#[test]
+fn scaling_0_6b() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-0.6b");
+    if !model_dir.exists() { eprintln!("SKIP"); return; }
+
+    let mut encoder = shady_thinker::asr_encoder::AsrEncoder::new(model_dir);
+    let d = encoder.config.d_model;
+
+    for &seq_len in &[25u32, 62, 125, 250, 375] {
+        let input: Vec<f32> = (0..seq_len * d).map(|i| (i as f32 * 0.001).sin()).collect();
+        let t0 = std::time::Instant::now();
+        let output = encoder.forward(&input, seq_len);
+        let ms = t0.elapsed().as_millis();
+        let audio_s = seq_len as f32 * 0.08; // ~80ms per token
+        let rtf = ms as f32 / (audio_s * 1000.0);
+        eprintln!("seq_len={:>3} (~{:.0}s audio) → {}ms (RTF={:.2}x)",
+            seq_len, audio_s, ms, rtf);
+        assert_eq!(output.len(), (seq_len * encoder.config.output_dim) as usize);
+    }
+}
