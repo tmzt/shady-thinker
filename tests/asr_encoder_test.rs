@@ -155,6 +155,20 @@ fn compare_to_c_reference() {
     eprintln!("DONE");
 }
 
+/// Test loading 1.7B decoder weights.
+#[test]
+fn load_decoder_1_7b() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-1.7b");
+    if !model_dir.exists() { eprintln!("SKIP: model not found"); return; }
+
+    let t0 = std::time::Instant::now();
+    let decoder = shady_thinker::asr_decoder::AsrDecoder::new(model_dir, 2048);
+    let ms = t0.elapsed().as_millis();
+    eprintln!("Decoder config: {:?}", decoder.config);
+    eprintln!("Loaded in {}ms", ms);
+}
+
 /// Test scaling with realistic sequence lengths.
 /// 2s audio ≈ 25 tokens, 5s ≈ 62, 10s ≈ 125, 30s ≈ 375
 #[test]
