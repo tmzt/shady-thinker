@@ -178,6 +178,8 @@ pub fn gpu_asr_decode(
 }
 
 /// GPU ASR decode returning raw token IDs (for caller to decode with tokenizer).
+/// Uses batched GEMM prefill for prompt tokens + encoder embeddings,
+/// then token-by-token autoregressive decode.
 pub fn gpu_asr_decode_tokens(
     gpu: &mut GpuContext,
     model: &mut Model,
@@ -192,29 +194,44 @@ pub fn gpu_asr_decode_tokens(
 
     let t0 = std::time::Instant::now();
 
-    // Prefill prefix
-    for &tok in PREFIX_HEAD {
-        model.forward_argmax(gpu, tok);
-    }
-    for &tok in PREFIX_TAIL {
-        model.forward_argmax(gpu, tok);
-    }
-
-    // Prefill encoder output embeddings
-    for i in 0..enc_seq_len as usize {
-        let embed = &encoder_output[i * hidden..(i + 1) * hidden];
-        model.forward_embed_argmax(gpu, embed);
-    }
-
-    // Prefill suffix
+    // Build input embeddings: prefix tokens + encoder output + suffix tokens
+    let prefix: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
     let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
-    for &tok in &suffix[..suffix.len() - 1] {
-        model.forward_argmax(gpu, tok);
+    let total_seq = prefix.len() + enc_seq_len as usize + suffix.len();
+
+    // Lookup token embeddings on CPU (bf16 → f32) and concatenate with encoder output
+    let mut input_embeds = Vec::with_capacity(total_seq * hidden);
+
+    // Prefix token embeddings
+    for &tok in &prefix {
+        model.embedding(gpu, tok);
+        gpu.flush();
+        let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
+        input_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
     }
 
-    // Generate
+    // Encoder output embeddings (already f32)
+    input_embeds.extend_from_slice(encoder_output);
+
+    // Suffix token embeddings
+    for &tok in &suffix {
+        model.embedding(gpu, tok);
+        gpu.flush();
+        let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
+        input_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
+    }
+
+    let embed_ms = t0.elapsed().as_millis();
+    log::info!("[asr-decode] built {} embeddings in {}ms", total_seq, embed_ms);
+
+    // Batched prefill: all tokens through all layers at once
     let t1 = std::time::Instant::now();
-    let mut token = model.forward_argmax(gpu, suffix[suffix.len() - 1]);
+    let mut token = model.prefill(gpu, &input_embeds, total_seq as u32);
+    let prefill_ms = t1.elapsed().as_millis();
+    log::info!("[asr-decode] prefill: {} tokens in {}ms, first_token={}", total_seq, prefill_ms, token);
+
+    // Autoregressive decode
+    let t2 = std::time::Instant::now();
     let mut token_ids: Vec<u32> = Vec::new();
     let mut n_generated = 0u32;
 
@@ -228,8 +245,8 @@ pub fn gpu_asr_decode_tokens(
     }
 
     let total_ms = t0.elapsed().as_millis();
-    log::info!("[asr-decode] {} tokens generated in {}ms (decode: {}ms)",
-        token_ids.len(), total_ms, t1.elapsed().as_millis());
+    log::info!("[asr-decode] {} tokens generated in {}ms (prefill: {}ms, decode: {}ms)",
+        token_ids.len(), total_ms, prefill_ms, t2.elapsed().as_millis());
 
     token_ids
 }

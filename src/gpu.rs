@@ -294,6 +294,25 @@ impl GpuContext {
         data
     }
 
+    /// Read a sub-range of a buffer to CPU.
+    pub fn read_buffer_offset(&mut self, buffer: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
+        self.flush();
+        let staging = self.create_readback_buffer("readback_off", size);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback_off"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        data
+    }
+
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.queue.write_buffer(buffer, offset, data);
     }

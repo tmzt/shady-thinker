@@ -20,6 +20,13 @@ mod shaders {
     pub const SILU_MUL: &str = include_str!("shaders/silu_mul.wgsl");
     pub const FUSED_CONV_DELTANET_NORM: &str = include_str!("shaders/fused_conv_deltanet_norm.wgsl");
 
+    // Batched prefill shaders
+    pub const BF16_GEMM: &str = include_str!("shaders/bf16_gemm.wgsl");
+    pub const BATCHED_RMSNORM: &str = include_str!("shaders/batched_rmsnorm.wgsl");
+    pub const BATCHED_ADD_RMSNORM: &str = include_str!("shaders/batched_add_rmsnorm.wgsl");
+    pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
+    pub const CAUSAL_ATTENTION_PREFILL: &str = include_str!("shaders/causal_attention_prefill.wgsl");
+
     // LoRA shaders
     #[cfg(feature = "jit-lora")]
     pub const LORA_DOWN: &str = include_str!("shaders/lora_down.wgsl");
@@ -1218,6 +1225,294 @@ impl Model {
         }
 
         self.seq_len += 1;
+
+        // Greedy argmax
+        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, _) = logits.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let token = max_idx as u32;
+        self.generated_tokens.push(token);
+        token
+    }
+
+    /// Batched prefill: process input_embeds [seq_len, hidden_size] through all layers.
+    /// Populates KV cache for subsequent autoregressive decode.
+    /// Returns the argmax token predicted from the last position.
+    /// bf16_mode must be true. q_gated must be false (ASR decoder).
+    pub fn prefill(&mut self, gpu: &mut GpuContext, input_embeds: &[f32], seq_len: u32) -> u32 {
+        assert!(self.bf16_mode, "prefill requires bf16_mode");
+        assert!(!self.q_gated, "prefill only supports non-gated Q (ASR decoder)");
+
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nh = self.config.num_attention_heads;
+        let nkv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+        let f = 4u64; // bytes per f32
+        let sl = seq_len as u64;
+
+        // Upload input embeddings
+        let x_buf = gpu.upload_buffer("prefill_x", bytemuck::cast_slice(input_embeds));
+
+        // Allocate batched scratch buffers
+        let residual = gpu.create_storage_buffer("pf_residual", sl * h as u64 * f);
+        let normed = gpu.create_storage_buffer("pf_normed", sl * h as u64 * f);
+        let q_buf = gpu.create_storage_buffer("pf_q", sl * (nh * hd) as u64 * f);
+        let k_buf = gpu.create_storage_buffer("pf_k", sl * (nkv * hd) as u64 * f);
+        let v_buf = gpu.create_storage_buffer("pf_v", sl * (nkv * hd) as u64 * f);
+        let attn_out = gpu.create_storage_buffer("pf_attn", sl * (nh * hd) as u64 * f);
+        let o_out = gpu.create_storage_buffer("pf_o", sl * h as u64 * f);
+        let gate_buf = gpu.create_storage_buffer("pf_gate", sl * inter as u64 * f);
+        let up_buf = gpu.create_storage_buffer("pf_up", sl * inter as u64 * f);
+        let silu_buf = gpu.create_storage_buffer("pf_silu", sl * inter as u64 * f);
+        let mlp_out = gpu.create_storage_buffer("pf_mlp", sl * h as u64 * f);
+
+        // Params buffer for prefill dispatches
+        let params = gpu.create_buffer("pf_params", 256,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+
+        // Copy x → residual
+        gpu.copy_buffer(&x_buf, &residual, sl * h as u64 * f);
+
+        // Build batched qknorm shader with model constants
+        let batched_qknorm_src = {
+            let partial_dim = (self.config.head_dim as f32 * self.config.partial_rotary_factor) as u32;
+            let s_limit = partial_dim / 2;
+            format!(
+                "const ROPE_THETA: f32 = {:.1};\n\
+                 const PARTIAL_DIM: u32 = {}u;\n\
+                 const MROPE_INTERLEAVED: bool = {};\n\n{}",
+                self.config.rope_theta,
+                partial_dim,
+                self.config.mrope_interleaved(),
+                include_str!("shaders/batched_qknorm_rope.wgsl")
+                    .lines()
+                    .skip(12) // skip comment block (9 lines) + 3 const lines
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+
+        for layer_idx in 0..self.config.num_hidden_layers as usize {
+            let layer = &self.weights.layers[layer_idx];
+
+            // ── RMSNorm ──
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct NormP { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+
+            if layer_idx == 0 {
+                // First layer: rmsnorm(x_buf)
+                gpu.flush();
+                gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                    n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+                gpu.dispatch("pf_norm", shaders::BATCHED_RMSNORM, &[
+                    gpu::bind(0, &x_buf),
+                    gpu::bind(1, &layer.input_layernorm),
+                    gpu::bind(2, &normed),
+                    gpu::bind(3, &params),
+                ], (seq_len, 1, 1));
+            } else {
+                // add_rmsnorm(residual += mlp_out, normed)
+                gpu.flush();
+                gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                    n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+                gpu.dispatch("pf_addnorm", shaders::BATCHED_ADD_RMSNORM, &[
+                    gpu::bind(0, &residual),
+                    gpu::bind(1, &mlp_out),
+                    gpu::bind(2, &layer.input_layernorm),
+                    gpu::bind(3, &normed),
+                    gpu::bind(4, &params),
+                ], (seq_len, 1, 1));
+            }
+
+            // ── Q/K/V projections (bf16 GEMM) ──
+            let sa = layer.self_attn().expect("ASR decoder must be self-attn");
+
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct GemmP { d_in: u32, d_out: u32, seq_len: u32, has_bias: u32 }
+
+            // Q: [seq_len, h] × [nh*hd, h]^T → [seq_len, nh*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nh * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_q_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.q_proj_qweight),
+                gpu::bind(2, &normed), // bias unused (has_bias=0)
+                gpu::bind(3, &q_buf),
+                gpu::bind(4, &params),
+            ], ((nh * hd).div_ceil(32), seq_len, 1));
+
+            // K: [seq_len, h] → [seq_len, nkv*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_k_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.k_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &k_buf),
+                gpu::bind(4, &params),
+            ], ((nkv * hd).div_ceil(32), seq_len, 1));
+
+            // V: [seq_len, h] → [seq_len, nkv*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_v_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.v_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &v_buf),
+                gpu::bind(4, &params),
+            ], ((nkv * hd).div_ceil(32), seq_len, 1));
+
+            // ── Q/K Norm + RoPE + KV cache write ──
+            // qknorm_params[layer_idx] was pre-filled by init_qknorm_params with
+            // header (num_heads, kv_heads, head_dim, eps) + packed norm weights.
+            // The batched shader reads position from workgroup_id.y, not the buffer.
+            gpu.flush();
+            gpu.dispatch(&format!("pf_qknorm_l{layer_idx}"), &batched_qknorm_src, &[
+                gpu::bind(0, &q_buf),
+                gpu::bind(1, &k_buf),
+                gpu::bind(2, &v_buf),
+                gpu::bind(3, &self.state.k_cache[layer_idx]),
+                gpu::bind(4, &self.state.v_cache[layer_idx]),
+                gpu::bind(5, &self.state.qknorm_params[layer_idx]),
+            ], (nh + nkv, seq_len, 1));
+
+            // ── Causal attention ──
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct AttnP { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&AttnP {
+                seq_len, head_dim: hd, num_kv_heads: nkv, num_q_heads: nh,
+                heads_per_kv: nh / nkv }));
+            gpu.dispatch(&format!("pf_attn_l{layer_idx}"), shaders::CAUSAL_ATTENTION_PREFILL, &[
+                gpu::bind(0, &q_buf),
+                gpu::bind(1, &k_buf),
+                gpu::bind(2, &v_buf),
+                gpu::bind(3, &attn_out),
+                gpu::bind(4, &params),
+            ], (nh, seq_len, 1));
+
+            // ── O projection: [seq_len, nh*hd] → [seq_len, h] ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: nh * hd, d_out: h, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_o_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &attn_out),
+                gpu::bind(1, &sa.o_proj_qweight),
+                gpu::bind(2, &attn_out),
+                gpu::bind(3, &o_out),
+                gpu::bind(4, &params),
+            ], (h.div_ceil(32), seq_len, 1));
+
+            // ── Post-attention norm: residual += o_out ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+            gpu.dispatch(&format!("pf_postnorm_l{layer_idx}"), shaders::BATCHED_ADD_RMSNORM, &[
+                gpu::bind(0, &residual),
+                gpu::bind(1, &o_out),
+                gpu::bind(2, &layer.post_attn_layernorm),
+                gpu::bind(3, &normed),
+                gpu::bind(4, &params),
+            ], (seq_len, 1, 1));
+
+            // ── MLP: gate + up → SiLU → down ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: inter, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_gate_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &layer.gate_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &gate_buf),
+                gpu::bind(4, &params),
+            ], (inter.div_ceil(32), seq_len, 1));
+
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: inter, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_up_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &layer.up_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &up_buf),
+                gpu::bind(4, &params),
+            ], (inter.div_ceil(32), seq_len, 1));
+
+            // SiLU(gate) * up → silu_buf
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct SiluP { n: u32 }
+            let total_silu = seq_len * inter;
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&SiluP { n: total_silu }));
+            gpu.dispatch(&format!("pf_silu_l{layer_idx}"), shaders::BATCHED_SILU_MUL, &[
+                gpu::bind(0, &gate_buf),
+                gpu::bind(1, &up_buf),
+                gpu::bind(2, &silu_buf),
+                gpu::bind(3, &params),
+            ], (total_silu.div_ceil(256), 1, 1));
+
+            // down_proj: [seq_len, inter] → [seq_len, h]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: inter, d_out: h, seq_len, has_bias: 0 }));
+            gpu.dispatch(&format!("pf_down_l{layer_idx}"), shaders::BF16_GEMM, &[
+                gpu::bind(0, &silu_buf),
+                gpu::bind(1, &layer.down_proj_qweight),
+                gpu::bind(2, &silu_buf),
+                gpu::bind(3, &mlp_out),
+                gpu::bind(4, &params),
+            ], (h.div_ceil(32), seq_len, 1));
+
+            if (layer_idx + 1) % 7 == 0 {
+                log::info!("[prefill] layer {}/{}", layer_idx + 1, self.config.num_hidden_layers);
+            }
+        }
+
+        // Final: residual += mlp_out from last layer
+        gpu.flush();
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct NormP2 { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+        gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP2 {
+            n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+        gpu.dispatch("pf_final_addnorm", shaders::BATCHED_ADD_RMSNORM, &[
+            gpu::bind(0, &residual),
+            gpu::bind(1, &mlp_out),
+            gpu::bind(2, &self.weights.final_norm),
+            gpu::bind(3, &normed),
+            gpu::bind(4, &params),
+        ], (seq_len, 1, 1));
+
+        // Extract last position's hidden state → state.normed for LM head
+        gpu.flush();
+        let last_offset = ((seq_len - 1) as u64) * h as u64 * f;
+        {
+            let last_bytes = gpu.read_buffer_offset(&normed, last_offset, h as u64 * f);
+            gpu.write_buffer(&self.state.normed, 0, &last_bytes);
+        }
+
+        // LM head
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, h, self.config.vocab_size);
+        }
+
+        self.seq_len = seq_len;
 
         // Greedy argmax
         let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
