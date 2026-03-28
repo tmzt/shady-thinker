@@ -145,9 +145,6 @@ pub struct Model {
     /// When true, RMSNorm uses direct `w` scaling (ASR decoder).
     /// When false, uses `(1 + w)` scaling (Qwen3.5).
     pub norm_direct: bool,
-    /// CPU-side bf16 embedding table (raw bytes). Used for bf16 mode where
-    /// the GPU embedding buffer may exceed max_storage_buffer_binding_size.
-    pub embed_tokens_cpu: Option<Vec<u8>>,
     tied_embeddings: bool,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
@@ -362,7 +359,6 @@ impl Model {
             bf16_mode: false,
             q_gated: true, // default: Qwen3.5 gated attention
             norm_direct: false, // default: Qwen3.5 (1+w) norm scaling
-            embed_tokens_cpu: None,
             tied_embeddings,
             qknorm_shader_src,
         }
@@ -574,19 +570,24 @@ impl Model {
     }
 
     pub fn embedding(&self, gpu: &mut GpuContext, token_id: u32) {
-        // CPU embedding lookup for bf16 mode (embedding table may exceed GPU binding limit)
-        if let Some(ref embed_data) = self.embed_tokens_cpu {
-            let dim = self.config.hidden_size as usize;
-            let offset = token_id as usize * dim * 2; // 2 bytes per bf16
-            let mut f32_embed = vec![0.0f32; dim];
-            for i in 0..dim {
-                let byte_idx = offset + i * 2;
-                if byte_idx + 1 < embed_data.len() {
-                    let bits = (embed_data[byte_idx] as u32) | ((embed_data[byte_idx + 1] as u32) << 8);
-                    f32_embed[i] = f32::from_bits(bits << 16);
-                }
-            }
-            gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(&f32_embed));
+        // Chunked embedding lookup
+        if !self.weights.embed_chunks.is_empty() {
+            let chunk_size = self.weights.embed_chunk_size;
+            let chunk_idx = token_id / chunk_size;
+            let local_id = token_id % chunk_size;
+            let chunk = &self.weights.embed_chunks[chunk_idx as usize];
+
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct P { token_id: u32, dim: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&P {
+                token_id: local_id, dim: self.config.hidden_size,
+            }));
+            gpu.dispatch("embedding", shaders::EMBEDDING, &[
+                gpu::bind(0, chunk),
+                gpu::bind(1, &self.state.hidden),
+                gpu::bind(2, &self.state.params),
+            ], (self.config.hidden_size.div_ceil(256), 1, 1));
             return;
         }
         #[repr(C)]
@@ -603,32 +604,37 @@ impl Model {
     }
 
     fn bf16_lm_head(&self, gpu: &mut GpuContext, weight: &wgpu::Buffer, h: u32) {
-        // CPU lm_head for bf16 mode (embed table may exceed GPU binding limit)
-        if let Some(ref embed_data) = self.embed_tokens_cpu {
-            let vocab = self.config.vocab_size as usize;
-            let dim = h as usize;
+        // Chunked lm_head: dispatch bf16_matvec per chunk, write to logits at correct offset
+        if !self.weights.embed_chunks.is_empty() {
+            let chunk_size = self.weights.embed_chunk_size;
+            let vocab = self.config.vocab_size;
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct LmP { hidden_size: u32, vocab_size: u32 }
 
-            // Read normed hidden from GPU
-            let normed_bytes = gpu.read_buffer(&self.state.normed, dim as u64 * 4);
-            let normed: &[f32] = bytemuck::cast_slice(&normed_bytes);
+            for (ci, chunk) in self.weights.embed_chunks.iter().enumerate() {
+                let chunk_start = ci as u32 * chunk_size;
+                let chunk_vocab = chunk_size.min(vocab - chunk_start);
 
-            // Compute logits on CPU: logits[v] = dot(embed[v], normed)
-            let mut logits = vec![0.0f32; vocab];
-            for v in 0..vocab {
-                let base = v * dim * 2; // bf16 byte offset
-                let mut sum = 0.0f32;
-                for k in 0..dim {
-                    let byte_idx = base + k * 2;
-                    if byte_idx + 1 < embed_data.len() {
-                        let bits = (embed_data[byte_idx] as u32) | ((embed_data[byte_idx + 1] as u32) << 8);
-                        let w = f32::from_bits(bits << 16);
-                        sum += w * normed[k];
-                    }
-                }
-                logits[v] = sum;
+                // Need a temp buffer for this chunk's logits, then copy to the right offset
+                let chunk_logits = gpu.create_storage_buffer(
+                    &format!("lm_chunk_{ci}"), chunk_vocab as u64 * 4);
+
+                self.write_params(gpu, bytemuck::bytes_of(&LmP {
+                    hidden_size: h, vocab_size: chunk_vocab,
+                }));
+                gpu.dispatch(&format!("lm_head_chunk_{ci}"), shaders::BF16_MATVEC, &[
+                    gpu::bind(0, &self.state.normed),
+                    gpu::bind(1, chunk),
+                    gpu::bind(2, &chunk_logits),
+                    gpu::bind(3, &self.state.params),
+                ], (chunk_vocab.div_ceil(32), 1, 1));
+
+                // Read chunk logits and write to the correct offset in the full logits buffer
+                gpu.flush();
+                let chunk_bytes = gpu.read_buffer(&chunk_logits, chunk_vocab as u64 * 4);
+                gpu.write_buffer(&self.state.logits, chunk_start as u64 * 4, &chunk_bytes);
             }
-
-            gpu.write_buffer(&self.state.logits, 0, bytemuck::cast_slice(&logits));
             return;
         }
         #[repr(C)]

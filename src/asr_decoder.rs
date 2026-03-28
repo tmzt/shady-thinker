@@ -43,26 +43,15 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
     };
 
     let gpu = GpuContext::new();
-    let (weights, raw_norms, embed_cpu) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
+    let (weights, raw_norms) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
 
-    // Check if embedding table exceeds GPU storage binding limit
-    let embed_bytes = config.vocab_size as u64 * config.hidden_size as u64 * 2; // bf16
-    let binding_limit = gpu.max_storage_binding_size();
-    let need_cpu_embed = embed_bytes > binding_limit as u64;
-
+    let chunked = !weights.embed_chunks.is_empty();
     let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
     model.bf16_mode = true;
     model.q_gated = false; // ASR decoder uses standard attention, not SiGLU-gated Q
     model.norm_direct = true; // ASR uses direct w scaling, not (1+w) like Qwen3.5
     model.rebuild_qknorm_shader();
-    if need_cpu_embed {
-        log::info!("[asr-decoder] embed table {}MB > binding limit {}MB, using CPU embed+lm_head",
-            embed_bytes / (1024 * 1024), binding_limit / (1024 * 1024));
-        model.embed_tokens_cpu = Some(embed_cpu);
-    } else {
-        log::info!("[asr-decoder] embed table {}MB fits in GPU binding ({}MB), using GPU embed+lm_head",
-            embed_bytes / (1024 * 1024), binding_limit / (1024 * 1024));
-    }
+    log::info!("[asr-decoder] embed chunked={}", chunked);
 
     for (i, norm) in raw_norms.layers.iter().enumerate() {
         if let Some((q, k)) = norm {
@@ -70,7 +59,7 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
         }
     }
 
-    log::info!("[asr-decoder] model ready (bf16_mode=true, cpu_embed={})", need_cpu_embed);
+    log::info!("[asr-decoder] model ready (bf16_mode=true, chunked_embed={})", chunked);
     (gpu, model)
 }
 

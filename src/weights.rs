@@ -87,6 +87,11 @@ pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
     /// Which layers are self-attention (vs DeltaNet)
     pub self_attn_layers: Vec<usize>,
+    /// Chunked embedding table for 128MB binding limit.
+    /// Empty means embed_tokens holds the full table.
+    pub embed_chunks: Vec<wgpu::Buffer>,
+    /// Tokens per chunk (0 if not chunked)
+    pub embed_chunk_size: u32,
 }
 
 /// Model configuration parsed from config.json
@@ -539,6 +544,8 @@ pub fn load_weights(
             lm_head_is_bf16: lm_head_is_unquantized,
             self_attn_layers: self_attn_indices,
             layers,
+            embed_chunks: Vec::new(),
+            embed_chunk_size: 0,
         },
         RawNormWeights {
             layers: norm_weights,
@@ -553,7 +560,7 @@ pub fn load_weights_bf16(
     gpu: &GpuContext,
     model_dir: &Path,
     config: &ModelConfig,
-) -> (ModelWeights, RawNormWeights, Vec<u8>) {
+) -> (ModelWeights, RawNormWeights) {
     let mut shard_files: Vec<_> = std::fs::read_dir(model_dir)
         .expect("read model dir")
         .filter_map(|e| e.ok())
@@ -586,9 +593,34 @@ pub fn load_weights_bf16(
     // Dummy 4-byte buffer for scales (unused in bf16 mode)
     let dummy = gpu.create_storage_buffer("dummy", 4);
 
-    // Embedding — keep CPU copy for CPU embed/lm_head (table may exceed GPU binding limit)
-    let embed_bytes = get("thinker.model.embed_tokens.weight").to_vec();
-    let embed = gpu.upload_buffer("embed", &embed_bytes);
+    // Embedding — chunk if needed for binding limit
+    let embed_raw = get("thinker.model.embed_tokens.weight");
+    let binding_limit = gpu.max_storage_binding_size() as usize;
+    let embed_total_bytes = embed_raw.len();
+    let bytes_per_token = config.hidden_size as usize * 2; // bf16
+    let needs_chunking = embed_total_bytes > binding_limit;
+
+    let (embed, embed_chunks, embed_chunk_size) = if needs_chunking {
+        let max_chunk_bytes = (binding_limit - 1024) & !3; // stay under limit, aligned
+        let tokens_per_chunk = max_chunk_bytes / bytes_per_token;
+        let n_chunks = (config.vocab_size as usize + tokens_per_chunk - 1) / tokens_per_chunk;
+        log::info!("[bf16] embedding {}MB > {}MB binding — splitting into {} chunks of {} tokens",
+            embed_total_bytes / (1024*1024), binding_limit / (1024*1024), n_chunks, tokens_per_chunk);
+
+        let mut chunks = Vec::new();
+        for c in 0..n_chunks {
+            let start = c * tokens_per_chunk * bytes_per_token;
+            let end = ((c + 1) * tokens_per_chunk * bytes_per_token).min(embed_raw.len());
+            chunks.push(gpu.upload_buffer(&format!("embed_chunk_{c}"), &embed_raw[start..end]));
+        }
+        // First chunk doubles as embed_tokens for compatibility
+        let dummy_embed = gpu.create_storage_buffer("embed_dummy", 4);
+        (dummy_embed, chunks, tokens_per_chunk as u32)
+    } else {
+        let embed_bytes = embed_raw.to_vec();
+        let embed = gpu.upload_buffer("embed", &embed_bytes);
+        (embed, Vec::new(), 0u32)
+    };
     let final_norm = upload("final_norm", "thinker.model.norm.weight");
 
     // lm_head
@@ -655,10 +687,11 @@ pub fn load_weights_bf16(
             lm_head_is_bf16: true,
             self_attn_layers: self_attn_indices,
             layers,
+            embed_chunks,
+            embed_chunk_size,
         },
         RawNormWeights {
             layers: norm_weights,
         },
-        embed_bytes,
     )
 }

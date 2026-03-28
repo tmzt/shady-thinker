@@ -183,7 +183,7 @@ fn load_decoder_1_7b() {
     let quant_config = shady_thinker::weights::QuantConfig {
         bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false,
     };
-    let (weights, raw_norms, _embed_cpu) = shady_thinker::weights::load_weights_bf16(&gpu, model_dir, &config);
+    let (weights, raw_norms) = shady_thinker::weights::load_weights_bf16(&gpu, model_dir, &config);
     let mut model = shady_thinker::model::Model::new(&gpu, config.clone(), quant_config, weights, 512);
     model.bf16_mode = true;
     for (i, norm) in raw_norms.layers.iter().enumerate() {
