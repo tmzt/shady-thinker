@@ -17,6 +17,7 @@ mod shaders {
     pub const GPTQ_MATVEC: &str = include_str!("shaders/gptq_matvec.wgsl");
     pub const FUSED_SILU_GPTQ: &str = include_str!("shaders/fused_silu_gptq.wgsl");
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
+    pub const BF16_MATVEC_TILED: &str = include_str!("shaders/bf16_matvec_tiled.wgsl");
     pub const SILU_MUL: &str = include_str!("shaders/silu_mul.wgsl");
     pub const FUSED_CONV_DELTANET_NORM: &str = include_str!("shaders/fused_conv_deltanet_norm.wgsl");
 

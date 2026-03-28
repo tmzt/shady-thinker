@@ -223,9 +223,10 @@ fn gpu_encoder_gpu_decoder_e2e() {
 
     // GPU decoder (1.7B) — full ASR decode with prompt structure
     let (mut gpu, mut model) = shady_thinker::asr_decoder::load_bf16_model(model_dir, 512);
+    let prefix_cache = shady_thinker::asr_decoder::precompute_prefix_cache(&mut gpu, &mut model);
 
     let token_ids = shady_thinker::asr_decoder::gpu_asr_decode_tokens(
-        &mut gpu, &mut model, &enc_output, seq_len);
+        &mut gpu, &mut model, &prefix_cache, &enc_output, seq_len);
 
     eprintln!("Decoded {} tokens: {:?}", token_ids.len(), &token_ids[..token_ids.len().min(20)]);
     assert!(!token_ids.is_empty(), "decoder produced no tokens");
@@ -319,9 +320,10 @@ fn gpu_full_pipeline_1_7b_real() {
         enc_output.clone()
     };
 
+    let prefix_cache = shady_thinker::asr_decoder::precompute_prefix_cache(&mut gpu, &mut model);
     let t1 = std::time::Instant::now();
     let token_ids = shady_thinker::asr_decoder::gpu_asr_decode_tokens(
-        &mut gpu, &mut model, &dec_input, seq_len);
+        &mut gpu, &mut model, &prefix_cache, &dec_input, seq_len);
     let total_ms = t1.elapsed().as_millis();
 
     eprintln!("GPU decoder: {} tokens in {}ms", token_ids.len(), total_ms);
@@ -720,6 +722,8 @@ fn gpu_pipeline_fox() {
 
     // GPU decoder
     let (mut gpu, mut model) = shady_thinker::asr_decoder::load_bf16_model(model_dir, 512);
-    let tokens = shady_thinker::asr_decoder::gpu_asr_decode_tokens(&mut gpu, &mut model, &enc_output, seq_len);
+    let prefix_cache = shady_thinker::asr_decoder::precompute_prefix_cache(&mut gpu, &mut model);
+    let tokens = shady_thinker::asr_decoder::gpu_asr_decode_tokens(
+        &mut gpu, &mut model, &prefix_cache, &enc_output, seq_len);
     eprintln!("GPU decoder: {} tokens: {:?}", tokens.len(), &tokens);
 }
