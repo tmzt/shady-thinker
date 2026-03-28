@@ -13,8 +13,11 @@ Possible fixes:
 ## GPU Encoder → Decoder Shared Buffer
 Currently encoder output goes GPU→CPU→GPU (readback f32 then re-upload as embeddings). Could keep the encoder output buffer on GPU and pass directly to decoder prefill. Zero-copy VRAM handoff.
 
-## Chunked Embedding for 128MB Binding Limit (PowerVR)
-The 1.7B embedding table is 584MB (151936 × 2048 × bf16). PowerVR DXT-48 has 128MB max_storage_buffer_binding. Need to split into 5 chunks (~120MB each) for both embedding lookup and lm_head dispatch. CPU fallback exists but is too slow for mobile.
+## ~~Chunked Embedding for 128MB Binding Limit~~ DONE
+Embedding split into 5 × ~120MB chunks. Lookup dispatches correct chunk per token ID. LM head iterates over chunks.
+
+## INT4 Quantization for Android GPU Decoder
+The 1.7B bf16 decoder needs ~2.7GB GPU memory + ~3.5GB CPU during safetensor loading = 6.9GB total. Android OOM kills at this level. INT4 GPTQ quantization would cut weights to ~400MB, making it feasible. The existing GPTQ matvec shaders could handle this — need quantized weights.
 
 ## Fused Gate+Up GEMM
 C decoder uses a single fused `gate_up_fused_bf16` weight `[2*intermediate, hidden]` for one GEMM. GPU does two separate GEMMs (gate_proj + up_proj). Fusing would halve the GEMM dispatches in MLP and may improve precision alignment with C.
