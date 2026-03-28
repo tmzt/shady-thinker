@@ -11,6 +11,7 @@ pub struct GpuContext {
     bind_group_cache: HashMap<BindGroupKey, wgpu::BindGroup>,
     encoder: Option<wgpu::CommandEncoder>,
     pending_dispatches: u32,
+    max_storage_binding: u32,
 }
 
 impl GpuContext {
@@ -22,6 +23,7 @@ impl GpuContext {
     /// This allows the caller to create a surface-compatible device and
     /// share it with both the UI renderer and the compute pipeline.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let limit = device.limits().max_storage_buffer_binding_size;
         Self {
             device,
             queue,
@@ -29,7 +31,12 @@ impl GpuContext {
             bind_group_cache: HashMap::new(),
             encoder: None,
             pending_dispatches: 0,
+            max_storage_binding: limit,
         }
+    }
+
+    pub fn max_storage_binding_size(&self) -> u32 {
+        self.max_storage_binding
     }
 
     async fn init() -> Self {
@@ -77,6 +84,7 @@ impl GpuContext {
             .await
             .expect("failed to create device");
 
+        let max_storage_binding = device.limits().max_storage_buffer_binding_size;
         Self {
             device,
             queue,
@@ -84,6 +92,7 @@ impl GpuContext {
             bind_group_cache: HashMap::new(),
             encoder: None,
             pending_dispatches: 0,
+            max_storage_binding,
         }
     }
 

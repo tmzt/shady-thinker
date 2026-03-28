@@ -553,7 +553,7 @@ pub fn load_weights_bf16(
     gpu: &GpuContext,
     model_dir: &Path,
     config: &ModelConfig,
-) -> (ModelWeights, RawNormWeights) {
+) -> (ModelWeights, RawNormWeights, Vec<u8>) {
     let mut shard_files: Vec<_> = std::fs::read_dir(model_dir)
         .expect("read model dir")
         .filter_map(|e| e.ok())
@@ -586,8 +586,9 @@ pub fn load_weights_bf16(
     // Dummy 4-byte buffer for scales (unused in bf16 mode)
     let dummy = gpu.create_storage_buffer("dummy", 4);
 
-    // Embedding (may need chunking for >128MB — handle at model level)
-    let embed = upload("embed", "thinker.model.embed_tokens.weight");
+    // Embedding — keep CPU copy for CPU embed/lm_head (table may exceed GPU binding limit)
+    let embed_bytes = get("thinker.model.embed_tokens.weight").to_vec();
+    let embed = gpu.upload_buffer("embed", &embed_bytes);
     let final_norm = upload("final_norm", "thinker.model.norm.weight");
 
     // lm_head
@@ -658,5 +659,6 @@ pub fn load_weights_bf16(
         RawNormWeights {
             layers: norm_weights,
         },
+        embed_bytes,
     )
 }

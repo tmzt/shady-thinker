@@ -6,6 +6,233 @@
 use std::path::{Path, PathBuf};
 use safetensors::SafeTensors;
 use crate::gpu::GpuContext;
+use crate::model::Model;
+use crate::weights::{ModelConfig, QuantConfig};
+
+/// Load a bf16 ASR decoder model ready for inference.
+/// Handles the nested ASR config (thinker_config.text_config).
+/// Returns (GpuContext, Model) with bf16_mode enabled.
+pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model) {
+    log::info!("[asr-decoder] loading bf16 model from {:?}", model_dir);
+
+    // Parse config — handle ASR nesting
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model_dir.join("config.json")).expect("config.json")
+    ).expect("parse json");
+
+    let text_cfg = if raw["thinker_config"]["text_config"].is_object() {
+        &raw["thinker_config"]["text_config"]
+    } else if raw["text_config"].is_object() {
+        &raw["text_config"]
+    } else {
+        &raw // top-level config
+    };
+    let mut config: ModelConfig = serde_json::from_value(text_cfg.clone()).expect("parse ModelConfig");
+    // ASR decoder uses full rotary encoding (partial_rotary_factor=1.0)
+    // The default 0.25 is for Qwen3.5, not ASR
+    if config.partial_rotary_factor < 1.0 && !text_cfg.get("partial_rotary_factor").is_some() {
+        config.partial_rotary_factor = 1.0;
+    }
+    log::info!("[asr-decoder] config: {} layers, hidden={}, heads={}, kv_heads={}, vocab={}, rope_theta={}, head_dim={}, partial_rot={}",
+        config.num_hidden_layers, config.hidden_size,
+        config.num_attention_heads, config.num_key_value_heads, config.vocab_size,
+        config.rope_theta, config.head_dim, config.partial_rotary_factor);
+
+    let quant_config = QuantConfig {
+        bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false,
+    };
+
+    let gpu = GpuContext::new();
+    let (weights, raw_norms, embed_cpu) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
+
+    // Check if embedding table exceeds GPU storage binding limit
+    let embed_bytes = config.vocab_size as u64 * config.hidden_size as u64 * 2; // bf16
+    let binding_limit = gpu.max_storage_binding_size();
+    let need_cpu_embed = embed_bytes > binding_limit as u64;
+
+    let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
+    model.bf16_mode = true;
+    model.q_gated = false; // ASR decoder uses standard attention, not SiGLU-gated Q
+    model.rebuild_qknorm_shader();
+    if need_cpu_embed {
+        log::info!("[asr-decoder] embed table {}MB > binding limit {}MB, using CPU embed+lm_head",
+            embed_bytes / (1024 * 1024), binding_limit / (1024 * 1024));
+        model.embed_tokens_cpu = Some(embed_cpu);
+    } else {
+        log::info!("[asr-decoder] embed table {}MB fits in GPU binding ({}MB), using GPU embed+lm_head",
+            embed_bytes / (1024 * 1024), binding_limit / (1024 * 1024));
+    }
+
+    for (i, norm) in raw_norms.layers.iter().enumerate() {
+        if let Some((q, k)) = norm {
+            model.init_qknorm_params(&gpu, i, q, k);
+        }
+    }
+
+    log::info!("[asr-decoder] model ready (bf16_mode=true, cpu_embed={})", need_cpu_embed);
+    (gpu, model)
+}
+
+// ── Qwen3-ASR prompt token IDs ──
+const TOKEN_IM_START: u32 = 151644;
+const TOKEN_IM_END: u32 = 151645;
+const TOKEN_ENDOFTEXT: u32 = 151643;
+const TOKEN_AUDIO_START: u32 = 151669;
+const TOKEN_AUDIO_END: u32 = 151670;
+const TOKEN_ASR_TEXT: u32 = 151704;
+
+/// Prompt structure: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
+const PREFIX_HEAD: &[u32] = &[TOKEN_IM_START, 8948, 198]; // <|im_start|>system\n
+const PREFIX_TAIL: &[u32] = &[TOKEN_IM_END, 198, TOKEN_IM_START, 872, 198, TOKEN_AUDIO_START];
+/// <|audio_end|><|im_end|>\n<|im_start|>assistant\n
+const SUFFIX_BASE: &[u32] = &[TOKEN_AUDIO_END, TOKEN_IM_END, 198, TOKEN_IM_START, 77091, 198];
+
+/// GPU ASR decode: encoder output → text.
+/// Takes encoder output embeddings [seq_len × hidden_size] and decodes to text tokens.
+/// Returns decoded text string.
+pub fn gpu_asr_decode(
+    gpu: &mut GpuContext,
+    model: &mut Model,
+    encoder_output: &[f32],
+    enc_seq_len: u32,
+) -> String {
+    let hidden = model.config.hidden_size as usize;
+    assert_eq!(encoder_output.len(), enc_seq_len as usize * hidden);
+
+    // Reset model state for fresh decode
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+
+    let t0 = std::time::Instant::now();
+
+    // ── Prefill: prefix tokens ──
+    for &tok in PREFIX_HEAD {
+        model.forward_argmax(gpu, tok);
+    }
+    for &tok in PREFIX_TAIL {
+        model.forward_argmax(gpu, tok);
+    }
+
+    let prefix_ms = t0.elapsed().as_millis();
+    log::info!("[asr-decode] prefix: {} tokens in {}ms",
+        PREFIX_HEAD.len() + PREFIX_TAIL.len(), prefix_ms);
+
+    // ── Prefill: encoder output embeddings ──
+    let t1 = std::time::Instant::now();
+    for i in 0..enc_seq_len as usize {
+        let embed = &encoder_output[i * hidden..(i + 1) * hidden];
+        model.forward_embed_argmax(gpu, embed);
+    }
+    let enc_ms = t1.elapsed().as_millis();
+    log::info!("[asr-decode] encoder prefill: {} tokens in {}ms ({:.1}ms/tok)",
+        enc_seq_len, enc_ms, enc_ms as f64 / enc_seq_len as f64);
+
+    // ── Prefill: suffix tokens (all but last) ──
+    let force_prompt = &[TOKEN_ASR_TEXT]; // language=en + <|asr_text|>
+    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(force_prompt.iter()).copied().collect();
+    for &tok in &suffix[..suffix.len() - 1] {
+        model.forward_argmax(gpu, tok);
+    }
+
+    // ── Generate from last suffix token ──
+    let t2 = std::time::Instant::now();
+    let mut token = model.forward_argmax(gpu, suffix[suffix.len() - 1]);
+
+    let mut text = String::new();
+    let mut n_generated = 0u32;
+    let max_tokens = 448u32; // ASR rarely needs more
+
+    // We need a tokenizer to decode tokens to text.
+    // For now, collect token IDs and return them as a format string
+    // that the caller can decode with the C tokenizer.
+    let mut token_ids: Vec<u32> = Vec::new();
+    let mut past_asr_text = true; // We forced <|asr_text|> as last prefix token
+
+    while n_generated < max_tokens {
+        n_generated += 1;
+
+        if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
+            break;
+        }
+
+        if token == TOKEN_ASR_TEXT {
+            past_asr_text = true;
+        } else if past_asr_text {
+            token_ids.push(token);
+        }
+
+        token = model.forward_argmax(gpu, token);
+    }
+
+    let decode_ms = t2.elapsed().as_millis();
+    let total_ms = t0.elapsed().as_millis();
+    log::info!("[asr-decode] decode: {} tokens in {}ms ({:.1}ms/tok), total={}ms",
+        n_generated, decode_ms,
+        if n_generated > 0 { decode_ms as f64 / n_generated as f64 } else { 0.0 },
+        total_ms);
+
+    // Return token IDs as space-separated string for C tokenizer decode,
+    // or if we add a Rust tokenizer later, decode directly here.
+    // For now, encode as binary: prefix with "TOKS:" marker.
+    token_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// GPU ASR decode returning raw token IDs (for caller to decode with tokenizer).
+pub fn gpu_asr_decode_tokens(
+    gpu: &mut GpuContext,
+    model: &mut Model,
+    encoder_output: &[f32],
+    enc_seq_len: u32,
+) -> Vec<u32> {
+    let hidden = model.config.hidden_size as usize;
+    assert_eq!(encoder_output.len(), enc_seq_len as usize * hidden);
+
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+
+    let t0 = std::time::Instant::now();
+
+    // Prefill prefix
+    for &tok in PREFIX_HEAD {
+        model.forward_argmax(gpu, tok);
+    }
+    for &tok in PREFIX_TAIL {
+        model.forward_argmax(gpu, tok);
+    }
+
+    // Prefill encoder output embeddings
+    for i in 0..enc_seq_len as usize {
+        let embed = &encoder_output[i * hidden..(i + 1) * hidden];
+        model.forward_embed_argmax(gpu, embed);
+    }
+
+    // Prefill suffix
+    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
+    for &tok in &suffix[..suffix.len() - 1] {
+        model.forward_argmax(gpu, tok);
+    }
+
+    // Generate
+    let t1 = std::time::Instant::now();
+    let mut token = model.forward_argmax(gpu, suffix[suffix.len() - 1]);
+    let mut token_ids: Vec<u32> = Vec::new();
+    let mut n_generated = 0u32;
+
+    while n_generated < 448 {
+        n_generated += 1;
+        if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
+        if token != TOKEN_ASR_TEXT {
+            token_ids.push(token);
+        }
+        token = model.forward_argmax(gpu, token);
+    }
+
+    let total_ms = t0.elapsed().as_millis();
+    log::info!("[asr-decode] {} tokens generated in {}ms (decode: {}ms)",
+        token_ids.len(), total_ms, t1.elapsed().as_millis());
+
+    token_ids
+}
 
 mod shaders {
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
@@ -150,28 +377,9 @@ impl AsrDecoder {
         }
     }
 
-    /// Run a single autoregressive decode step.
-    /// Returns the predicted token ID.
-    pub fn forward_token(&mut self, token_id: u32) -> u32 {
-        // TODO: implement — needs KV cache allocation, embedding lookup,
-        // layer loop with bf16_matvec, attention, MLP, lm_head, argmax
-        log::warn!("[asr-decoder] forward_token not yet implemented");
-        0
-    }
-
-    /// Prefill a sequence of embeddings (from encoder output + prompt).
-    /// Sets up the KV cache for subsequent autoregressive decode.
-    pub fn prefill(&mut self, _embeddings: &[f32], _seq_len: u32) {
-        // TODO: implement — batched bf16_gemm through all layers
-        log::warn!("[asr-decoder] prefill not yet implemented");
-    }
-
-    /// Generate tokens autoregressively until EOS or max_tokens.
-    pub fn generate(&mut self, _prompt_embeddings: &[f32], _seq_len: u32, _max_tokens: u32) -> Vec<u32> {
-        // TODO: implement — prefill + decode loop
-        log::warn!("[asr-decoder] generate not yet implemented");
-        Vec::new()
-    }
+    // Note: The actual decode logic uses the existing Model infrastructure.
+    // Use load_bf16_model() to get a (GpuContext, Model) pair,
+    // then call model.forward() for autoregressive decoding.
 
     fn parse_config(path: &Path, max_seq_len: u32) -> AsrDecoderConfig {
         let text = std::fs::read_to_string(path).expect("config.json");
