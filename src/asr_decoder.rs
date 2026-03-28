@@ -40,10 +40,9 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
 
     let gpu = GpuContext::new();
 
-    // Use INT4 quantization on Android (128MB binding, less GPU memory)
-    // Use bf16 on macOS/desktop (plenty of memory, higher quality)
-    let use_int4 = gpu.max_storage_binding_size() < 256 * 1024 * 1024
-        || std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
+    // INT4 runtime quantization available but quality is poor without calibration.
+    // Default to bf16 everywhere. INT4 can be forced with USE_INT4=1.
+    let use_int4 = std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
 
     let (weights, raw_norms, quant_config) = if use_int4 {
         let group_size = 128u32;
