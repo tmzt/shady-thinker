@@ -40,30 +40,42 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
 
     let gpu = GpuContext::new();
 
-    // INT4 runtime quantization available but quality is poor without calibration.
-    // Default to bf16 everywhere. INT4 can be forced with USE_INT4=1.
-    let use_int4 = std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
+    // Detect model format:
+    // - MLX INT4: has model.layers.N.*.biases tensors (pre-quantized, calibrated)
+    // - bf16: has thinker.model.layers.N.* tensors (original HF format)
+    let is_mlx = model_dir.join("config.json").exists() && {
+        let cfg_text = std::fs::read_to_string(model_dir.join("config.json")).unwrap_or_default();
+        cfg_text.contains("\"quant_method\"") || cfg_text.contains("\"quantization_config\"")
+    };
+    let use_int4_runtime = std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
 
-    let (weights, raw_norms, quant_config) = if use_int4 {
-        let group_size = 128u32;
-        let (w, n) = crate::weights::load_weights_int4(&gpu, model_dir, &config, group_size);
-        let qc = QuantConfig { bits: 4, group_size, quant_method: "gptq".to_string(), sym: true };
-        (w, n, qc)
+    let (weights, raw_norms, quant_config, mode) = if is_mlx {
+        let (w, n) = crate::weights::load_weights_mlx_int4(&gpu, model_dir, &config);
+        let qc = QuantConfig { bits: 4, group_size: 64, quant_method: "mlx".to_string(), sym: false };
+        (w, n, qc, "mlx-int4")
+    } else if use_int4_runtime {
+        let (w, n) = crate::weights::load_weights_int4(&gpu, model_dir, &config, 128);
+        let qc = QuantConfig { bits: 4, group_size: 128, quant_method: "gptq".to_string(), sym: true };
+        (w, n, qc, "int4-runtime")
     } else {
         let (w, n) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
         let qc = QuantConfig { bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false };
-        (w, n, qc)
+        (w, n, qc, "bf16")
     };
 
     let chunked = !weights.embed_chunks.is_empty();
+    let has_mlx_biases = !weights.mlx_biases.is_empty();
     let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
-    if !use_int4 {
+    if mode == "bf16" {
         model.bf16_mode = true;
+    }
+    if has_mlx_biases {
+        model.mlx_int4_mode = true;
     }
     model.q_gated = false;
     model.norm_direct = true;
     model.rebuild_qknorm_shader();
-    log::info!("[asr-decoder] mode={}, chunked_embed={}", if use_int4 { "int4" } else { "bf16" }, chunked);
+    log::info!("[asr-decoder] mode={}, chunked_embed={}", mode, chunked);
 
     for (i, norm) in raw_norms.layers.iter().enumerate() {
         if let Some((q, k)) = norm {

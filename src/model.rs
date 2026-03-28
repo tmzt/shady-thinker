@@ -29,6 +29,7 @@ mod shaders {
     pub const BATCHED_ADD_RMSNORM: &str = include_str!("shaders/batched_add_rmsnorm.wgsl");
     pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
     pub const CAUSAL_ATTENTION_PREFILL: &str = include_str!("shaders/causal_attention_prefill.wgsl");
+    pub const INT4_MATVEC_MLX: &str = include_str!("shaders/int4_matvec_mlx.wgsl");
 
     // LoRA shaders
     #[cfg(feature = "jit-lora")]
@@ -146,6 +147,13 @@ pub struct Model {
     /// When true, RMSNorm uses direct `w` scaling (ASR decoder).
     /// When false, uses `(1 + w)` scaling (Qwen3.5).
     pub norm_direct: bool,
+    /// When true, weights are MLX INT4 (asymmetric minmax, row-major).
+    /// Uses int4_matvec_mlx shader with separate biases buffer.
+    pub mlx_int4_mode: bool,
+    /// Current layer index during forward pass (for accessing mlx_biases)
+    mlx_current_layer: usize,
+    /// Which projection within a layer: 0=q,1=k,2=v,3=o,4=gate,5=up,6=down
+    mlx_current_proj: usize,
     tied_embeddings: bool,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
@@ -359,7 +367,10 @@ impl Model {
             use_4t,
             bf16_mode: false,
             q_gated: true, // default: Qwen3.5 gated attention
-            norm_direct: false, // default: Qwen3.5 (1+w) norm scaling
+            norm_direct: false,
+            mlx_int4_mode: false,
+            mlx_current_layer: 0,
+            mlx_current_proj: 0,
             tied_embeddings,
             qknorm_shader_src,
         }
@@ -393,6 +404,42 @@ impl Model {
     }
 
     // ── Dispatch helpers ──────────────────────────────────────────────
+
+    /// Dispatch matvec with mode-aware shader selection.
+    /// For MLX INT4: pass biases from mlx_biases[layer][proj].
+    /// proj: 0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down
+    pub fn matvec_layer(
+        &self, gpu: &mut GpuContext, name: &str,
+        input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
+        output: &wgpu::Buffer, k: u32, n: u32,
+        layer: usize, proj: usize,
+    ) {
+        if self.mlx_int4_mode && !self.weights.mlx_biases.is_empty() {
+            let biases = &self.weights.mlx_biases[layer][proj];
+            self.mlx_matvec(gpu, name, input, qweight, scales, biases, output, k, n);
+        } else {
+            self.gptq_matvec(gpu, name, input, qweight, scales, output, k, n);
+        }
+    }
+
+    /// MLX INT4 matvec: asymmetric dequant with separate biases buffer.
+    pub fn mlx_matvec(
+        &self, gpu: &mut GpuContext, name: &str,
+        input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
+        biases: &wgpu::Buffer, output: &wgpu::Buffer, k: u32, n: u32,
+    ) {
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct P { in_dim: u32, out_dim: u32, group_size: u32 }
+        self.write_params(gpu, bytemuck::bytes_of(&P {
+            in_dim: k, out_dim: n, group_size: self.quant_config.group_size,
+        }));
+        gpu.dispatch(name, shaders::INT4_MATVEC_MLX, &[
+            gpu::bind(0, input), gpu::bind(1, qweight),
+            gpu::bind(2, scales), gpu::bind(3, biases),
+            gpu::bind(4, output), gpu::bind(5, &self.state.params),
+        ], (n.div_ceil(32), 1, 1));
+    }
 
     pub fn gptq_matvec(
         &self, gpu: &mut GpuContext, name: &str,

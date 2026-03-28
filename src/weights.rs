@@ -175,10 +175,12 @@ pub struct ModelWeights {
     /// Which layers are self-attention (vs DeltaNet)
     pub self_attn_layers: Vec<usize>,
     /// Chunked embedding table for 128MB binding limit.
-    /// Empty means embed_tokens holds the full table.
     pub embed_chunks: Vec<wgpu::Buffer>,
     /// Tokens per chunk (0 if not chunked)
     pub embed_chunk_size: u32,
+    /// MLX INT4 biases per layer: [q, k, v, o, gate, up, down]
+    /// Empty for GPTQ/bf16 modes.
+    pub mlx_biases: Vec<[wgpu::Buffer; 7]>,
 }
 
 /// Model configuration parsed from config.json
@@ -633,6 +635,7 @@ pub fn load_weights(
             layers,
             embed_chunks: Vec::new(),
             embed_chunk_size: 0,
+            mlx_biases: Vec::new(),
         },
         RawNormWeights {
             layers: norm_weights,
@@ -780,6 +783,7 @@ pub fn load_weights_bf16(
             layers,
             embed_chunks,
             embed_chunk_size,
+            mlx_biases: Vec::new(),
         },
         RawNormWeights {
             layers: norm_weights,
@@ -857,5 +861,100 @@ pub fn load_weights_int4(
         embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
         lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
         layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
+        mlx_biases: Vec::new(),
+    }, RawNormWeights { layers: nw })
+}
+
+/// Load pre-quantized MLX INT4 weights (minmax, group_size=64).
+/// Tensor names: model.layers.N.* (MLX convention, no "thinker." prefix).
+/// Returns weights ready for int4_matvec_mlx shader.
+pub fn load_weights_mlx_int4(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig,
+) -> (ModelWeights, RawNormWeights) {
+    let mut sf: Vec<_> = std::fs::read_dir(model_dir).expect("read dir")
+        .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
+        .map(|e| e.path()).collect();
+    sf.sort();
+    log::info!("[mlx-int4] {} shard(s)", sf.len());
+    let mm: Vec<memmap2::Mmap> = sf.iter()
+        .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
+    let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
+
+    let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let up = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
+
+    // Embedding — quantized in MLX format, needs chunking for 128MB binding
+    // For embedding lookup we need a special dequant shader too.
+    // For now, upload qweight + scales + biases and dequant on CPU during lookup.
+    // TODO: GPU embedding dequant shader
+    let embed_qw = up("emb_qw", "model.embed_tokens.weight");
+    let embed_sc = up("emb_sc", "model.embed_tokens.scales");
+    let embed_bi = up("emb_bi", "model.embed_tokens.biases");
+
+    let fnorm = up("fn", "model.norm.weight");
+    let lmh = up("lmh", "lm_head.weight");
+    let dsc = gpu.create_storage_buffer("ds", 4);
+
+    let mut layers = Vec::new();
+    let mut nw = Vec::new();
+    let mut biases = Vec::new();
+    let t0 = std::time::Instant::now();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p = format!("model.layers.{i}");
+        nw.push(Some((
+            get(&format!("{p}.self_attn.q_norm.weight")).to_vec(),
+            get(&format!("{p}.self_attn.k_norm.weight")).to_vec(),
+        )));
+
+        let qq=up("qw",&format!("{p}.self_attn.q_proj.weight"));
+        let qs=up("qs",&format!("{p}.self_attn.q_proj.scales"));
+        let qb=up("qb",&format!("{p}.self_attn.q_proj.biases"));
+        let kq=up("kw",&format!("{p}.self_attn.k_proj.weight"));
+        let ks=up("ks",&format!("{p}.self_attn.k_proj.scales"));
+        let kb=up("kb",&format!("{p}.self_attn.k_proj.biases"));
+        let vq=up("vw",&format!("{p}.self_attn.v_proj.weight"));
+        let vs=up("vs",&format!("{p}.self_attn.v_proj.scales"));
+        let vb=up("vb",&format!("{p}.self_attn.v_proj.biases"));
+        let oq=up("ow",&format!("{p}.self_attn.o_proj.weight"));
+        let os=up("os",&format!("{p}.self_attn.o_proj.scales"));
+        let ob=up("ob",&format!("{p}.self_attn.o_proj.biases"));
+        let gq=up("gw",&format!("{p}.mlp.gate_proj.weight"));
+        let gs=up("gs",&format!("{p}.mlp.gate_proj.scales"));
+        let gb=up("gb",&format!("{p}.mlp.gate_proj.biases"));
+        let uq=up("uw",&format!("{p}.mlp.up_proj.weight"));
+        let us=up("us",&format!("{p}.mlp.up_proj.scales"));
+        let ub=up("ub",&format!("{p}.mlp.up_proj.biases"));
+        let dq=up("dw",&format!("{p}.mlp.down_proj.weight"));
+        let dss=up("dss",&format!("{p}.mlp.down_proj.scales"));
+        let db=up("db",&format!("{p}.mlp.down_proj.biases"));
+
+        layers.push(LayerWeights {
+            attn: AttnWeights::SelfAttn(SelfAttnWeights {
+                q_proj_qweight:qq, q_proj_scales:qs,
+                k_proj_qweight:kq, k_proj_scales:ks,
+                v_proj_qweight:vq, v_proj_scales:vs,
+                o_proj_qweight:oq, o_proj_scales:os,
+                q_norm:up("qn",&format!("{p}.self_attn.q_norm.weight")),
+                k_norm:up("kn",&format!("{p}.self_attn.k_norm.weight")),
+            }),
+            gate_proj_qweight:gq, gate_proj_scales:gs,
+            up_proj_qweight:uq, up_proj_scales:us,
+            down_proj_qweight:dq, down_proj_scales:dss,
+            input_layernorm:up("il",&format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm:up("pl",&format!("{p}.post_attention_layernorm.weight")),
+        });
+        biases.push([qb, kb, vb, ob, gb, ub, db]);
+
+        if (i+1)%7==0 { log::info!("[mlx-int4] layer {}/{} ({}ms)", i+1, config.num_hidden_layers, t0.elapsed().as_millis()); }
+    }
+    log::info!("[mlx-int4] done: {} layers in {}ms", layers.len(), t0.elapsed().as_millis());
+
+    (ModelWeights {
+        embed_tokens: embed_qw, final_norm: fnorm,
+        lm_head_qweight: lmh, lm_head_scales: dsc, lm_head_is_bf16: true,
+        self_attn_layers: (0..config.num_hidden_layers as usize).collect(),
+        layers, embed_chunks: Vec::new(), embed_chunk_size: 0,
+        mlx_biases: biases,
     }, RawNormWeights { layers: nw })
 }

@@ -87,6 +87,8 @@ fn main(
                 i += 1u;
             }
         }
+        // Second barrier: ensure all threads finish reading shared_input
+        // before the next iteration overwrites it
         workgroupBarrier();
 
         tile_start += TILE_K;
