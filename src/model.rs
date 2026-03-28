@@ -612,13 +612,13 @@ impl Model {
             #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
             struct LmP { hidden_size: u32, vocab_size: u32 }
 
+            // Temp buffer for one chunk's logits (reused across chunks)
+            let max_chunk_vocab = chunk_size;
+            let chunk_logits = gpu.create_storage_buffer("lm_chunk_tmp", max_chunk_vocab as u64 * 4);
+
             for (ci, chunk) in self.weights.embed_chunks.iter().enumerate() {
                 let chunk_start = ci as u32 * chunk_size;
                 let chunk_vocab = chunk_size.min(vocab - chunk_start);
-
-                // Need a temp buffer for this chunk's logits, then copy to the right offset
-                let chunk_logits = gpu.create_storage_buffer(
-                    &format!("lm_chunk_{ci}"), chunk_vocab as u64 * 4);
 
                 self.write_params(gpu, bytemuck::bytes_of(&LmP {
                     hidden_size: h, vocab_size: chunk_vocab,
@@ -630,10 +630,10 @@ impl Model {
                     gpu::bind(3, &self.state.params),
                 ], (chunk_vocab.div_ceil(32), 1, 1));
 
-                // Read chunk logits and write to the correct offset in the full logits buffer
-                gpu.flush();
-                let chunk_bytes = gpu.read_buffer(&chunk_logits, chunk_vocab as u64 * 4);
-                gpu.write_buffer(&self.state.logits, chunk_start as u64 * 4, &chunk_bytes);
+                // GPU-side copy to the correct offset in the full logits buffer
+                gpu.copy_buffer_offset(&chunk_logits, 0,
+                    &self.state.logits, chunk_start as u64 * 4,
+                    chunk_vocab as u64 * 4);
             }
             return;
         }

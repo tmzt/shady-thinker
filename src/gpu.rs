@@ -267,6 +267,13 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(src, 0, dst, 0, size);
     }
 
+    pub fn copy_buffer_offset(&mut self, src: &wgpu::Buffer, src_off: u64,
+                               dst: &wgpu::Buffer, dst_off: u64, size: u64) {
+        self.ensure_encoder();
+        let encoder = self.encoder.as_mut().unwrap();
+        encoder.copy_buffer_to_buffer(src, src_off, dst, dst_off, size);
+    }
+
     /// Read back a buffer to CPU. Flushes pending work first.
     pub fn read_buffer(&mut self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
         // Flush any pending dispatches
