@@ -699,3 +699,27 @@ fn verify_full_decode_real() {
     // Expected tokens for this: ~[9707, 13, 1096, 374, 264, 1273, 13]
     // ("Hello" "." " This" " is" " a" " test" ".")
 }
+
+/// GPU encoder + decoder with longer audio (fox sentence).
+#[test]
+fn gpu_pipeline_fox() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-1.7b");
+    if !model_dir.exists() { eprintln!("SKIP"); return; }
+    let stem_path = "/tmp/conv_stem_46_1024.f32";
+    if !std::path::Path::new(stem_path).exists() { eprintln!("SKIP: run test_split_encoder first"); return; }
+
+    let stem_bytes = std::fs::read(stem_path).unwrap();
+    let stem: &[f32] = bytemuck::cast_slice(&stem_bytes);
+    let seq_len = 46u32;
+
+    // GPU encoder
+    let mut encoder = shady_thinker::asr_encoder::AsrEncoder::new(model_dir);
+    let enc_output = encoder.forward(stem, seq_len);
+    eprintln!("GPU encoder: {} tokens", enc_output.len() / encoder.config.output_dim as usize);
+
+    // GPU decoder
+    let (mut gpu, mut model) = shady_thinker::asr_decoder::load_bf16_model(model_dir, 512);
+    let tokens = shady_thinker::asr_decoder::gpu_asr_decode_tokens(&mut gpu, &mut model, &enc_output, seq_len);
+    eprintln!("GPU decoder: {} tokens: {:?}", tokens.len(), &tokens);
+}

@@ -124,7 +124,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * w;
             d += 256u;
         }
         workgroupBarrier();
@@ -175,7 +175,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(head_dim + d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * w;
             d += 256u;
         }
         workgroupBarrier();

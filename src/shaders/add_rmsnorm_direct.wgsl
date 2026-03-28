@@ -1,11 +1,10 @@
-// Batched Add + RMSNorm: hidden[row,i] += addend[row,i], then
-// output[row,i] = hidden[row,i] * rms * (1 + weight[i])
-// Weight is BF16 packed. Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Add + RMSNorm: hidden[i] += addend[i], then output[i] = hidden[i] * rms * (1 + weight[i])
+// Weight is BF16 packed (two BF16 values per u32), using (1 + w) scaling.
+// Dispatch: (1, 1, 1) — single workgroup
 
 struct Params {
     N: u32,
     eps: f32,
-    seq_len: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> hidden: array<f32>;
@@ -22,29 +21,23 @@ fn unpack_bf16(packed: u32, idx: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn main(
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
-) {
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
-    let row = wid.x;
-    if (row >= params.seq_len) { return; }
     let N = params.N;
-    let base = row * N;
 
-    // Phase 1: hidden += addend, accumulate sum of squares
+    // Phase 1: hidden[i] += addend[i], accumulate sum of squares.
     var sum_sq: f32 = 0.0;
     var i = tid;
     while (i < N) {
-        let v = hidden[base + i] + addend[base + i];
-        hidden[base + i] = v;
+        let v = hidden[i] + addend[i];
+        hidden[i] = v;
         sum_sq += v * v;
         i += 256u;
     }
     wg_temp[tid] = sum_sq;
     workgroupBarrier();
 
-    // Tree reduce
+    // Phase 2: Tree reduce sum of squares.
     var stride = 128u;
     while (stride > 0u) {
         if (tid < stride) {
@@ -54,13 +47,13 @@ fn main(
         stride = stride >> 1u;
     }
 
+    // Phase 3: Compute rms and write normalized output.
     let rms = 1.0 / sqrt(wg_temp[0] / f32(N) + params.eps);
 
-    // Write normalized output
     i = tid;
     while (i < N) {
         let w = unpack_bf16(weight[i / 2u], i % 2u);
-        output[base + i] = hidden[base + i] * rms * w;
+        output[i] = hidden[i] * rms * w;
         i += 256u;
     }
 }

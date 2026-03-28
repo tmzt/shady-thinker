@@ -53,6 +53,7 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
     let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
     model.bf16_mode = true;
     model.q_gated = false; // ASR decoder uses standard attention, not SiGLU-gated Q
+    model.norm_direct = true; // ASR uses direct w scaling, not (1+w) like Qwen3.5
     model.rebuild_qknorm_shader();
     if need_cpu_embed {
         log::info!("[asr-decoder] embed table {}MB > binding limit {}MB, using CPU embed+lm_head",

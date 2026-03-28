@@ -4,6 +4,7 @@ const MROPE_S2_LIMIT: u32 = 22u;
 const PARTIAL_DIM: u32 = 64u;
 const MROPE_INTERLEAVED: bool = true;
 const Q_GATED: bool = true;
+const NORM_OFFSET: f32 = 1.0;
 
 // Fused Q/gate split, Q/K RMSNorm, mRoPE positional encoding, and KV cache write.
 // Dispatch: (num_heads + num_kv_heads, 1, 1)
@@ -161,7 +162,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * (NORM_OFFSET + w);
             d += 256u;
         }
         workgroupBarrier();
@@ -215,7 +216,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(head_dim + d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * (NORM_OFFSET + w);
             d += 256u;
         }
         workgroupBarrier();

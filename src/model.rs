@@ -22,6 +22,8 @@ mod shaders {
 
     // Batched prefill shaders
     pub const BF16_GEMM: &str = include_str!("shaders/bf16_gemm.wgsl");
+    pub const RMSNORM_DIRECT: &str = include_str!("shaders/rmsnorm_direct.wgsl");
+    pub const ADD_RMSNORM_DIRECT: &str = include_str!("shaders/add_rmsnorm_direct.wgsl");
     pub const BATCHED_RMSNORM: &str = include_str!("shaders/batched_rmsnorm.wgsl");
     pub const BATCHED_ADD_RMSNORM: &str = include_str!("shaders/batched_add_rmsnorm.wgsl");
     pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
@@ -42,6 +44,10 @@ fn build_qknorm_shader(config: &ModelConfig) -> String {
 }
 
 fn build_qknorm_shader_gated(config: &ModelConfig, q_gated: bool) -> String {
+    build_qknorm_shader_full(config, q_gated, 1.0) // Qwen3.5: (1 + w) norm scaling
+}
+
+fn build_qknorm_shader_full(config: &ModelConfig, q_gated: bool, norm_offset: f32) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
     let interleaved = config.mrope_interleaved();
     let s_limit = partial_dim / 2;
@@ -51,16 +57,18 @@ fn build_qknorm_shader_gated(config: &ModelConfig, q_gated: bool) -> String {
          const MROPE_S2_LIMIT: u32 = {}u;\n\
          const PARTIAL_DIM: u32 = {}u;\n\
          const MROPE_INTERLEAVED: bool = {};\n\
-         const Q_GATED: bool = {};\n\n{}",
+         const Q_GATED: bool = {};\n\
+         const NORM_OFFSET: f32 = {:.1};\n\n{}",
         config.rope_theta,
         s_limit,
         s_limit,
         partial_dim,
         interleaved,
         q_gated,
+        norm_offset,
         include_str!("shaders/fused_split_qknorm_kvstore.wgsl")
             .lines()
-            .skip(6) // skip the 6 hardcoded const lines
+            .skip(7) // skip the 7 hardcoded const lines
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -134,6 +142,9 @@ pub struct Model {
     /// When true, Q projection outputs [nh * hd * 2] (Qwen3.5 SiGLU gated attention).
     /// When false, Q outputs [nh * hd] (standard attention, e.g. Qwen3-ASR decoder).
     pub q_gated: bool,
+    /// When true, RMSNorm uses direct `w` scaling (ASR decoder).
+    /// When false, uses `(1 + w)` scaling (Qwen3.5).
+    pub norm_direct: bool,
     /// CPU-side bf16 embedding table (raw bytes). Used for bf16 mode where
     /// the GPU embedding buffer may exceed max_storage_buffer_binding_size.
     pub embed_tokens_cpu: Option<Vec<u8>>,
@@ -350,6 +361,7 @@ impl Model {
             use_4t,
             bf16_mode: false,
             q_gated: true, // default: Qwen3.5 gated attention
+            norm_direct: false, // default: Qwen3.5 (1+w) norm scaling
             embed_tokens_cpu: None,
             tied_embeddings,
             qknorm_shader_src,
@@ -372,7 +384,8 @@ impl Model {
     /// Rebuild the QK norm shader with the current q_gated setting.
     /// Must be called after changing q_gated.
     pub fn rebuild_qknorm_shader(&mut self) {
-        self.qknorm_shader_src = build_qknorm_shader_gated(&self.config, self.q_gated);
+        let norm_offset = if self.norm_direct { 0.0 } else { 1.0 };
+        self.qknorm_shader_src = build_qknorm_shader_full(&self.config, self.q_gated, norm_offset);
     }
 
     fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
@@ -536,7 +549,8 @@ impl Model {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { n: u32, eps: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&P { n, eps: self.config.rms_norm_eps }));
-        gpu.dispatch("add_rmsnorm", shaders::ADD_RMSNORM, &[
+        let shader = if self.norm_direct { shaders::ADD_RMSNORM_DIRECT } else { shaders::ADD_RMSNORM };
+        gpu.dispatch("add_rmsnorm", shader, &[
             gpu::bind(0, hidden), gpu::bind(1, addend),
             gpu::bind(2, weight), gpu::bind(3, output),
             gpu::bind(4, &self.state.params),
@@ -552,7 +566,8 @@ impl Model {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { n: u32, eps: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&P { n, eps: self.config.rms_norm_eps }));
-        gpu.dispatch("rmsnorm", shaders::RMSNORM, &[
+        let shader = if self.norm_direct { shaders::RMSNORM_DIRECT } else { shaders::RMSNORM };
+        gpu.dispatch("rmsnorm", shader, &[
             gpu::bind(0, input), gpu::bind(1, weight),
             gpu::bind(2, output), gpu::bind(3, &self.state.params),
         ], (1, 1, 1));
