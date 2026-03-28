@@ -1,12 +1,11 @@
-// LayerNorm: output[i] = (input[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
-// Weight and bias are f32 (ASR encoder uses f32 norms, not bf16).
-// Dispatch: (1, 1, 1) — single workgroup per token
-// For batched: dispatch (seq_len, 1, 1) with token offset = workgroup_id.x * N
+// LayerNorm with Kahan-compensated accumulation for precision.
+// output[i] = (input[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]
+// Dispatch: (seq_len, 1, 1) — one workgroup per token
 
 struct Params {
-    N: u32,       // hidden dimension
+    N: u32,
     eps: f32,
-    seq_len: u32, // number of tokens (rows)
+    seq_len: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -30,11 +29,15 @@ fn main(
     let N = params.N;
     let base = row * N;
 
-    // Step 1: Compute mean via tree reduce.
+    // Step 1: Kahan-compensated mean accumulation
     var sum: f32 = 0.0;
+    var comp: f32 = 0.0;
     var i = tid;
     while (i < N) {
-        sum += input[base + i];
+        let y = input[base + i] - comp;
+        let t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
         i += 256u;
     }
     wg_temp[tid] = sum;
@@ -51,12 +54,17 @@ fn main(
     let mean = wg_temp[0] / f32(N);
     workgroupBarrier();
 
-    // Step 2: Compute variance via tree reduce.
+    // Step 2: Kahan-compensated variance accumulation
     var sum_sq: f32 = 0.0;
+    comp = 0.0;
     i = tid;
     while (i < N) {
         let diff = input[base + i] - mean;
-        sum_sq += diff * diff;
+        let product = diff * diff;
+        let y2 = product - comp;
+        let t2 = sum_sq + y2;
+        comp = (t2 - sum_sq) - y2;
+        sum_sq = t2;
         i += 256u;
     }
     wg_temp[tid] = sum_sq;
@@ -72,7 +80,7 @@ fn main(
     }
     let inv_std = 1.0 / sqrt(wg_temp[0] / f32(N) + params.eps);
 
-    // Step 3: Normalize, scale, shift.
+    // Step 3: Normalize, scale, shift
     i = tid;
     while (i < N) {
         let idx = base + i;

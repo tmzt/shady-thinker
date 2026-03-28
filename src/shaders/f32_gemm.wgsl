@@ -1,4 +1,5 @@
-// F32 Batched GEMM: output[row, col] = sum_k(input[row, k] * weight[col, k]) + bias[col]
+// F32 Batched GEMM with Kahan compensated summation for precision.
+// output[row, col] = sum_k(input[row, k] * weight[col, k]) + bias[col]
 // Computes: [seq_len, d_in] × [d_out, d_in]^T + [d_out] → [seq_len, d_out]
 // All buffers are f32. Weight layout: row-major [d_out, d_in].
 //
@@ -33,25 +34,24 @@ fn main(
     let w_base = col * d_in;
     let in_base = row * d_in;
 
+    // Kahan compensated summation — tracks rounding error
     var sum: f32 = 0.0;
+    var comp: f32 = 0.0; // compensation for lost low-order bits
 
-    // Unroll by 4
-    let unroll_end = d_in & ~3u;
     var i: u32 = 0u;
-    while (i < unroll_end) {
-        sum += weight[w_base + i] * input[in_base + i];
-        sum += weight[w_base + i + 1u] * input[in_base + i + 1u];
-        sum += weight[w_base + i + 2u] * input[in_base + i + 2u];
-        sum += weight[w_base + i + 3u] * input[in_base + i + 3u];
-        i += 4u;
-    }
     while (i < d_in) {
-        sum += weight[w_base + i] * input[in_base + i];
+        let product = weight[w_base + i] * input[in_base + i];
+        let y = product - comp;
+        let t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
         i += 1u;
     }
 
     if (params.has_bias != 0u) {
-        sum += bias[col];
+        let y = bias[col] - comp;
+        let t = sum + y;
+        sum = t;
     }
 
     output[row * params.d_out + col] = sum;

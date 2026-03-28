@@ -61,6 +61,41 @@ fn load_and_forward_env() {
     }
 }
 
+/// Test GPU encoder output through the C offline decoder.
+/// Run test_split_encoder first to generate /tmp/conv_stem_43_896.f32
+#[test]
+fn gpu_encoder_offline_decode() {
+    let _ = env_logger::try_init();
+
+    let stem_path = "/tmp/conv_stem_43_896.f32";
+    if !std::path::Path::new(stem_path).exists() {
+        eprintln!("SKIP: run test_split_encoder first");
+        return;
+    }
+
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-0.6b");
+    if !model_dir.exists() { eprintln!("SKIP: model not found"); return; }
+
+    // Load conv stem
+    let stem_bytes = std::fs::read(stem_path).unwrap();
+    let stem: &[f32] = bytemuck::cast_slice(&stem_bytes);
+    let seq_len = 43u32;
+    let d_model = 896u32;
+
+    // GPU encoder
+    let mut encoder = shady_thinker::asr_encoder::AsrEncoder::new(model_dir);
+    let gpu_output = encoder.forward(stem, seq_len);
+    let out_dim = encoder.config.output_dim;
+    eprintln!("GPU encoder: {} tokens × {} = {} floats", seq_len, out_dim, gpu_output.len());
+    eprintln!("  gpu[0][0:4]: {:?}", &gpu_output[..4]);
+
+    // Write GPU output for C decoder test
+    let gpu_path = "/tmp/gpu_enc_43_1024.f32";
+    std::fs::write(gpu_path, bytemuck::cast_slice::<f32, u8>(&gpu_output)).unwrap();
+    eprintln!("Wrote GPU encoder output to {gpu_path}");
+    eprintln!("Run: /tmp/test_decode_gpu to test offline decode");
+}
+
 /// Compare GPU encoder output to C reference using real conv stem data.
 /// Run test_split_encoder first to generate /tmp/conv_stem_*.f32 and /tmp/enc_ref_*.f32
 #[test]
