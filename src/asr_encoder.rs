@@ -11,7 +11,7 @@ use safetensors::SafeTensors;
 use crate::gpu::GpuContext;
 
 mod shaders {
-    pub const F32_GEMM: &str = include_str!("shaders/f32_gemm.wgsl");
+    pub const BF16_GEMM: &str = include_str!("shaders/bf16_gemm.wgsl");
     pub const LAYERNORM: &str = include_str!("shaders/layernorm.wgsl");
     pub const GELU_MUL: &str = include_str!("shaders/gelu_mul.wgsl");
     pub const BIDIR_ATTN: &str = include_str!("shaders/qwen_asr_bidir_attn.wgsl");
@@ -115,8 +115,11 @@ impl AsrEncoder {
             out
         };
 
-        // Upload helper: all tensors converted bf16→f32 for precision
-        // (matches C encoder which converts at load time)
+        // Upload raw bf16 packed as u32 (shader unpacks per-multiply)
+        let upload_bf16 = |gpu: &GpuContext, label: &str, name: &str| -> wgpu::Buffer {
+            gpu.upload_buffer(label, get_tensor(name))
+        };
+        // Upload bf16→f32 converted (for biases/norms that shaders read as f32)
         let upload_f32 = |gpu: &GpuContext, label: &str, name: &str| -> wgpu::Buffer {
             let f32_data = bf16_to_f32(get_tensor(name));
             gpu.upload_buffer(label, &f32_data)
@@ -126,14 +129,14 @@ impl AsrEncoder {
         for i in 0..config.num_layers {
             let p = format!("thinker.audio_tower.layers.{i}");
             let layer = EncoderLayer {
-                // Weights: bf16 packed (shader unpacks)
-                wq: upload_f32(&gpu, &format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
-                wk: upload_f32(&gpu, &format!("{p}.k"), &format!("{p}.self_attn.k_proj.weight")),
-                wv: upload_f32(&gpu, &format!("{p}.v"), &format!("{p}.self_attn.v_proj.weight")),
-                wo: upload_f32(&gpu, &format!("{p}.o"), &format!("{p}.self_attn.out_proj.weight")),
-                fc1: upload_f32(&gpu, &format!("{p}.fc1"), &format!("{p}.fc1.weight")),
-                fc2: upload_f32(&gpu, &format!("{p}.fc2"), &format!("{p}.fc2.weight")),
-                // Biases + norms: convert bf16 → f32 (shaders read as f32)
+                // Weights: raw bf16 packed as u32 (shader unpacks per-multiply)
+                wq: upload_bf16(&gpu, &format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
+                wk: upload_bf16(&gpu, &format!("{p}.k"), &format!("{p}.self_attn.k_proj.weight")),
+                wv: upload_bf16(&gpu, &format!("{p}.v"), &format!("{p}.self_attn.v_proj.weight")),
+                wo: upload_bf16(&gpu, &format!("{p}.o"), &format!("{p}.self_attn.out_proj.weight")),
+                fc1: upload_bf16(&gpu, &format!("{p}.fc1"), &format!("{p}.fc1.weight")),
+                fc2: upload_bf16(&gpu, &format!("{p}.fc2"), &format!("{p}.fc2.weight")),
+                // Biases + norms: bf16→f32 (shaders read as f32)
                 bq: upload_f32(&gpu, &format!("{p}.bq"), &format!("{p}.self_attn.q_proj.bias")),
                 bk: upload_f32(&gpu, &format!("{p}.bk"), &format!("{p}.self_attn.k_proj.bias")),
                 bv: upload_f32(&gpu, &format!("{p}.bv"), &format!("{p}.self_attn.v_proj.bias")),
@@ -153,9 +156,9 @@ impl AsrEncoder {
 
         let ln_post_w = upload_f32(&gpu, "enc.ln_w", "thinker.audio_tower.ln_post.weight");
         let ln_post_b = upload_f32(&gpu, "enc.ln_b", "thinker.audio_tower.ln_post.bias");
-        let proj1_w = upload_f32(&gpu, "enc.p1_w", "thinker.audio_tower.proj1.weight");
+        let proj1_w = upload_bf16(&gpu, "enc.p1_w", "thinker.audio_tower.proj1.weight");
         let proj1_b = upload_f32(&gpu, "enc.p1_b", "thinker.audio_tower.proj1.bias");
-        let proj2_w = upload_f32(&gpu, "enc.p2_w", "thinker.audio_tower.proj2.weight");
+        let proj2_w = upload_bf16(&gpu, "enc.p2_w", "thinker.audio_tower.proj2.weight");
         let proj2_b = upload_f32(&gpu, "enc.p2_b", "thinker.audio_tower.proj2.bias");
 
         log::info!("[asr-encoder] loaded {} layers onto GPU", layers.len());
@@ -348,7 +351,7 @@ fn dispatch_bf16_gemm(
     gpu.write_buffer(params, 0, bytemuck::bytes_of(&P {
         d_in, d_out, seq_len, has_bias: has_bias as u32,
     }));
-    gpu.dispatch("f32_gemm", shaders::F32_GEMM, &[
+    gpu.dispatch("bf16_gemm", shaders::BF16_GEMM, &[
         bind(0, input), bind(1, weight), bind(2, bias), bind(3, output), bind(4, params),
     ], (d_out.div_ceil(32), seq_len, 1));
 }
