@@ -91,7 +91,7 @@ impl AsrEncoder {
             .map(|data| SafeTensors::deserialize(data).expect("failed to parse safetensors"))
             .collect();
 
-        // Helper: find tensor across shards
+        // Helper: find tensor across shards (raw bf16 bytes)
         let get_tensor = |name: &str| -> &[u8] {
             for st in &shards {
                 if let Ok(t) = st.tensor(name) {
@@ -101,26 +101,51 @@ impl AsrEncoder {
             panic!("[asr-encoder] tensor not found: {name}");
         };
 
+        // Convert bf16 bytes → f32 bytes for biases and norm weights.
+        // GEMM weights stay as bf16 packed (shader unpacks them).
+        // Biases/norms are read as f32 by the shaders.
+        let bf16_to_f32 = |data: &[u8]| -> Vec<u8> {
+            let n = data.len() / 2;
+            let mut out = Vec::with_capacity(n * 4);
+            for i in 0..n {
+                let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                let f = f32::from_bits((bits as u32) << 16);
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            out
+        };
+
+        // Upload helpers
+        let upload_bf16_weight = |gpu: &GpuContext, label: &str, name: &str| -> wgpu::Buffer {
+            gpu.upload_buffer(label, get_tensor(name))
+        };
+        let upload_f32_bias = |gpu: &GpuContext, label: &str, name: &str| -> wgpu::Buffer {
+            let f32_data = bf16_to_f32(get_tensor(name));
+            gpu.upload_buffer(label, &f32_data)
+        };
+
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
             let p = format!("thinker.audio_tower.layers.{i}");
             let layer = EncoderLayer {
-                wq: gpu.upload_buffer(&format!("{p}.q"), get_tensor(&format!("{p}.self_attn.q_proj.weight"))),
-                wk: gpu.upload_buffer(&format!("{p}.k"), get_tensor(&format!("{p}.self_attn.k_proj.weight"))),
-                wv: gpu.upload_buffer(&format!("{p}.v"), get_tensor(&format!("{p}.self_attn.v_proj.weight"))),
-                wo: gpu.upload_buffer(&format!("{p}.o"), get_tensor(&format!("{p}.self_attn.out_proj.weight"))),
-                bq: gpu.upload_buffer(&format!("{p}.bq"), get_tensor(&format!("{p}.self_attn.q_proj.bias"))),
-                bk: gpu.upload_buffer(&format!("{p}.bk"), get_tensor(&format!("{p}.self_attn.k_proj.bias"))),
-                bv: gpu.upload_buffer(&format!("{p}.bv"), get_tensor(&format!("{p}.self_attn.v_proj.bias"))),
-                bo: gpu.upload_buffer(&format!("{p}.bo"), get_tensor(&format!("{p}.self_attn.out_proj.bias"))),
-                attn_norm_w: gpu.upload_buffer(&format!("{p}.an_w"), get_tensor(&format!("{p}.self_attn_layer_norm.weight"))),
-                attn_norm_b: gpu.upload_buffer(&format!("{p}.an_b"), get_tensor(&format!("{p}.self_attn_layer_norm.bias"))),
-                fc1: gpu.upload_buffer(&format!("{p}.fc1"), get_tensor(&format!("{p}.fc1.weight"))),
-                fc2: gpu.upload_buffer(&format!("{p}.fc2"), get_tensor(&format!("{p}.fc2.weight"))),
-                fc1_bias: gpu.upload_buffer(&format!("{p}.fc1b"), get_tensor(&format!("{p}.fc1.bias"))),
-                fc2_bias: gpu.upload_buffer(&format!("{p}.fc2b"), get_tensor(&format!("{p}.fc2.bias"))),
-                ffn_norm_w: gpu.upload_buffer(&format!("{p}.fn_w"), get_tensor(&format!("{p}.final_layer_norm.weight"))),
-                ffn_norm_b: gpu.upload_buffer(&format!("{p}.fn_b"), get_tensor(&format!("{p}.final_layer_norm.bias"))),
+                // Weights: bf16 packed (shader unpacks)
+                wq: upload_bf16_weight(&gpu, &format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
+                wk: upload_bf16_weight(&gpu, &format!("{p}.k"), &format!("{p}.self_attn.k_proj.weight")),
+                wv: upload_bf16_weight(&gpu, &format!("{p}.v"), &format!("{p}.self_attn.v_proj.weight")),
+                wo: upload_bf16_weight(&gpu, &format!("{p}.o"), &format!("{p}.self_attn.out_proj.weight")),
+                fc1: upload_bf16_weight(&gpu, &format!("{p}.fc1"), &format!("{p}.fc1.weight")),
+                fc2: upload_bf16_weight(&gpu, &format!("{p}.fc2"), &format!("{p}.fc2.weight")),
+                // Biases + norms: convert bf16 → f32 (shaders read as f32)
+                bq: upload_f32_bias(&gpu, &format!("{p}.bq"), &format!("{p}.self_attn.q_proj.bias")),
+                bk: upload_f32_bias(&gpu, &format!("{p}.bk"), &format!("{p}.self_attn.k_proj.bias")),
+                bv: upload_f32_bias(&gpu, &format!("{p}.bv"), &format!("{p}.self_attn.v_proj.bias")),
+                bo: upload_f32_bias(&gpu, &format!("{p}.bo"), &format!("{p}.self_attn.out_proj.bias")),
+                attn_norm_w: upload_f32_bias(&gpu, &format!("{p}.an_w"), &format!("{p}.self_attn_layer_norm.weight")),
+                attn_norm_b: upload_f32_bias(&gpu, &format!("{p}.an_b"), &format!("{p}.self_attn_layer_norm.bias")),
+                fc1_bias: upload_f32_bias(&gpu, &format!("{p}.fc1b"), &format!("{p}.fc1.bias")),
+                fc2_bias: upload_f32_bias(&gpu, &format!("{p}.fc2b"), &format!("{p}.fc2.bias")),
+                ffn_norm_w: upload_f32_bias(&gpu, &format!("{p}.fn_w"), &format!("{p}.final_layer_norm.weight")),
+                ffn_norm_b: upload_f32_bias(&gpu, &format!("{p}.fn_b"), &format!("{p}.final_layer_norm.bias")),
             };
             layers.push(layer);
             if (i + 1) % 6 == 0 {
@@ -128,12 +153,12 @@ impl AsrEncoder {
             }
         }
 
-        let ln_post_w = gpu.upload_buffer("enc.ln_w", get_tensor("thinker.audio_tower.ln_post.weight"));
-        let ln_post_b = gpu.upload_buffer("enc.ln_b", get_tensor("thinker.audio_tower.ln_post.bias"));
-        let proj1_w = gpu.upload_buffer("enc.p1_w", get_tensor("thinker.audio_tower.proj1.weight"));
-        let proj1_b = gpu.upload_buffer("enc.p1_b", get_tensor("thinker.audio_tower.proj1.bias"));
-        let proj2_w = gpu.upload_buffer("enc.p2_w", get_tensor("thinker.audio_tower.proj2.weight"));
-        let proj2_b = gpu.upload_buffer("enc.p2_b", get_tensor("thinker.audio_tower.proj2.bias"));
+        let ln_post_w = upload_f32_bias(&gpu, "enc.ln_w", "thinker.audio_tower.ln_post.weight");
+        let ln_post_b = upload_f32_bias(&gpu, "enc.ln_b", "thinker.audio_tower.ln_post.bias");
+        let proj1_w = upload_bf16_weight(&gpu, "enc.p1_w", "thinker.audio_tower.proj1.weight");
+        let proj1_b = upload_f32_bias(&gpu, "enc.p1_b", "thinker.audio_tower.proj1.bias");
+        let proj2_w = upload_bf16_weight(&gpu, "enc.p2_w", "thinker.audio_tower.proj2.weight");
+        let proj2_b = upload_f32_bias(&gpu, "enc.p2_b", "thinker.audio_tower.proj2.bias");
 
         log::info!("[asr-encoder] loaded {} layers onto GPU", layers.len());
 
