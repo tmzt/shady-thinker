@@ -643,3 +643,59 @@ fn verify_prefix_then_embed() {
     let t0 = model.forward_embed_argmax(&mut gpu, first_embed);
     eprintln!("Same embed as first token: predicted={}", t0);
 }
+
+/// Full pipeline with real encoder output, printing each generated token.
+#[test]
+fn verify_full_decode_real() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/qwen3-asr-1.7b");
+    if !model_dir.exists() { eprintln!("SKIP"); return; }
+    let ref_path = "/tmp/enc_ref_17_2048.f32";
+    if !std::path::Path::new(ref_path).exists() { eprintln!("SKIP"); return; }
+
+    let (mut gpu, mut model) = shady_thinker::asr_decoder::load_bf16_model(model_dir, 512);
+    let h = model.config.hidden_size as usize;
+
+    let ref_bytes = std::fs::read(ref_path).unwrap();
+    let enc_output: &[f32] = bytemuck::cast_slice(&ref_bytes);
+    let enc_seq_len = 17u32;
+
+    // Manually run the decode pipeline with logging
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+
+    // Prefix
+    for &tok in &[151644u32, 8948, 198, 151645, 198, 151644, 872, 198, 151669] {
+        model.forward_argmax(&mut gpu, tok);
+    }
+    eprintln!("After prefix: seq_len={}", model.seq_len);
+
+    // Encoder output
+    for i in 0..enc_seq_len as usize {
+        let embed = &enc_output[i * h..(i + 1) * h];
+        model.forward_embed_argmax(&mut gpu, embed);
+    }
+    eprintln!("After encoder: seq_len={}", model.seq_len);
+
+    // Suffix (all but last)
+    for &tok in &[151670u32, 151645, 198, 151644, 77091, 198] {
+        model.forward_argmax(&mut gpu, tok);
+    }
+    eprintln!("After suffix (minus last): seq_len={}", model.seq_len);
+
+    // Last token starts generation
+    let mut token = model.forward_argmax(&mut gpu, 151704); // <|asr_text|>
+    eprintln!("First generated: {} (seq_len={})", token, model.seq_len);
+
+    let mut tokens = vec![];
+    for i in 0..30 {
+        if token == 151643 || token == 151645 { break; }
+        tokens.push(token);
+        token = model.forward_argmax(&mut gpu, token);
+        eprintln!("  gen[{}]: {}", i, token);
+    }
+    eprintln!("Generated tokens: {:?}", tokens);
+    // C decoder produces: "Hello. This is a test."
+    // Expected tokens for this: ~[9707, 13, 1096, 374, 264, 1273, 13]
+    // ("Hello" "." " This" " is" " a" " test" ".")
+}
