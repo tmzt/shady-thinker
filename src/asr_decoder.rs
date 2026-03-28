@@ -9,6 +9,8 @@ use crate::gpu::GpuContext;
 use crate::model::Model;
 use crate::weights::{ModelConfig, QuantConfig};
 
+const INT4_EMBEDDING_MLX_SRC: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
+
 /// Load a bf16 ASR decoder model ready for inference.
 /// Handles the nested ASR config (thinker_config.text_config).
 /// Returns (GpuContext, Model) with bf16_mode enabled.
@@ -22,10 +24,12 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
 
     let text_cfg = if raw["thinker_config"]["text_config"].is_object() {
         &raw["thinker_config"]["text_config"]
+    } else if raw["text_decoder"].is_object() {
+        &raw["text_decoder"]  // MLX format
     } else if raw["text_config"].is_object() {
         &raw["text_config"]
     } else {
-        &raw // top-level config
+        &raw
     };
     let mut config: ModelConfig = serde_json::from_value(text_cfg.clone()).expect("parse ModelConfig");
     // ASR decoder uses full rotary encoding (partial_rotary_factor=1.0)
@@ -199,6 +203,10 @@ pub struct PrefixCache {
     pub prefix_len: u32,
     /// Pre-computed prefix embeddings [prefix_len, hidden]
     pub prefix_embeds: Vec<f32>,
+    /// MLX INT4 embed scales buffer (for dequant embedding lookup)
+    pub embed_scales: Option<wgpu::Buffer>,
+    /// MLX INT4 embed biases buffer
+    pub embed_biases: Option<wgpu::Buffer>,
 }
 
 /// Pre-compute KV cache for the fixed ASR prompt prefix.
@@ -206,6 +214,7 @@ pub struct PrefixCache {
 pub fn precompute_prefix_cache(
     gpu: &mut GpuContext,
     model: &mut Model,
+    model_dir: &Path,
 ) -> PrefixCache {
     let prefix: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
     let hidden = model.config.hidden_size as usize;
@@ -217,10 +226,59 @@ pub fn precompute_prefix_cache(
 
     let t0 = std::time::Instant::now();
 
-    // Build prefix embeddings
+    // Build prefix embeddings — MLX INT4 or bf16
+    let (embed_scales, embed_biases) = if model.mlx_int4_mode {
+        // For MLX, need to load embed scales/biases from the safetensor
+        // The MLX loader stored them — we need to extract from the model dir
+        // Actually, the load_weights_mlx_int4 uploaded embed scales/biases as
+        // separate buffers. But they're not stored in ModelWeights yet.
+        // For now, do the embedding dequant via the int4_embedding_mlx shader.
+        // We need to pass the embed qweight (in embed_tokens), and load
+        // the scales+biases buffers here.
+        let model_dir_cfg = std::fs::read_to_string(model_dir.join("config.json")).ok();
+        // The MLX safetensors has model.embed_tokens.scales and model.embed_tokens.biases
+        // We need to load them. For now, open the safetensors directly.
+        let mut sf: Vec<_> = std::fs::read_dir(model_dir).unwrap()
+            .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
+            .map(|e| e.path()).collect();
+        sf.sort();
+        let mm: Vec<memmap2::Mmap> = sf.iter()
+            .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
+        let sts: Vec<safetensors::SafeTensors> = mm.iter()
+            .map(|m| safetensors::SafeTensors::deserialize(m).unwrap()).collect();
+        let get = |n: &str| -> &[u8] {
+            for s in &sts { if let Ok(t)=s.tensor(n) { return t.data(); } }
+            panic!("{n}");
+        };
+        let es = gpu.upload_buffer("emb_sc", get("model.embed_tokens.scales"));
+        let eb = gpu.upload_buffer("emb_bi", get("model.embed_tokens.biases"));
+        (Some(es), Some(eb))
+    } else {
+        (None, None)
+    };
+
     let mut prefix_embeds = Vec::with_capacity(prefix.len() * hidden);
     for &tok in &prefix {
-        model.embedding(gpu, tok);
+        if model.mlx_int4_mode {
+            if let (Some(ref sc), Some(ref bi)) = (&embed_scales, &embed_biases) {
+                #[repr(C)]
+                #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+                struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                    token_id: tok, dim: model.config.hidden_size,
+                    group_size: model.quant_config.group_size, _pad: 0,
+                }));
+                gpu.dispatch("emb_mlx", INT4_EMBEDDING_MLX_SRC, &[
+                    crate::gpu::bind(0, &model.weights.embed_tokens),
+                    crate::gpu::bind(1, sc),
+                    crate::gpu::bind(2, bi),
+                    crate::gpu::bind(3, &model.state.hidden),
+                    crate::gpu::bind(4, &model.state.params),
+                ], (model.config.hidden_size.div_ceil(256), 1, 1));
+            }
+        } else {
+            model.embedding(gpu, tok);
+        }
         gpu.flush();
         let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
         prefix_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
@@ -231,13 +289,20 @@ pub fn precompute_prefix_cache(
     model.generated_tokens.clear();
     if model.bf16_mode {
         model.prefill(gpu, &prefix_embeds, prefix_len);
+    } else if model.mlx_int4_mode {
+        for chunk in prefix_embeds.chunks_exact(hidden) {
+            gpu.write_buffer(&model.state.hidden, 0, bytemuck::cast_slice(chunk));
+            gpu.flush();
+            gpu.copy_buffer(&model.state.hidden, &model.state.residual, hidden as u64 * 4);
+            model.forward_mlx_argmax(gpu);
+        }
     } else {
         for chunk in prefix_embeds.chunks_exact(hidden) {
             model.forward_embed_argmax(gpu, chunk);
         }
     }
 
-    // Snapshot KV cache (only the prefix positions)
+    // Snapshot KV cache
     let snapshot_bytes = prefix_len as u64 * kv_entry_bytes;
     let mut kv_snapshots = Vec::with_capacity(nl);
     for i in 0..nl {
@@ -249,7 +314,7 @@ pub fn precompute_prefix_cache(
     log::info!("[asr-decode] prefix cache: {} tokens, {}KB per layer, computed in {}ms",
         prefix_len, snapshot_bytes / 1024, t0.elapsed().as_millis());
 
-    PrefixCache { kv_snapshots, prefix_len, prefix_embeds }
+    PrefixCache { kv_snapshots, prefix_len, prefix_embeds, embed_scales, embed_biases }
 }
 
 /// GPU ASR decode returning raw token IDs (for caller to decode with tokenizer).
@@ -283,7 +348,25 @@ pub fn gpu_asr_decode_tokens(
     let mut input_embeds = Vec::with_capacity(remain_seq * hidden);
     input_embeds.extend_from_slice(encoder_output);
     for &tok in &suffix {
-        model.embedding(gpu, tok);
+        if model.mlx_int4_mode {
+            if let (Some(ref sc), Some(ref bi)) = (&prefix_cache.embed_scales, &prefix_cache.embed_biases) {
+                #[repr(C)]
+                #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+                struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                    token_id: tok, dim: model.config.hidden_size,
+                    group_size: model.quant_config.group_size, _pad: 0,
+                }));
+                gpu.dispatch("emb_mlx", INT4_EMBEDDING_MLX_SRC, &[
+                    crate::gpu::bind(0, &model.weights.embed_tokens),
+                    crate::gpu::bind(1, sc), crate::gpu::bind(2, bi),
+                    crate::gpu::bind(3, &model.state.hidden),
+                    crate::gpu::bind(4, &model.state.params),
+                ], (model.config.hidden_size.div_ceil(256), 1, 1));
+            }
+        } else {
+            model.embedding(gpu, tok);
+        }
         gpu.flush();
         let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
         input_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
@@ -293,15 +376,19 @@ pub fn gpu_asr_decode_tokens(
     log::info!("[asr-decode] restored prefix ({} tokens), built {} remaining embeds in {}ms",
         prefix_cache.prefix_len, remain_seq, embed_ms);
 
-    // Prefill remaining tokens (audio + suffix)
+    // Prefill remaining tokens (audio + suffix) — token by token
     let t1 = std::time::Instant::now();
-    // For prefill, we need to process starting from prefix_len position.
-    // The batched prefill writes KV cache starting at position 0, but we need
-    // it to start at prefix_len. For now, do token-by-token for the remaining tokens.
-    // TODO: add offset support to batched prefill.
     let h = model.config.hidden_size as usize;
+    let is_mlx = model.mlx_int4_mode;
     for (i, chunk) in input_embeds.chunks_exact(h).enumerate() {
-        model.forward_embed_argmax(gpu, chunk);
+        gpu.write_buffer(&model.state.hidden, 0, bytemuck::cast_slice(chunk));
+        gpu.flush();
+        gpu.copy_buffer(&model.state.hidden, &model.state.residual, h as u64 * 4);
+        if is_mlx {
+            model.forward_mlx_argmax(gpu);
+        } else {
+            model.forward_embed_argmax(gpu, chunk);
+        }
         if (i + 1) % 20 == 0 {
             log::info!("[asr-decode] prefill: {}/{} tokens", i + 1, remain_seq);
         }
@@ -323,7 +410,29 @@ pub fn gpu_asr_decode_tokens(
         if token != TOKEN_ASR_TEXT {
             token_ids.push(token);
         }
-        token = model.forward_argmax(gpu, token);
+        // MLX mode: use embedding_mlx + forward_mlx_argmax for decode tokens
+        if is_mlx {
+            if let (Some(ref sc), Some(ref bi)) = (&prefix_cache.embed_scales, &prefix_cache.embed_biases) {
+                #[repr(C)]
+                #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+                struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                    token_id: token, dim: model.config.hidden_size,
+                    group_size: model.quant_config.group_size, _pad: 0,
+                }));
+                gpu.dispatch("emb_mlx", INT4_EMBEDDING_MLX_SRC, &[
+                    crate::gpu::bind(0, &model.weights.embed_tokens),
+                    crate::gpu::bind(1, sc), crate::gpu::bind(2, bi),
+                    crate::gpu::bind(3, &model.state.hidden),
+                    crate::gpu::bind(4, &model.state.params),
+                ], (model.config.hidden_size.div_ceil(256), 1, 1));
+            }
+            gpu.flush();
+            gpu.copy_buffer(&model.state.hidden, &model.state.residual, h as u64 * 4);
+            token = model.forward_mlx_argmax(gpu);
+        } else {
+            token = model.forward_argmax(gpu, token);
+        }
     }
 
     let total_ms = t0.elapsed().as_millis();

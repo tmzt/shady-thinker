@@ -30,6 +30,8 @@ mod shaders {
     pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
     pub const CAUSAL_ATTENTION_PREFILL: &str = include_str!("shaders/causal_attention_prefill.wgsl");
     pub const INT4_MATVEC_MLX: &str = include_str!("shaders/int4_matvec_mlx.wgsl");
+    pub const FUSED_SILU_INT4_MLX: &str = include_str!("shaders/fused_silu_int4_mlx.wgsl");
+    pub const INT4_EMBEDDING_MLX: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
 
     // LoRA shaders
     #[cfg(feature = "jit-lora")]
@@ -396,7 +398,7 @@ impl Model {
         self.qknorm_shader_src = build_qknorm_shader_full(&self.config, self.q_gated, norm_offset);
     }
 
-    fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
+    pub fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
         // Must flush pending dispatches before overwriting params uniform,
         // otherwise previous dispatches would read the new params value.
         gpu.flush();
@@ -1283,6 +1285,152 @@ impl Model {
         self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
             &self.weights.final_norm, &self.state.normed, h);
 
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, h, self.config.vocab_size);
+        }
+
+        self.seq_len += 1;
+
+        // Greedy argmax
+        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, _) = logits.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let token = max_idx as u32;
+        self.generated_tokens.push(token);
+        token
+    }
+
+    /// MLX INT4 embedding lookup.
+    pub fn embedding_mlx(&self, gpu: &mut GpuContext, token_id: u32) {
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct P { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+        self.write_params(gpu, bytemuck::bytes_of(&P {
+            token_id, dim: self.config.hidden_size,
+            group_size: self.quant_config.group_size, _pad: 0,
+        }));
+        // mlx_biases is empty for embed — use the dedicated embed buffers from weights
+        // The MLX loader stored embed qweight in embed_tokens, scales in lm_head_scales (reused)
+        // Actually we need dedicated embed scale/bias buffers. For now, fall back to the
+        // ModelWeights fields. The MLX loader puts embed_qw in embed_tokens.
+        // But we need embed_scales and embed_biases too...
+        // TODO: store embed scales/biases properly. For now, use the shader with
+        // the correct buffers passed from the asr_decoder.
+        panic!("embedding_mlx needs dedicated embed scale/bias buffers — call from asr_decoder");
+    }
+
+    /// MLX INT4 forward: single token through all layers using int4_matvec_mlx.
+    /// Dedicated forward path — no changes to existing gptq/bf16 methods.
+    pub fn forward_mlx_argmax(&mut self, gpu: &mut GpuContext) -> u32 {
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nh = self.config.num_attention_heads;
+        let nkv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct Mlx4P { in_dim: u32, out_dim: u32, group_size: u32 }
+
+        let gs = self.quant_config.group_size;
+
+        for i in 0..self.config.num_hidden_layers as usize {
+            let layer = &self.weights.layers[i];
+            let biases = &self.weights.mlx_biases[i];
+            // biases: [q=0, k=1, v=2, o=3, gate=4, up=5, down=6]
+
+            // Pre-attention norm
+            if i == 0 {
+                self.rmsnorm(gpu, &self.state.hidden, &layer.input_layernorm, &self.state.normed, h);
+            } else {
+                self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+                    &layer.input_layernorm, &self.state.normed, h);
+            }
+
+            if let Some(sa) = layer.self_attn() {
+                let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
+                let kv_dim = nkv * hd;
+
+                // Q projection (MLX INT4)
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: q_dim, group_size: gs }));
+                gpu.dispatch("qproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.q_proj_qweight),
+                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &biases[0]),
+                    gpu::bind(4, &self.state.q_out), gpu::bind(5, &self.state.params),
+                ], (q_dim.div_ceil(32), 1, 1));
+
+                // K projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: kv_dim, group_size: gs }));
+                gpu.dispatch("kproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.k_proj_qweight),
+                    gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &biases[1]),
+                    gpu::bind(4, &self.state.k_out), gpu::bind(5, &self.state.params),
+                ], (kv_dim.div_ceil(32), 1, 1));
+
+                // V projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: kv_dim, group_size: gs }));
+                gpu.dispatch("vproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.v_proj_qweight),
+                    gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &biases[2]),
+                    gpu::bind(4, &self.state.v_out), gpu::bind(5, &self.state.params),
+                ], (kv_dim.div_ceil(32), 1, 1));
+
+                self.fused_split_qknorm_kvstore(gpu, i);
+                self.gqa_attention(gpu, i);
+                if self.q_gated { self.sigmoid_mul_gate(gpu); }
+
+                // O projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: nh * hd, out_dim: h, group_size: gs }));
+                gpu.dispatch("oproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.attn_output), gpu::bind(1, &sa.o_proj_qweight),
+                    gpu::bind(2, &sa.o_proj_scales), gpu::bind(3, &biases[3]),
+                    gpu::bind(4, &self.state.o_proj_out), gpu::bind(5, &self.state.params),
+                ], (h.div_ceil(32), 1, 1));
+            } else {
+                gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
+            }
+
+            // Post-attention norm
+            self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
+                &layer.post_attn_layernorm, &self.state.normed, h);
+
+            // MLP: gate + up (INT4), then fused SiLU + down (INT4)
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: inter, group_size: gs }));
+            gpu.dispatch("gate", shaders::INT4_MATVEC_MLX, &[
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.gate_proj_qweight),
+                gpu::bind(2, &layer.gate_proj_scales), gpu::bind(3, &biases[4]),
+                gpu::bind(4, &self.state.gate_out), gpu::bind(5, &self.state.params),
+            ], (inter.div_ceil(32), 1, 1));
+
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: inter, group_size: gs }));
+            gpu.dispatch("up", shaders::INT4_MATVEC_MLX, &[
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.up_proj_qweight),
+                gpu::bind(2, &layer.up_proj_scales), gpu::bind(3, &biases[5]),
+                gpu::bind(4, &self.state.up_out), gpu::bind(5, &self.state.params),
+            ], (inter.div_ceil(32), 1, 1));
+
+            // Fused SiLU(gate) * up → INT4 down_proj → mlp_output
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: inter, out_dim: h, group_size: gs }));
+            gpu.dispatch("silu_down", shaders::FUSED_SILU_INT4_MLX, &[
+                gpu::bind(0, &self.state.gate_out), gpu::bind(1, &self.state.up_out),
+                gpu::bind(2, &layer.down_proj_qweight),
+                gpu::bind(3, &layer.down_proj_scales), gpu::bind(4, &biases[6]),
+                gpu::bind(5, &self.state.mlp_output), gpu::bind(6, &self.state.params),
+            ], (h.div_ceil(32), 1, 1));
+        }
+
+        // Final norm
+        self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+            &self.weights.final_norm, &self.state.normed, h);
+
+        // LM head (bf16 — not quantized in MLX model)
         if self.tied_embeddings {
             self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
         } else if self.weights.lm_head_is_bf16 {
