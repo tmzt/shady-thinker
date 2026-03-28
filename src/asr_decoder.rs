@@ -179,43 +179,97 @@ pub fn gpu_asr_decode(
     token_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
 }
 
+/// Cached prefix KV state — computed once, restored before each decode.
+pub struct PrefixCache {
+    /// KV cache snapshot: Vec of (k_data, v_data) per layer
+    kv_snapshots: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Number of prefix tokens cached
+    pub prefix_len: u32,
+    /// Pre-computed prefix embeddings [prefix_len, hidden]
+    pub prefix_embeds: Vec<f32>,
+}
+
+/// Pre-compute KV cache for the fixed ASR prompt prefix.
+/// Call once after model load. Returns cache to pass to gpu_asr_decode_tokens.
+pub fn precompute_prefix_cache(
+    gpu: &mut GpuContext,
+    model: &mut Model,
+) -> PrefixCache {
+    let prefix: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
+    let hidden = model.config.hidden_size as usize;
+    let nkv = model.config.num_key_value_heads;
+    let hd = model.config.head_dim;
+    let nl = model.config.num_hidden_layers as usize;
+    let prefix_len = prefix.len() as u32;
+    let kv_entry_bytes = (nkv * hd) as u64 * 4; // bytes per position per layer
+
+    let t0 = std::time::Instant::now();
+
+    // Build prefix embeddings
+    let mut prefix_embeds = Vec::with_capacity(prefix.len() * hidden);
+    for &tok in &prefix {
+        model.embedding(gpu, tok);
+        gpu.flush();
+        let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
+        prefix_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
+    }
+
+    // Run prefix through model to populate KV cache
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+    if model.bf16_mode {
+        model.prefill(gpu, &prefix_embeds, prefix_len);
+    } else {
+        for chunk in prefix_embeds.chunks_exact(hidden) {
+            model.forward_embed_argmax(gpu, chunk);
+        }
+    }
+
+    // Snapshot KV cache (only the prefix positions)
+    let snapshot_bytes = prefix_len as u64 * kv_entry_bytes;
+    let mut kv_snapshots = Vec::with_capacity(nl);
+    for i in 0..nl {
+        let k = gpu.read_buffer(&model.state.k_cache[i], snapshot_bytes);
+        let v = gpu.read_buffer(&model.state.v_cache[i], snapshot_bytes);
+        kv_snapshots.push((k, v));
+    }
+
+    log::info!("[asr-decode] prefix cache: {} tokens, {}KB per layer, computed in {}ms",
+        prefix_len, snapshot_bytes / 1024, t0.elapsed().as_millis());
+
+    PrefixCache { kv_snapshots, prefix_len, prefix_embeds }
+}
+
 /// GPU ASR decode returning raw token IDs (for caller to decode with tokenizer).
-/// Uses batched GEMM prefill for prompt tokens + encoder embeddings,
-/// then token-by-token autoregressive decode.
+/// Uses prefix KV cache + batched GEMM prefill for audio embeddings + suffix.
 pub fn gpu_asr_decode_tokens(
     gpu: &mut GpuContext,
     model: &mut Model,
+    prefix_cache: &PrefixCache,
     encoder_output: &[f32],
     enc_seq_len: u32,
 ) -> Vec<u32> {
     let hidden = model.config.hidden_size as usize;
     assert_eq!(encoder_output.len(), enc_seq_len as usize * hidden);
 
-    model.seq_len = 0;
-    model.generated_tokens.clear();
-
     let t0 = std::time::Instant::now();
 
-    // Build input embeddings: prefix tokens + encoder output + suffix tokens
-    let prefix: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
-    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
-    let total_seq = prefix.len() + enc_seq_len as usize + suffix.len();
-
-    // Lookup token embeddings on CPU (bf16 → f32) and concatenate with encoder output
-    let mut input_embeds = Vec::with_capacity(total_seq * hidden);
-
-    // Prefix token embeddings
-    for &tok in &prefix {
-        model.embedding(gpu, tok);
-        gpu.flush();
-        let bytes = gpu.read_buffer(&model.state.hidden, hidden as u64 * 4);
-        input_embeds.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&bytes));
+    // Restore prefix KV cache
+    let nl = model.config.num_hidden_layers as usize;
+    for i in 0..nl {
+        let (ref k, ref v) = prefix_cache.kv_snapshots[i];
+        gpu.write_buffer(&model.state.k_cache[i], 0, k);
+        gpu.write_buffer(&model.state.v_cache[i], 0, v);
     }
+    model.seq_len = prefix_cache.prefix_len;
+    model.generated_tokens.clear();
 
-    // Encoder output embeddings (already f32)
+    // Build remaining embeddings: audio + suffix only (prefix is cached)
+    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
+    let remain_seq = enc_seq_len as usize + suffix.len();
+
+    let mut input_embeds = Vec::with_capacity(remain_seq * hidden);
     input_embeds.extend_from_slice(encoder_output);
-
-    // Suffix token embeddings
     for &tok in &suffix {
         model.embedding(gpu, tok);
         gpu.flush();
@@ -224,28 +278,27 @@ pub fn gpu_asr_decode_tokens(
     }
 
     let embed_ms = t0.elapsed().as_millis();
-    log::info!("[asr-decode] built {} embeddings in {}ms", total_seq, embed_ms);
+    log::info!("[asr-decode] restored prefix ({} tokens), built {} remaining embeds in {}ms",
+        prefix_cache.prefix_len, remain_seq, embed_ms);
 
-    // Prefill: batched GEMM for bf16, token-by-token for INT4
+    // Prefill remaining tokens (audio + suffix)
     let t1 = std::time::Instant::now();
-    let mut token = if model.bf16_mode {
-        model.prefill(gpu, &input_embeds, total_seq as u32)
-    } else {
-        // INT4/GPTQ: token-by-token prefill using forward_argmax / forward_embed_argmax
-        model.seq_len = 0;
-        model.generated_tokens.clear();
-        let h = model.config.hidden_size as usize;
-        for (i, chunk) in input_embeds.chunks_exact(h).enumerate() {
-            model.forward_embed_argmax(gpu, chunk);
-            if (i + 1) % 10 == 0 {
-                log::info!("[asr-decode] int4 prefill: {}/{} tokens", i + 1, total_seq);
-            }
+    // For prefill, we need to process starting from prefix_len position.
+    // The batched prefill writes KV cache starting at position 0, but we need
+    // it to start at prefix_len. For now, do token-by-token for the remaining tokens.
+    // TODO: add offset support to batched prefill.
+    let h = model.config.hidden_size as usize;
+    for (i, chunk) in input_embeds.chunks_exact(h).enumerate() {
+        model.forward_embed_argmax(gpu, chunk);
+        if (i + 1) % 20 == 0 {
+            log::info!("[asr-decode] prefill: {}/{} tokens", i + 1, remain_seq);
         }
-        // The last forward_embed_argmax returned a token — use it
-        *model.generated_tokens.last().unwrap_or(&0)
-    };
+    }
+    let mut token = *model.generated_tokens.last().unwrap_or(&0);
+
     let prefill_ms = t1.elapsed().as_millis();
-    log::info!("[asr-decode] prefill: {} tokens in {}ms, first_token={}", total_seq, prefill_ms, token);
+    log::info!("[asr-decode] prefill: {} tokens in {}ms (prefix cached), first_token={}",
+        remain_seq, prefill_ms, token);
 
     // Autoregressive decode
     let t2 = std::time::Instant::now();
