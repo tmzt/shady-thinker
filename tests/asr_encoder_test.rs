@@ -155,18 +155,50 @@ fn compare_to_c_reference() {
     eprintln!("DONE");
 }
 
-/// Test loading 1.7B decoder weights.
+/// Test loading 1.7B decoder weights via both AsrDecoder and Model+bf16.
 #[test]
 fn load_decoder_1_7b() {
     let _ = env_logger::try_init();
     let model_dir = std::path::Path::new("../../models/qwen3-asr-1.7b");
     if !model_dir.exists() { eprintln!("SKIP: model not found"); return; }
 
+    // Test AsrDecoder (standalone)
     let t0 = std::time::Instant::now();
     let decoder = shady_thinker::asr_decoder::AsrDecoder::new(model_dir, 2048);
-    let ms = t0.elapsed().as_millis();
-    eprintln!("Decoder config: {:?}", decoder.config);
-    eprintln!("Loaded in {}ms", ms);
+    eprintln!("AsrDecoder config: {:?} ({}ms)", decoder.config, t0.elapsed().as_millis());
+
+    // Test Model with bf16 weights (reuse existing infrastructure)
+    let t1 = std::time::Instant::now();
+    let gpu = shady_thinker::gpu::GpuContext::new();
+    // ASR config has thinker_config.text_config nesting — extract it
+    let config = {
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(model_dir.join("config.json")).unwrap()
+        ).unwrap();
+        let text_cfg = &raw["thinker_config"]["text_config"];
+        let cfg_str = serde_json::to_string(text_cfg).unwrap();
+        let c: shady_thinker::weights::ModelConfig = serde_json::from_str(&cfg_str).unwrap();
+        c
+    };
+    let quant_config = shady_thinker::weights::QuantConfig {
+        bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false,
+    };
+    let (weights, raw_norms) = shady_thinker::weights::load_weights_bf16(&gpu, model_dir, &config);
+    let mut model = shady_thinker::model::Model::new(&gpu, config.clone(), quant_config, weights, 512);
+    model.bf16_mode = true;
+    for (i, norm) in raw_norms.layers.iter().enumerate() {
+        if let Some((q, k)) = norm {
+            model.init_qknorm_params(&gpu, i, q, k);
+        }
+    }
+    eprintln!("Model+bf16 loaded ({}ms), config: {} layers, hidden={}",
+        t1.elapsed().as_millis(), config.num_hidden_layers, config.hidden_size);
+
+    // Test single forward step
+    let t2 = std::time::Instant::now();
+    let mut gpu = gpu;
+    let token = model.forward(&mut gpu, 1); // token ID 1
+    eprintln!("First token: {} ({}ms)", token, t2.elapsed().as_millis());
 }
 
 /// Test scaling with realistic sequence lengths.

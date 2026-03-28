@@ -17,6 +17,7 @@ mod shaders {
     pub const GPTQ_MATVEC: &str = include_str!("shaders/gptq_matvec.wgsl");
     pub const FUSED_SILU_GPTQ: &str = include_str!("shaders/fused_silu_gptq.wgsl");
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
+    pub const SILU_MUL: &str = include_str!("shaders/silu_mul.wgsl");
     pub const FUSED_CONV_DELTANET_NORM: &str = include_str!("shaders/fused_conv_deltanet_norm.wgsl");
 
     // LoRA shaders
@@ -116,6 +117,8 @@ pub struct Model {
     /// Simple RNG state for sampling
     rng_state: u64,
     use_4t: bool,
+    /// When true, all weights are bf16 (not GPTQ). Dispatch bf16_matvec instead of gptq_matvec.
+    pub bf16_mode: bool,
     tied_embeddings: bool,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
@@ -327,6 +330,7 @@ impl Model {
             #[cfg(feature = "jit-lora")]
             lora: None,
             use_4t,
+            bf16_mode: false,
             tied_embeddings,
             qknorm_shader_src,
         }
@@ -359,6 +363,20 @@ impl Model {
         input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
         output: &wgpu::Buffer, k: u32, n: u32,
     ) {
+        if self.bf16_mode {
+            // BF16 mode: qweight contains bf16 packed weights, scales is unused
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct Bf16P { hidden_size: u32, vocab_size: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&Bf16P {
+                hidden_size: k, vocab_size: n,
+            }));
+            gpu.dispatch(name, shaders::BF16_MATVEC, &[
+                gpu::bind(0, input), gpu::bind(1, qweight),
+                gpu::bind(2, output), gpu::bind(3, &self.state.params),
+            ], (n.div_ceil(32), 1, 1));
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { k: u32, n: u32, group_size: u32 }
@@ -386,6 +404,60 @@ impl Model {
         down_qw: &wgpu::Buffer, down_sc: &wgpu::Buffer,
         output: &wgpu::Buffer, k: u32, n: u32,
     ) {
+        if self.bf16_mode {
+            // BF16 mode: SiLU(gate) * up first, then bf16_matvec for down_proj
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct SiluP { n: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&SiluP { n: k }));
+            gpu.dispatch("silu_mul_bf16", shaders::SILU_MUL, &[
+                gpu::bind(0, gate_out), gpu::bind(1, up_out),
+                gpu::bind(2, output), // reuse output as temp for SiLU result
+                gpu::bind(3, &self.state.params),
+            ], (k.div_ceil(256), 1, 1));
+            // Now bf16_matvec: output = down_proj @ silu_result
+            // silu_result is in gate_out (silu_mul writes to gate_out in-place? no, to output)
+            // Actually silu_mul writes to binding 2. We need a temp buffer.
+            // For now: use gate_out as temp — silu_mul reads gate+up, writes to output(binding 2)
+            // Then bf16_matvec reads output, writes to... we need a separate temp.
+            // Let's just do two dispatches with the existing buffer layout:
+            // 1. silu_mul: gate_out[i] = SiLU(gate_out[i]) * up_out[i] (in-place in gate_out)
+            // 2. bf16_matvec: output = down_proj @ gate_out
+            // But silu_mul.wgsl writes to output[i] not gate_out[i].
+            // Let me re-read the shader...
+            // silu_mul: output[i] = SiLU(gate[i]) * up[i]
+            // So: dispatch silu_mul(gate_out, up_out, gate_out) to overwrite gate_out
+            // Then: bf16_matvec(gate_out, down_qw, output)
+            // Actually we can't write to gate_out if it's binding 0 (read) — WGSL won't allow.
+            // Need a separate approach. Use the existing mlp buffer.
+            // For simplicity: two separate dispatches, use a different temp buffer.
+
+            // Actually, looking at silu_mul.wgsl: binding 0=gate(read), 1=up(read), 2=output(write)
+            // So we write SiLU result to `output`, then bf16_matvec reads from `output`.
+            // But bf16_matvec writes to `output` too — same buffer for read and write!
+            // We need a temp buffer. The state has mlp_output which we can use.
+            // But we're called WITH output = state.mlp_output. So we need another temp.
+            // Use attn_output as temp (not used during MLP phase):
+            gpu.dispatch("silu_mul_bf16", shaders::SILU_MUL, &[
+                gpu::bind(0, gate_out), gpu::bind(1, up_out),
+                gpu::bind(2, &self.state.attn_output), // temp: SiLU result
+                gpu::bind(3, &self.state.params),
+            ], (k.div_ceil(256), 1, 1));
+            // bf16_matvec: output[row] = sum(down_proj[row,k] * silu_result[k])
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct Bf16P { hidden_size: u32, vocab_size: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&Bf16P {
+                hidden_size: k, vocab_size: n,
+            }));
+            gpu.dispatch("down_bf16", shaders::BF16_MATVEC, &[
+                gpu::bind(0, &self.state.attn_output),
+                gpu::bind(1, down_qw),
+                gpu::bind(2, output),
+                gpu::bind(3, &self.state.params),
+            ], (n.div_ceil(32), 1, 1));
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { k: u32, n: u32, group_size: u32 }

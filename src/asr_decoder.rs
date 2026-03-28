@@ -150,7 +150,28 @@ impl AsrDecoder {
         }
     }
 
-    // TODO: implement forward/generate methods
+    /// Run a single autoregressive decode step.
+    /// Returns the predicted token ID.
+    pub fn forward_token(&mut self, token_id: u32) -> u32 {
+        // TODO: implement — needs KV cache allocation, embedding lookup,
+        // layer loop with bf16_matvec, attention, MLP, lm_head, argmax
+        log::warn!("[asr-decoder] forward_token not yet implemented");
+        0
+    }
+
+    /// Prefill a sequence of embeddings (from encoder output + prompt).
+    /// Sets up the KV cache for subsequent autoregressive decode.
+    pub fn prefill(&mut self, _embeddings: &[f32], _seq_len: u32) {
+        // TODO: implement — batched bf16_gemm through all layers
+        log::warn!("[asr-decoder] prefill not yet implemented");
+    }
+
+    /// Generate tokens autoregressively until EOS or max_tokens.
+    pub fn generate(&mut self, _prompt_embeddings: &[f32], _seq_len: u32, _max_tokens: u32) -> Vec<u32> {
+        // TODO: implement — prefill + decode loop
+        log::warn!("[asr-decoder] generate not yet implemented");
+        Vec::new()
+    }
 
     fn parse_config(path: &Path, max_seq_len: u32) -> AsrDecoderConfig {
         let text = std::fs::read_to_string(path).expect("config.json");

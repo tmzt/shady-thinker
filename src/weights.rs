@@ -545,3 +545,118 @@ pub fn load_weights(
         },
     )
 }
+
+/// Load bf16 (unquantized) weights for the ASR decoder.
+/// Creates ModelWeights with bf16 data in qweight fields, dummy scales.
+/// The model.rs forward uses bf16_matvec when bf16_mode=true.
+pub fn load_weights_bf16(
+    gpu: &GpuContext,
+    model_dir: &Path,
+    config: &ModelConfig,
+) -> (ModelWeights, RawNormWeights) {
+    let mut shard_files: Vec<_> = std::fs::read_dir(model_dir)
+        .expect("read model dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
+        .map(|e| e.path())
+        .collect();
+    shard_files.sort();
+
+    log::info!("[bf16] loading {} shard(s) from {:?}", shard_files.len(), model_dir);
+
+    // Collect all tensors across shards
+    let shard_data: Vec<Vec<u8>> = shard_files.iter()
+        .map(|p| std::fs::read(p).expect("read shard"))
+        .collect();
+    let shards: Vec<SafeTensors> = shard_data.iter()
+        .map(|d| SafeTensors::deserialize(d).expect("parse"))
+        .collect();
+
+    let get = |name: &str| -> &[u8] {
+        for st in &shards {
+            if let Ok(t) = st.tensor(name) { return t.data(); }
+        }
+        panic!("[bf16] tensor not found: {name}");
+    };
+
+    let upload = |label: &str, name: &str| -> wgpu::Buffer {
+        gpu.upload_buffer(label, get(name))
+    };
+
+    // Dummy 4-byte buffer for scales (unused in bf16 mode)
+    let dummy = gpu.create_storage_buffer("dummy", 4);
+
+    // Embedding (may need chunking for >128MB — handle at model level)
+    let embed = upload("embed", "thinker.model.embed_tokens.weight");
+    let final_norm = upload("final_norm", "thinker.model.norm.weight");
+
+    // lm_head
+    let lm_head_exists = shards.iter().any(|st| st.tensor("thinker.lm_head.weight").is_ok());
+    let lm_head = if lm_head_exists {
+        upload("lm_head", "thinker.lm_head.weight")
+    } else {
+        log::info!("[bf16] no lm_head — assuming tied embeddings");
+        gpu.create_storage_buffer("lm_head_dummy", 4)
+    };
+
+    let mut layers = Vec::new();
+    let mut norm_weights = Vec::new();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p = format!("thinker.model.layers.{i}");
+
+        // Q/K norm raw bytes for qknorm_params
+        let q_norm_bytes = get(&format!("{p}.self_attn.q_norm.weight")).to_vec();
+        let k_norm_bytes = get(&format!("{p}.self_attn.k_norm.weight")).to_vec();
+        norm_weights.push(Some((q_norm_bytes, k_norm_bytes)));
+
+        let sa = SelfAttnWeights {
+            q_proj_qweight: upload(&format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
+            q_proj_scales: dummy.clone(),
+            k_proj_qweight: upload(&format!("{p}.k"), &format!("{p}.self_attn.k_proj.weight")),
+            k_proj_scales: dummy.clone(),
+            v_proj_qweight: upload(&format!("{p}.v"), &format!("{p}.self_attn.v_proj.weight")),
+            v_proj_scales: dummy.clone(),
+            o_proj_qweight: upload(&format!("{p}.o"), &format!("{p}.self_attn.o_proj.weight")),
+            o_proj_scales: dummy.clone(),
+            q_norm: upload(&format!("{p}.qn"), &format!("{p}.self_attn.q_norm.weight")),
+            k_norm: upload(&format!("{p}.kn"), &format!("{p}.self_attn.k_norm.weight")),
+        };
+
+        let layer = LayerWeights {
+            attn: AttnWeights::SelfAttn(sa),
+            gate_proj_qweight: upload(&format!("{p}.gate"), &format!("{p}.mlp.gate_proj.weight")),
+            gate_proj_scales: dummy.clone(),
+            up_proj_qweight: upload(&format!("{p}.up"), &format!("{p}.mlp.up_proj.weight")),
+            up_proj_scales: dummy.clone(),
+            down_proj_qweight: upload(&format!("{p}.down"), &format!("{p}.mlp.down_proj.weight")),
+            down_proj_scales: dummy.clone(),
+            input_layernorm: upload(&format!("{p}.in"), &format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm: upload(&format!("{p}.pa"), &format!("{p}.post_attention_layernorm.weight")),
+        };
+        layers.push(layer);
+
+        if (i + 1) % 7 == 0 {
+            log::info!("[bf16] loaded layer {}/{}", i + 1, config.num_hidden_layers);
+        }
+    }
+
+    let self_attn_indices: Vec<usize> = (0..config.num_hidden_layers as usize).collect();
+
+    log::info!("[bf16] loaded {} layers", layers.len());
+
+    (
+        ModelWeights {
+            embed_tokens: embed,
+            final_norm,
+            lm_head_qweight: lm_head,
+            lm_head_scales: dummy,
+            lm_head_is_bf16: true,
+            self_attn_layers: self_attn_indices,
+            layers,
+        },
+        RawNormWeights {
+            layers: norm_weights,
+        },
+    )
+}
