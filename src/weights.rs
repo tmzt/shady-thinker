@@ -5,6 +5,93 @@ use safetensors::SafeTensors;
 
 use crate::gpu::GpuContext;
 
+/// Convert a bf16 weight matrix [rows, cols] to GPTQ INT4 format.
+/// Returns (qweight_buffer, scales_buffer) ready for GPU upload.
+/// Symmetric quantization: val ≈ (nibble - 8) * scale.
+/// Column-major qweight layout matches gptq_matvec.wgsl.
+fn quantize_bf16_to_int4(
+    gpu: &GpuContext,
+    label: &str,
+    bf16_data: &[u8],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> (wgpu::Buffer, wgpu::Buffer) {
+    assert_eq!(bf16_data.len(), rows * cols * 2, "{label}: bf16 size mismatch");
+    assert!(rows % 8 == 0, "{label}: rows must be multiple of 8");
+
+    let packed_rows = rows / 8;
+    let n_groups = (rows + group_size - 1) / group_size;
+
+    // Step 1: bf16 → f32 batch conversion (row-major → column-major transpose)
+    // Process one column at a time to be cache-friendly for the output
+    let mut qweight = vec![0u32; packed_rows * cols];
+    let mut scales_f16 = vec![0u16; n_groups * cols];
+
+    for c in 0..cols {
+        // Extract column c from row-major bf16 data, convert to f32
+        // Stride: every `cols` elements, offset by c
+        let mut col_f32 = vec![0.0f32; rows];
+        for r in 0..rows {
+            let idx = (r * cols + c) * 2;
+            let bits = (bf16_data[idx] as u32) | ((bf16_data[idx + 1] as u32) << 8);
+            col_f32[r] = f32::from_bits(bits << 16);
+        }
+
+        // Step 2: Per-group quantization for this column
+        for g in 0..n_groups {
+            let start = g * group_size;
+            let end = (start + group_size).min(rows);
+
+            // Find max absolute value in group (vectorizable)
+            let mut max_abs: f32 = 0.0;
+            for r in start..end {
+                let a = col_f32[r].abs();
+                if a > max_abs { max_abs = a; }
+            }
+
+            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+            let inv_scale = 1.0 / scale;
+            scales_f16[g * cols + c] = half::f16::from_f32(scale).to_bits();
+
+            // Quantize and pack 8 values per u32
+            let group_pr_start = start / 8;
+            let group_pr_end = (end + 7) / 8;
+            for pr in group_pr_start..group_pr_end.min(packed_rows) {
+                let mut packed: u32 = 0;
+                for nibble in 0..8u32 {
+                    let r = pr * 8 + nibble as usize;
+                    if r < end && r >= start {
+                        let q = ((col_f32[r] * inv_scale).round() as i32 + 8).clamp(0, 15) as u32;
+                        packed |= q << (nibble * 4);
+                    } else if r < rows {
+                        // Row belongs to adjacent group — already handled or will be
+                        // Read existing packed value and preserve this nibble
+                        let existing = qweight[pr * cols + c];
+                        packed |= existing & (0xF << (nibble * 4));
+                    }
+                }
+                qweight[pr * cols + c] = packed;
+            }
+        }
+    }
+
+    // Step 3: Upload to GPU
+    let qw_buf = gpu.upload_buffer(&format!("{label}.qw"), bytemuck::cast_slice(&qweight));
+
+    // Pack scales: two f16 per u32
+    let scales_u32_len = (n_groups * cols + 1) / 2;
+    let mut scales_packed = vec![0u32; scales_u32_len];
+    for i in (0..n_groups * cols).step_by(2) {
+        let lo = scales_f16[i] as u32;
+        let hi = if i + 1 < n_groups * cols { scales_f16[i + 1] as u32 } else { 0 };
+        scales_packed[i / 2] = lo | (hi << 16);
+    }
+    let sc_buf = gpu.upload_buffer(&format!("{label}.sc"), bytemuck::cast_slice(&scales_packed));
+
+    (qw_buf, sc_buf)
+}
+
 /// Standard self-attention layer weights
 pub struct SelfAttnWeights {
     pub q_proj_qweight: wgpu::Buffer,
@@ -698,4 +785,77 @@ pub fn load_weights_bf16(
             layers: norm_weights,
         },
     )
+}
+
+/// Load weights with runtime bf16→INT4 quantization.
+/// Linear layers → GPTQ INT4 (symmetric, group_size). Norms/embeddings → bf16.
+/// ~4x less GPU memory + bandwidth, uses standard gptq_matvec shader (no bf16_mode).
+pub fn load_weights_int4(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, group_size: u32,
+) -> (ModelWeights, RawNormWeights) {
+    let mut sf: Vec<_> = std::fs::read_dir(model_dir).expect("read dir")
+        .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
+        .map(|e| e.path()).collect();
+    sf.sort();
+    log::info!("[int4] {} shard(s), group_size={}", sf.len(), group_size);
+    let mm: Vec<memmap2::Mmap> = sf.iter()
+        .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
+    let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
+
+    let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let shp = |n: &str| -> Vec<usize> { for s in &st { if let Ok(t)=s.tensor(n) { return t.shape().to_vec(); } } panic!("{n}"); };
+    let bf = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
+    let q4 = |l:&str,n:&str| -> (wgpu::Buffer,wgpu::Buffer) {
+        let s=shp(n); quantize_bf16_to_int4(gpu,l,get(n),s[0],s[1],group_size as usize)
+    };
+
+    let er = get("thinker.model.embed_tokens.weight");
+    let bl = gpu.max_storage_binding_size() as usize;
+    let bt = config.hidden_size as usize * 2;
+    let (emb,ech,ecs) = if er.len()>bl {
+        let mc=(bl-1024)&!3; let tp=mc/bt; let nc=(config.vocab_size as usize+tp-1)/tp;
+        log::info!("[int4] embed: {} bf16 chunks", nc);
+        let mut c=Vec::new();
+        for i in 0..nc { let s=i*tp*bt; let e=((i+1)*tp*bt).min(er.len()); c.push(gpu.upload_buffer(&format!("ec{i}"),&er[s..e])); }
+        (gpu.create_storage_buffer("ed",4),c,tp as u32)
+    } else { (gpu.upload_buffer("e",er),Vec::new(),0u32) };
+
+    let fnrm = bf("fn","thinker.model.norm.weight");
+    let lmh = if st.iter().any(|s| s.tensor("thinker.lm_head.weight").is_ok()) { bf("lh","thinker.lm_head.weight") }
+              else { gpu.create_storage_buffer("ld",4) };
+    let ds = gpu.create_storage_buffer("ds",4);
+    let mut ly=Vec::new(); let mut nw=Vec::new(); let t0=std::time::Instant::now();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p=format!("thinker.model.layers.{i}");
+        nw.push(Some((get(&format!("{p}.self_attn.q_norm.weight")).to_vec(),
+                       get(&format!("{p}.self_attn.k_norm.weight")).to_vec())));
+        let (qq,qs)=q4("q",&format!("{p}.self_attn.q_proj.weight"));
+        let (kq,ks)=q4("k",&format!("{p}.self_attn.k_proj.weight"));
+        let (vq,vs)=q4("v",&format!("{p}.self_attn.v_proj.weight"));
+        let (oq,os)=q4("o",&format!("{p}.self_attn.o_proj.weight"));
+        let (gq,gs)=q4("g",&format!("{p}.mlp.gate_proj.weight"));
+        let (uq,us)=q4("u",&format!("{p}.mlp.up_proj.weight"));
+        let (dq,dss)=q4("d",&format!("{p}.mlp.down_proj.weight"));
+        ly.push(LayerWeights {
+            attn: AttnWeights::SelfAttn(SelfAttnWeights {
+                q_proj_qweight:qq,q_proj_scales:qs, k_proj_qweight:kq,k_proj_scales:ks,
+                v_proj_qweight:vq,v_proj_scales:vs, o_proj_qweight:oq,o_proj_scales:os,
+                q_norm:bf("qn",&format!("{p}.self_attn.q_norm.weight")),
+                k_norm:bf("kn",&format!("{p}.self_attn.k_norm.weight")),
+            }),
+            gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
+            down_proj_qweight:dq,down_proj_scales:dss,
+            input_layernorm:bf("il",&format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm:bf("pl",&format!("{p}.post_attention_layernorm.weight")),
+        });
+        if (i+1)%7==0 { log::info!("[int4] layer {}/{} ({}ms)", i+1, config.num_hidden_layers, t0.elapsed().as_millis()); }
+    }
+    log::info!("[int4] done: {} layers in {}ms", ly.len(), t0.elapsed().as_millis());
+
+    (ModelWeights {
+        embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
+        lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
+        layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
+    }, RawNormWeights { layers: nw })
 }

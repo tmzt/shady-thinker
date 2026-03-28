@@ -38,20 +38,33 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
         config.num_attention_heads, config.num_key_value_heads, config.vocab_size,
         config.rope_theta, config.head_dim, config.partial_rotary_factor);
 
-    let quant_config = QuantConfig {
-        bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false,
-    };
-
     let gpu = GpuContext::new();
-    let (weights, raw_norms) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
+
+    // Use INT4 quantization on Android (128MB binding, less GPU memory)
+    // Use bf16 on macOS/desktop (plenty of memory, higher quality)
+    let use_int4 = gpu.max_storage_binding_size() < 256 * 1024 * 1024
+        || std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
+
+    let (weights, raw_norms, quant_config) = if use_int4 {
+        let group_size = 128u32;
+        let (w, n) = crate::weights::load_weights_int4(&gpu, model_dir, &config, group_size);
+        let qc = QuantConfig { bits: 4, group_size, quant_method: "gptq".to_string(), sym: true };
+        (w, n, qc)
+    } else {
+        let (w, n) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
+        let qc = QuantConfig { bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false };
+        (w, n, qc)
+    };
 
     let chunked = !weights.embed_chunks.is_empty();
     let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
-    model.bf16_mode = true;
-    model.q_gated = false; // ASR decoder uses standard attention, not SiGLU-gated Q
-    model.norm_direct = true; // ASR uses direct w scaling, not (1+w) like Qwen3.5
+    if !use_int4 {
+        model.bf16_mode = true;
+    }
+    model.q_gated = false;
+    model.norm_direct = true;
     model.rebuild_qknorm_shader();
-    log::info!("[asr-decoder] embed chunked={}", chunked);
+    log::info!("[asr-decoder] mode={}, chunked_embed={}", if use_int4 { "int4" } else { "bf16" }, chunked);
 
     for (i, norm) in raw_norms.layers.iter().enumerate() {
         if let Some((q, k)) = norm {
@@ -59,7 +72,7 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
         }
     }
 
-    log::info!("[asr-decoder] model ready (bf16_mode=true, chunked_embed={})", chunked);
+    log::info!("[asr-decoder] model ready");
     (gpu, model)
 }
 
@@ -214,9 +227,24 @@ pub fn gpu_asr_decode_tokens(
     let embed_ms = t0.elapsed().as_millis();
     log::info!("[asr-decode] built {} embeddings in {}ms", total_seq, embed_ms);
 
-    // Batched prefill: all tokens through all layers at once
+    // Prefill: batched GEMM for bf16, token-by-token for INT4
     let t1 = std::time::Instant::now();
-    let mut token = model.prefill(gpu, &input_embeds, total_seq as u32);
+    let mut token = if model.bf16_mode {
+        model.prefill(gpu, &input_embeds, total_seq as u32)
+    } else {
+        // INT4/GPTQ: token-by-token prefill using forward_argmax / forward_embed_argmax
+        model.seq_len = 0;
+        model.generated_tokens.clear();
+        let h = model.config.hidden_size as usize;
+        for (i, chunk) in input_embeds.chunks_exact(h).enumerate() {
+            model.forward_embed_argmax(gpu, chunk);
+            if (i + 1) % 10 == 0 {
+                log::info!("[asr-decode] int4 prefill: {}/{} tokens", i + 1, total_seq);
+            }
+        }
+        // The last forward_embed_argmax returned a token — use it
+        *model.generated_tokens.last().unwrap_or(&0)
+    };
     let prefill_ms = t1.elapsed().as_millis();
     log::info!("[asr-decode] prefill: {} tokens in {}ms, first_token={}", total_seq, prefill_ms, token);
 
