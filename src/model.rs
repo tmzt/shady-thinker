@@ -623,7 +623,7 @@ impl Model {
                 self.write_params(gpu, bytemuck::bytes_of(&LmP {
                     hidden_size: h, vocab_size: chunk_vocab,
                 }));
-                gpu.dispatch(&format!("lm_head_chunk_{ci}"), shaders::BF16_MATVEC, &[
+                gpu.dispatch("lm_head_chunked", shaders::BF16_MATVEC, &[
                     gpu::bind(0, &self.state.normed),
                     gpu::bind(1, chunk),
                     gpu::bind(2, &chunk_logits),
@@ -680,7 +680,7 @@ impl Model {
         gpu.write_buffer(&self.state.qknorm_params[layer_idx], 16, bytemuck::cast_slice(&updates));
 
         gpu.dispatch(
-            &format!("qknorm_l{layer_idx}"),
+            "qknorm",
             &self.qknorm_shader_src,
             &[
                 gpu::bind(0, &self.state.q_out),   // q_proj_full (interleaved q+gate)
@@ -723,7 +723,7 @@ impl Model {
         };
 
         gpu.dispatch(
-            &format!("gqa_l{layer_idx}"),
+            "gqa",
             shaders::GQA_ATTENTION_HEAD,
             &[
                 gpu::bind(0, &self.state.q_proj),
@@ -744,7 +744,7 @@ impl Model {
                 head_dim: hd, num_splits: ns, num_heads: nh, _pad: 0,
             }));
             gpu.dispatch(
-                &format!("gqa_reduce_l{layer_idx}"),
+                "gqa_reduce",
                 shaders::GQA_REDUCE,
                 &[
                     gpu::bind(0, &self.state.attn_partials),
@@ -828,7 +828,7 @@ impl Model {
         struct DownP { in_features: u32, rank: u32 }
         self.write_params(gpu, bytemuck::bytes_of(&DownP { in_features: inter, rank }));
         gpu.dispatch(
-            &format!("lora_down_silu_l{layer_idx}"), shaders::LORA_DOWN_SILU,
+            "lora_down_silu", shaders::LORA_DOWN_SILU,
             &[gpu::bind(0, &self.state.gate_out), gpu::bind(1, &self.state.up_out),
               gpu::bind(2, &lora.layers[layer_idx].down_proj_a),
               gpu::bind(3, &lora.lora_hidden), gpu::bind(4, &self.state.params)],
@@ -840,7 +840,7 @@ impl Model {
         struct UpP { rank: u32, out_features: u32, scale: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&UpP { rank, out_features: h, scale }));
         gpu.dispatch(
-            &format!("lora_up_down_l{layer_idx}"), shaders::LORA_UP_ADD,
+            "lora_up_down", shaders::LORA_UP_ADD,
             &[gpu::bind(0, &lora.lora_hidden),
               gpu::bind(1, &lora.layers[layer_idx].down_proj_b),
               gpu::bind(2, &self.state.mlp_output), gpu::bind(3, &self.state.params)],
@@ -897,27 +897,27 @@ impl Model {
             if let Some(sa) = layer.self_attn() {
                 let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
                 let kv_dim = nkv * hd;
-                self.gptq_matvec(gpu, &format!("qproj_l{i}"),
+                self.gptq_matvec(gpu, "qproj",
                     &self.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
                     &self.state.q_out, h, q_dim);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[0]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("qproj_l{i}"),
+                    self.lora_apply(gpu, "qproj",
                         &self.state.normed, &lw.q_proj_a, &lw.q_proj_b,
                         &self.state.q_out, h, q_dim);
                 }
 
-                self.gptq_matvec(gpu, &format!("kproj_l{i}"),
+                self.gptq_matvec(gpu, "kproj",
                     &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
                     &self.state.k_out, h, kv_dim);
-                self.gptq_matvec(gpu, &format!("vproj_l{i}"),
+                self.gptq_matvec(gpu, "vproj",
                     &self.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
                     &self.state.v_out, h, kv_dim);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[1]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("vproj_l{i}"),
+                    self.lora_apply(gpu, "vproj",
                         &self.state.normed, &lw.v_proj_a, &lw.v_proj_b,
                         &self.state.v_out, h, kv_dim);
                 }
@@ -928,13 +928,13 @@ impl Model {
                     self.sigmoid_mul_gate(gpu);
                 }
 
-                self.gptq_matvec(gpu, &format!("oproj_l{i}"),
+                self.gptq_matvec(gpu, "oproj",
                     &self.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
                     &self.state.o_proj_out, nh * hd, h);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[2]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("oproj_l{i}"),
+                    self.lora_apply(gpu, "oproj",
                         &self.state.attn_output, &lw.o_proj_a, &lw.o_proj_b,
                         &self.state.o_proj_out, nh * hd, h);
                 }
@@ -947,11 +947,11 @@ impl Model {
 
                 let lin_idx = (0..i).filter(|j| !self.weights.self_attn_layers.contains(j)).count();
 
-                self.gptq_matvec(gpu, &format!("dn_qkv_l{i}"),
+                self.gptq_matvec(gpu, "dn_qkv",
                     &self.state.normed, &la.in_proj_qkv_qweight, &la.in_proj_qkv_scales,
                     &self.state.deltanet_qkv, h, total_ch);
 
-                self.gptq_matvec(gpu, &format!("dn_z_l{i}"),
+                self.gptq_matvec(gpu, "dn_z",
                     &self.state.normed, &la.in_proj_z_qweight, &la.in_proj_z_scales,
                     &self.state.deltanet_z, h, lnvh * lvd);
 
@@ -967,7 +967,7 @@ impl Model {
                 }));
 
                 gpu.dispatch(
-                    &format!("deltanet_l{i}"),
+                    "deltanet",
                     shaders::FUSED_CONV_DELTANET_NORM,
                     &[
                         gpu::bind(0, &self.state.deltanet_qkv),
@@ -998,10 +998,10 @@ impl Model {
                 &layer.post_attn_layernorm, &self.state.normed, h);
 
             // ── MLP ──
-            self.gptq_matvec(gpu, &format!("gate_l{i}"),
+            self.gptq_matvec(gpu, "gate",
                 &self.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
                 &self.state.gate_out, h, inter);
-            self.gptq_matvec(gpu, &format!("up_l{i}"),
+            self.gptq_matvec(gpu, "up",
                 &self.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
                 &self.state.up_out, h, inter);
             self.fused_silu_gptq_down(gpu,
@@ -1195,13 +1195,13 @@ impl Model {
                 let hd = self.config.head_dim;
                 let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
                 let kv_dim = nkv * hd;
-                self.gptq_matvec(gpu, &format!("qproj_l{i}"),
+                self.gptq_matvec(gpu, "qproj",
                     &self.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
                     &self.state.q_out, h, q_dim);
-                self.gptq_matvec(gpu, &format!("kproj_l{i}"),
+                self.gptq_matvec(gpu, "kproj",
                     &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
                     &self.state.k_out, h, kv_dim);
-                self.gptq_matvec(gpu, &format!("vproj_l{i}"),
+                self.gptq_matvec(gpu, "vproj",
                     &self.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
                     &self.state.v_out, h, kv_dim);
                 self.fused_split_qknorm_kvstore(gpu, i);
@@ -1209,7 +1209,7 @@ impl Model {
                 if self.q_gated {
                     self.sigmoid_mul_gate(gpu);
                 }
-                self.gptq_matvec(gpu, &format!("oproj_l{i}"),
+                self.gptq_matvec(gpu, "oproj",
                     &self.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
                     &self.state.o_proj_out, nh * hd, h);
             } else {
@@ -1219,10 +1219,10 @@ impl Model {
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed, h);
 
-            self.gptq_matvec(gpu, &format!("gate_l{i}"),
+            self.gptq_matvec(gpu, "gate",
                 &self.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
                 &self.state.gate_out, h, inter);
-            self.gptq_matvec(gpu, &format!("up_l{i}"),
+            self.gptq_matvec(gpu, "up",
                 &self.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
                 &self.state.up_out, h, inter);
             self.fused_silu_gptq_down(gpu,
@@ -1359,7 +1359,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: nh * hd, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_q_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_q", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
                 gpu::bind(1, &sa.q_proj_qweight),
                 gpu::bind(2, &normed), // bias unused (has_bias=0)
@@ -1371,7 +1371,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_k_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_k", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
                 gpu::bind(1, &sa.k_proj_qweight),
                 gpu::bind(2, &normed),
@@ -1383,7 +1383,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_v_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_v", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
                 gpu::bind(1, &sa.v_proj_qweight),
                 gpu::bind(2, &normed),
@@ -1396,7 +1396,7 @@ impl Model {
             // header (num_heads, kv_heads, head_dim, eps) + packed norm weights.
             // The batched shader reads position from workgroup_id.y, not the buffer.
             gpu.flush();
-            gpu.dispatch(&format!("pf_qknorm_l{layer_idx}"), &batched_qknorm_src, &[
+            gpu.dispatch("pf_qknorm", &batched_qknorm_src, &[
                 gpu::bind(0, &q_buf),
                 gpu::bind(1, &k_buf),
                 gpu::bind(2, &v_buf),
@@ -1413,7 +1413,7 @@ impl Model {
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&AttnP {
                 seq_len, head_dim: hd, num_kv_heads: nkv, num_q_heads: nh,
                 heads_per_kv: nh / nkv }));
-            gpu.dispatch(&format!("pf_attn_l{layer_idx}"), shaders::CAUSAL_ATTENTION_PREFILL, &[
+            gpu.dispatch("pf_attn", shaders::CAUSAL_ATTENTION_PREFILL, &[
                 gpu::bind(0, &q_buf),
                 gpu::bind(1, &k_buf),
                 gpu::bind(2, &v_buf),
@@ -1425,7 +1425,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: nh * hd, d_out: h, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_o_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_o", shaders::BF16_GEMM, &[
                 gpu::bind(0, &attn_out),
                 gpu::bind(1, &sa.o_proj_qweight),
                 gpu::bind(2, &attn_out),
@@ -1437,7 +1437,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
                 n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
-            gpu.dispatch(&format!("pf_postnorm_l{layer_idx}"), shaders::BATCHED_ADD_RMSNORM, &[
+            gpu.dispatch("pf_postnorm", shaders::BATCHED_ADD_RMSNORM, &[
                 gpu::bind(0, &residual),
                 gpu::bind(1, &o_out),
                 gpu::bind(2, &layer.post_attn_layernorm),
@@ -1449,7 +1449,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: inter, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_gate_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_gate", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
                 gpu::bind(1, &layer.gate_proj_qweight),
                 gpu::bind(2, &normed),
@@ -1460,7 +1460,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: inter, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_up_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_up", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
                 gpu::bind(1, &layer.up_proj_qweight),
                 gpu::bind(2, &normed),
@@ -1475,7 +1475,7 @@ impl Model {
             let total_silu = seq_len * inter;
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&SiluP { n: total_silu }));
-            gpu.dispatch(&format!("pf_silu_l{layer_idx}"), shaders::BATCHED_SILU_MUL, &[
+            gpu.dispatch("pf_silu", shaders::BATCHED_SILU_MUL, &[
                 gpu::bind(0, &gate_buf),
                 gpu::bind(1, &up_buf),
                 gpu::bind(2, &silu_buf),
@@ -1486,7 +1486,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: inter, d_out: h, seq_len, has_bias: 0 }));
-            gpu.dispatch(&format!("pf_down_l{layer_idx}"), shaders::BF16_GEMM, &[
+            gpu.dispatch("pf_down", shaders::BF16_GEMM, &[
                 gpu::bind(0, &silu_buf),
                 gpu::bind(1, &layer.down_proj_qweight),
                 gpu::bind(2, &silu_buf),
