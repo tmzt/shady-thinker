@@ -571,12 +571,16 @@ pub fn load_weights_bf16(
 
     log::info!("[bf16] loading {} shard(s) from {:?}", shard_files.len(), model_dir);
 
-    // Collect all tensors across shards
-    let shard_data: Vec<Vec<u8>> = shard_files.iter()
-        .map(|p| std::fs::read(p).expect("read shard"))
+    // Memory-map shards to avoid loading entire files into RAM.
+    // On Android this reduces peak RSS from ~6.9GB to ~2GB.
+    let shard_mmaps: Vec<memmap2::Mmap> = shard_files.iter()
+        .map(|p| {
+            let file = std::fs::File::open(p).expect("open shard");
+            unsafe { memmap2::Mmap::map(&file).expect("mmap shard") }
+        })
         .collect();
-    let shards: Vec<SafeTensors> = shard_data.iter()
-        .map(|d| SafeTensors::deserialize(d).expect("parse"))
+    let shards: Vec<SafeTensors> = shard_mmaps.iter()
+        .map(|m| SafeTensors::deserialize(m).expect("parse"))
         .collect();
 
     let get = |name: &str| -> &[u8] {
