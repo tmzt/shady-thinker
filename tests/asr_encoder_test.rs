@@ -727,3 +727,97 @@ fn gpu_pipeline_fox() {
         &mut gpu, &mut model, &prefix_cache, &enc_output, seq_len);
     eprintln!("GPU decoder: {} tokens: {:?}", tokens.len(), &tokens);
 }
+
+// ── 8-bit AsrModel tests ──────────────────────────────────────────────
+
+/// Test 8-bit AsrModel: load, forward, verify predictions match bf16.
+#[test]
+fn asr_model_8bit_load_and_forward() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/Qwen3-ASR-1.7B-MLX-8bit");
+    if !model_dir.exists() { eprintln!("SKIP: 8-bit model not found"); return; }
+
+    let t0 = std::time::Instant::now();
+    let (mut gpu, mut model) = shady_thinker::asr_decoder::load_asr_model(model_dir, 512);
+    let load_ms = t0.elapsed().as_millis();
+    eprintln!("AsrModel 8-bit loaded in {}ms (bits={})", load_ms, model.quant_config.bits);
+
+    // Forward two tokens
+    let t1 = model.forward_argmax_simple(&mut gpu, 151644);
+    eprintln!("Token 1: {} ({:x})", t1, t1);
+    let t2 = model.forward_argmax_simple(&mut gpu, t1);
+    eprintln!("Token 2: {} ({:x})", t2, t2);
+
+    // Zero-write test
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+    model.init_decode(&mut gpu, 151644, 0);
+    model.forward_zero_write(&mut gpu);
+    gpu.flush();
+    let tokens = model.read_generated_tokens(&mut gpu);
+    eprintln!("Zero-write token: {:?}", tokens);
+
+    eprintln!("PASS: asr_model_8bit_load_and_forward");
+}
+
+/// Compare 8-bit vs bf16 predictions on ASR prefix.
+#[test]
+fn asr_model_8bit_vs_bf16_prefix() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/Qwen3-ASR-1.7B-MLX-8bit");
+    let bf16_dir = std::path::Path::new("../../models/Qwen3-ASR-1.7B");
+    if !model_dir.exists() { eprintln!("SKIP: 8-bit model not found"); return; }
+    if !bf16_dir.exists() { eprintln!("SKIP: bf16 model not found"); return; }
+
+    let prefix: Vec<u32> = vec![151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669,
+                                 151670, 151645, 198, 151644, 77091, 198, 151704];
+
+    // bf16
+    let (mut gpu_b, mut model_b) = shady_thinker::asr_decoder::load_bf16_model(bf16_dir, 512);
+    model_b.seq_len = 0; model_b.generated_tokens.clear();
+    let mut bf16_preds = Vec::new();
+    for &tok in &prefix {
+        bf16_preds.push(model_b.forward_argmax(&mut gpu_b, tok));
+    }
+
+    // 8-bit
+    let (mut gpu_8, mut model_8) = shady_thinker::asr_decoder::load_asr_model(model_dir, 512);
+    model_8.seq_len = 0; model_8.generated_tokens.clear();
+    let mut int8_preds = Vec::new();
+    for &tok in &prefix {
+        int8_preds.push(model_8.forward_argmax_simple(&mut gpu_8, tok));
+    }
+
+    let mut matches = 0;
+    for (i, (&b, &e)) in bf16_preds.iter().zip(int8_preds.iter()).enumerate() {
+        let m = if b == e { "✓" } else { "✗" };
+        eprintln!("  pos={:2} bf16={:6x} int8={:6x} {}", i, b, e, m);
+        if b == e { matches += 1; }
+    }
+    eprintln!("{}/{} match", matches, prefix.len());
+}
+
+#[test]
+fn asr_decode_conv_stem_files() {
+    let _ = env_logger::try_init();
+    let model_dir = std::path::Path::new("../../models/Qwen3-ASR-1.7B-MLX-8bit");
+    if !model_dir.exists() { eprintln!("SKIP"); return; }
+
+    for (label, path, seq_len) in [
+        ("TTS", "/tmp/conv_stem_tts_12_1024.f32", 12u32),
+        ("Mic", "/tmp/conv_stem_mic_30_1024.f32", 30u32),
+    ] {
+        if !std::path::Path::new(path).exists() { eprintln!("SKIP {path}"); continue; }
+        let data = std::fs::read(path).unwrap();
+        let conv_stem: &[f32] = bytemuck::cast_slice(&data);
+
+        let mut encoder = shady_thinker::asr_encoder::AsrEncoder::new(model_dir);
+        let enc_out = encoder.forward(conv_stem, seq_len);
+
+        let (mut gpu, mut model) = shady_thinker::asr_decoder::load_asr_model(model_dir, 512);
+        let tokens = shady_thinker::asr_decoder::asr_decode_zero_write(
+            &mut gpu, &mut model, &enc_out, seq_len);
+        let hex: Vec<String> = tokens.iter().take(10).map(|t| format!("{:x}", t)).collect();
+        eprintln!("{label}: {} tokens [{}]", tokens.len(), hex.join(" "));
+    }
+}

@@ -1,6 +1,25 @@
 // Batched Add + RMSNorm: hidden[row,i] += addend[row,i], then
-// output[row,i] = hidden[row,i] * rms * (1 + weight[i])
-// Weight is BF16 packed. Dispatch: (seq_len, 1, 1) — one workgroup per token
+// output[row,i] = hidden[row,i] * rms * weight[i]
+// where rms = 1 / sqrt(mean(x^2) + eps).
+//
+// The residual add is fused: hidden is updated in-place before normalization.
+// Weight is BF16 packed (two BF16 values per u32).
+// All arrays layout: [seq_len, N] contiguous f32.
+//
+// Params uniform:
+//   N        — hidden dimension (e.g. 1024)
+//   eps      — normalization epsilon (e.g. 1e-6)
+//   seq_len  — number of tokens in the batch
+//
+// Bindings:
+//   @binding(0) hidden  — [seq_len, N] f32, read-write (residual, updated in-place)
+//   @binding(1) addend  — [seq_len, N] f32, read-only (value to add)
+//   @binding(2) weight  — [N/2] u32 (BF16 packed), read-only
+//   @binding(3) output  — [seq_len, N] f32, read-write (normalized result)
+//   @binding(4) params  — uniform Params
+//
+// Dispatch: (seq_len, 1, 1) — one workgroup per token
+// Workgroup size: 256 threads stride over N
 
 struct Params {
     N: u32,

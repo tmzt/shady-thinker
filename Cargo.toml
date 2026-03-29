@@ -11,6 +11,7 @@ name = "shady_thinker"
 default = []
 chat = ["dep:tokenizers"]
 jit-lora = ["chat"]
+simulate-imgtech = []
 
 [[example]]
 name = "chat"

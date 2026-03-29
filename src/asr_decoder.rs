@@ -7,9 +7,57 @@ use std::path::{Path, PathBuf};
 use safetensors::SafeTensors;
 use crate::gpu::GpuContext;
 use crate::model::Model;
+use crate::asr_model::AsrModel;
 use crate::weights::{ModelConfig, QuantConfig};
 
 const INT4_EMBEDDING_MLX_SRC: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
+
+/// Load an MLX quantized ASR decoder as AsrModel (4-bit or 8-bit).
+pub fn load_asr_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, AsrModel) {
+    log::info!("[asr-decoder] loading ASR model from {:?}", model_dir);
+
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model_dir.join("config.json")).expect("config.json")
+    ).expect("parse json");
+
+    let text_cfg = if raw["thinker_config"]["text_config"].is_object() {
+        &raw["thinker_config"]["text_config"]
+    } else if raw["text_decoder"].is_object() {
+        &raw["text_decoder"]
+    } else if raw["text_config"].is_object() {
+        &raw["text_config"]
+    } else {
+        &raw
+    };
+    let mut config: ModelConfig = serde_json::from_value(text_cfg.clone()).expect("parse ModelConfig");
+    if config.partial_rotary_factor < 1.0 && !text_cfg.get("partial_rotary_factor").is_some() {
+        config.partial_rotary_factor = 1.0;
+    }
+
+    let qcfg = raw.get("quantization_config").or(raw.get("quantization"));
+    let bits = qcfg.and_then(|q| q["bits"].as_u64()).unwrap_or(4) as u32;
+    let group_size = qcfg.and_then(|q| q["group_size"].as_u64()).unwrap_or(64) as u32;
+    log::info!("[asr-decoder] config: {} layers, hidden={}, heads={}, kv_heads={}, vocab={}, {}bit gs={}",
+        config.num_hidden_layers, config.hidden_size,
+        config.num_attention_heads, config.num_key_value_heads, config.vocab_size,
+        bits, group_size);
+
+    let gpu = GpuContext::new();
+    let (weights, raw_norms) = crate::weights::load_weights_mlx(&gpu, model_dir, &config, bits);
+    let quant_config = QuantConfig { bits, group_size, quant_method: "mlx".to_string(), sym: false };
+
+    let chunked = !weights.embed_chunks.is_empty();
+    let mut model = AsrModel::new(&gpu, config, quant_config, weights, max_seq_len);
+
+    for (i, norm) in raw_norms.layers.iter().enumerate() {
+        if let Some((q, k)) = norm {
+            model.init_qknorm_params(&gpu, i, q, k);
+        }
+    }
+
+    log::info!("[asr-decoder] AsrModel ready (mlx-{}bit, chunked_embed={})", bits, chunked);
+    (gpu, model)
+}
 
 /// Load a bf16 ASR decoder model ready for inference.
 /// Handles the nested ASR config (thinker_config.text_config).
@@ -440,6 +488,202 @@ pub fn gpu_asr_decode_tokens(
         token_ids.len(), total_ms, prefill_ms, t2.elapsed().as_millis());
 
     token_ids
+}
+
+// ── AsrModel zero-write decode ────────────────────────────────────────
+
+/// Result of GPU autoregressive decode.
+#[derive(Debug)]
+pub enum DecodeResult {
+    /// First decode token was EOS — model thinks no speech.
+    /// Contains top-3 logits from the first decode step.
+    NoSpeech { top3: Vec<(u32, f32)>, prefill_ms: u128 },
+    /// Successfully decoded tokens.
+    Speech {
+        /// Filtered output token IDs (special tokens removed).
+        token_ids: Vec<u32>,
+        /// Raw ring: every token with its winning logit value.
+        raw_ring: Vec<(u32, f32)>,
+        /// First decode token and its logit.
+        first_token: (u32, f32),
+        prefill_ms: u128,
+        decode_ms: u128,
+    },
+}
+
+/// Tracks whether prefix KV cache is resident on GPU.
+static PREFIX_CACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PREFIX_LEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn asr_decode_zero_write(
+    gpu: &mut GpuContext,
+    model: &mut AsrModel,
+    encoder_output: &[f32],
+    enc_seq_len: u32,
+) -> DecodeResult {
+    let hidden = model.config.hidden_size as usize;
+    assert_eq!(encoder_output.len(), enc_seq_len as usize * hidden);
+
+    let t0 = std::time::Instant::now();
+    model.seq_len = 0;
+    model.generated_tokens.clear();
+    gpu.invalidate_bind_groups();
+
+    let prefix: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
+    let kv_dim = (model.config.num_key_value_heads * model.config.head_dim) as u64;
+
+    if PREFIX_CACHED.load(std::sync::atomic::Ordering::Relaxed) {
+        // Prefix KV already on GPU — just clear everything after it
+        let pfx_len = PREFIX_LEN.load(std::sync::atomic::Ordering::Relaxed);
+        let pfx_bytes = pfx_len as u64 * kv_dim * 4;
+        for k in &model.state.k_cache {
+            gpu.clear_buffer_range(k, pfx_bytes);
+        }
+        for v in &model.state.v_cache {
+            gpu.clear_buffer_range(v, pfx_bytes);
+        }
+        model.seq_len = pfx_len;
+        model.generated_tokens.clear();
+        gpu.flush();
+        log::info!("[asr-zw] prefix: {} tokens in GPU cache ({}ms)",
+            pfx_len, t0.elapsed().as_millis());
+    } else {
+        // First run: clear all, compute prefix, mark cached
+        for k in &model.state.k_cache {
+            gpu.clear_buffer(k);
+        }
+        for v in &model.state.v_cache {
+            gpu.clear_buffer(v);
+        }
+        gpu.flush();
+        for &tok in &prefix {
+            model.forward_argmax_simple(gpu, tok);
+        }
+        gpu.flush();
+        let pfx_toks: Vec<String> = model.generated_tokens.iter().map(|t| format!("{:x}", t)).collect();
+        log::info!("[asr-zw] prefix: {} tokens computed in {}ms pred=[{}]",
+            prefix.len(), t0.elapsed().as_millis(), pfx_toks.join(" "));
+        PREFIX_LEN.store(model.seq_len, std::sync::atomic::Ordering::Relaxed);
+        PREFIX_CACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Prefill: encoder output embeddings
+    let t1 = std::time::Instant::now();
+    for i in 0..enc_seq_len as usize {
+        let embed = &encoder_output[i * hidden..(i + 1) * hidden];
+        gpu.write_buffer(&model.state.hidden, 0, bytemuck::cast_slice(embed));
+        gpu.flush();
+        gpu.copy_buffer(&model.state.hidden, &model.state.residual, hidden as u64 * 4);
+        gpu.write_buffer(&model.state.seq_counter, 0, bytemuck::cast_slice(&[model.seq_len]));
+        model.forward_layers(gpu);
+        model.seq_len += 1;
+        let lb = gpu.read_buffer(&model.state.logits, model.config.vocab_size as u64 * 4);
+        let lb: &[f32] = bytemuck::cast_slice(&lb);
+        let (mi, _) = lb.iter().enumerate().fold((0, f32::NEG_INFINITY), |(bi,bv),(i,&v)| if v>bv {(i,v)} else {(bi,bv)});
+        model.generated_tokens.push(mi as u32);
+    }
+    log::info!("[asr-zw] encoder prefill: {} tokens in {}ms", enc_seq_len, t1.elapsed().as_millis());
+
+    // Prefill: suffix tokens
+    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
+    for &tok in &suffix[..suffix.len() - 1] {
+        model.forward_argmax_simple(gpu, tok);
+    }
+    // Last suffix token — log top logits for diagnostics
+    model.embedding(gpu, suffix[suffix.len() - 1]);
+    gpu.flush();
+    gpu.copy_buffer(&model.state.hidden, &model.state.residual,
+        model.config.hidden_size as u64 * 4);
+    gpu.write_buffer(&model.state.seq_counter, 0,
+        bytemuck::cast_slice(&[model.seq_len]));
+    model.forward_layers(gpu);
+    model.seq_len += 1;
+    let logits_bytes = gpu.read_buffer(&model.state.logits, model.config.vocab_size as u64 * 4);
+    let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+    // Find top 3 tokens
+    let mut top3: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    top3.truncate(3);
+    let first_decode_token = top3[0].0 as u32;
+    model.generated_tokens.push(first_decode_token);
+    let prefill_total_ms = t0.elapsed().as_millis();
+    let top3_str: Vec<String> = top3.iter().map(|(i, v)| format!("{:x}={:.2}", i, v)).collect();
+    log::info!("[asr-zw] first_decode: top3=[{}] seq_len={} ({}ms)",
+        top3_str.join(" "), model.seq_len, prefill_total_ms);
+
+    // Early exit if first token is EOS
+    if first_decode_token == TOKEN_ENDOFTEXT || first_decode_token == TOKEN_IM_END {
+        let top3_data: Vec<(u32, f32)> = top3.iter().map(|&(i, v)| (i as u32, v)).collect();
+        log::info!("[asr-zw] first token is EOS — no speech detected ({}ms)", prefill_total_ms);
+        return DecodeResult::NoSpeech { top3: top3_data, prefill_ms: prefill_total_ms };
+    }
+
+    // Autoregressive decode: zero-write loop
+    let t2 = std::time::Instant::now();
+    model.init_decode(gpu, first_decode_token, model.seq_len);
+
+    let eos_check_interval = 4u32; // Check EOS every 4 tokens for fast exit on short commands
+    let max_tokens = 448u32;
+    let mut n_generated = 0u32;
+
+    loop {
+        let batch = eos_check_interval.min(max_tokens - n_generated);
+        for _ in 0..batch {
+            model.forward_zero_write(gpu);
+            gpu.flush();
+        }
+        n_generated += batch;
+
+        gpu.flush();
+        let eos = {
+            let bytes = gpu.read_buffer(&model.state.eos_flag, 4);
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()) != 0
+        };
+        if eos || n_generated >= max_tokens { break; }
+    }
+
+    let decode_ms = t2.elapsed().as_millis();
+    let ring_tokens = model.read_generated_tokens(gpu);
+
+    // Build output: first_decode + ring tokens, truncated at EOS with suppression
+    const MIN_TOKENS_BEFORE_EOS: usize = 5;
+    let mut token_ids = Vec::with_capacity(ring_tokens.len() + 1);
+    if first_decode_token != TOKEN_ASR_TEXT {
+        token_ids.push(first_decode_token);
+    }
+    for (i, &t) in ring_tokens.iter().enumerate() {
+        let is_eos = t == TOKEN_ENDOFTEXT || t == TOKEN_IM_END;
+        if is_eos && i >= MIN_TOKENS_BEFORE_EOS { break; }
+        let is_special = t >= 151000 || t == TOKEN_ASR_TEXT;
+        if !is_eos && !is_special {
+            token_ids.push(t);
+        }
+    }
+
+    let total_ms = t0.elapsed().as_millis();
+    // Read logit values for each token
+    let logit_bytes = gpu.read_buffer(&model.state.logit_ring, ring_tokens.len() as u64 * 4);
+    let logit_vals: &[f32] = bytemuck::cast_slice(&logit_bytes);
+
+    // Log tokens with their logit values
+    let tok_logit_preview: String = ring_tokens.iter().zip(logit_vals.iter()).take(20)
+        .map(|(t, l)| format!("{:x}({:.1})", t, l)).collect::<Vec<_>>().join(" ");
+    let out_preview: String = token_ids.iter().take(20)
+        .map(|t| format!("{:x}", t)).collect::<Vec<_>>().join(" ");
+    log::info!("[asr-zw] {} tokens in {}ms (prefill: {}ms, decode: {}ms)",
+        token_ids.len(), total_ms, prefill_total_ms, decode_ms);
+    log::info!("[asr-zw] ring: [{}]", tok_logit_preview);
+    log::info!("[asr-zw] output: [{}]", out_preview);
+
+    let raw_ring: Vec<(u32, f32)> = ring_tokens.iter().zip(logit_vals.iter())
+        .map(|(&t, &l)| (t, l)).collect();
+    DecodeResult::Speech {
+        token_ids,
+        raw_ring,
+        first_token: (first_decode_token, top3[0].1),
+        prefill_ms: prefill_total_ms,
+        decode_ms,
+    }
 }
 
 mod shaders {

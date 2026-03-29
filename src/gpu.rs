@@ -63,13 +63,20 @@ impl GpuContext {
             limits.max_buffer_size / (1024 * 1024),
             limits.max_storage_buffer_binding_size / (1024 * 1024),
         );
-        // For LLM: ensure large enough for embedding tables (~1GB for 248K vocab).
-        // For ASR encoder: adapter defaults are sufficient (~128MB).
-        // Only request larger if the adapter already supports it.
+        #[cfg(feature = "simulate-imgtech")]
+        {
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size
+                .min(128 * 1024 * 1024);
+            // max_buffer_size must fit 8-bit embedding table (~311MB for 151936 vocab)
+            limits.max_buffer_size = limits.max_buffer_size.min(512 * 1024 * 1024);
+            log::warn!("[simulate-imgtech] clamped: max_storage_binding={}MB, max_buffer={}MB",
+                limits.max_storage_buffer_binding_size / (1024 * 1024),
+                limits.max_buffer_size / (1024 * 1024));
+        }
+        #[cfg(not(feature = "simulate-imgtech"))]
         if limits.max_storage_buffer_binding_size >= (1u32 << 30) as u32 {
             limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
         }
-        // Don't override max_storage_buffer_binding_size — use adapter's native limit.
 
         let (device, queue) = adapter
             .request_device(
@@ -322,6 +329,30 @@ impl GpuContext {
 
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.queue.write_buffer(buffer, offset, data);
+    }
+
+    /// Invalidate cached bind groups. Call when temporary buffers are dropped
+    /// and their addresses may be reused by the allocator.
+    pub fn invalidate_bind_groups(&mut self) {
+        self.bind_group_cache.clear();
+    }
+
+    /// Zero-fill a buffer using a command encoder clear.
+    pub fn clear_buffer(&mut self, buffer: &wgpu::Buffer) {
+        let enc = self.encoder.get_or_insert_with(||
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }));
+        enc.clear_buffer(buffer, 0, None);
+        self.pending_dispatches += 1;
+    }
+
+    /// Zero-fill a buffer from offset to end.
+    pub fn clear_buffer_range(&mut self, buffer: &wgpu::Buffer, offset: u64) {
+        let size = buffer.size();
+        if offset >= size { return; }
+        let enc = self.encoder.get_or_insert_with(||
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }));
+        enc.clear_buffer(buffer, offset, None);
+        self.pending_dispatches += 1;
     }
 }
 
