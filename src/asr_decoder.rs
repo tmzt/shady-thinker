@@ -14,6 +14,12 @@ const INT4_EMBEDDING_MLX_SRC: &str = include_str!("shaders/int4_embedding_mlx.wg
 
 /// Load an MLX quantized ASR decoder as AsrModel (4-bit or 8-bit).
 pub fn load_asr_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, AsrModel) {
+    let gpu = GpuContext::new();
+    load_asr_model_on_gpu(gpu, model_dir, max_seq_len)
+}
+
+/// Load decoder onto an existing GPU (shared with encoder in fused pipeline).
+pub fn load_asr_model_on_gpu(gpu: GpuContext, model_dir: &Path, max_seq_len: u32) -> (GpuContext, AsrModel) {
     log::info!("[asr-decoder] loading ASR model from {:?}", model_dir);
 
     let raw: serde_json::Value = serde_json::from_str(
@@ -41,8 +47,6 @@ pub fn load_asr_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, AsrMod
         config.num_hidden_layers, config.hidden_size,
         config.num_attention_heads, config.num_key_value_heads, config.vocab_size,
         bits, group_size);
-
-    let gpu = GpuContext::new();
     let (weights, raw_norms) = crate::weights::load_weights_mlx(&gpu, model_dir, &config, bits);
     let quant_config = QuantConfig { bits, group_size, quant_method: "mlx".to_string(), sym: false };
 
@@ -622,19 +626,18 @@ pub fn asr_decode_zero_write(
         };
     }
 
-    // Autoregressive decode: zero-write loop
+    // Autoregressive decode: zero-write loop with adaptive EOS batching
     let t2 = std::time::Instant::now();
     model.init_decode(gpu, first_decode_token, model.seq_len);
 
-    let eos_check_interval = 4u32; // Check EOS every 4 tokens for fast exit on short commands
     let max_tokens = 448u32;
     let mut n_generated = 0u32;
+    let mut batch_size = 4u32; // Start small for fast exit on short commands
 
     loop {
-        let batch = eos_check_interval.min(max_tokens - n_generated);
+        let batch = batch_size.min(max_tokens - n_generated);
         for _ in 0..batch {
             model.forward_zero_write(gpu);
-            gpu.flush();
         }
         n_generated += batch;
 
@@ -643,6 +646,8 @@ pub fn asr_decode_zero_write(
             let bytes = gpu.read_buffer(&model.state.eos_flag, 4);
             u32::from_le_bytes(bytes[..4].try_into().unwrap()) != 0
         };
+        if eos || n_generated >= max_tokens { break; }
+        batch_size = (batch_size * 2).min(64); // Double batch, cap at 64
         if eos || n_generated >= max_tokens { break; }
     }
 

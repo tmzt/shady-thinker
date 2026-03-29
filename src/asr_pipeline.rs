@@ -64,10 +64,7 @@ mod shaders {
 /// Owns all weights, state buffers, and pre-computed embeddings needed
 /// to go from raw mel spectrogram to decoded text in one `forward` call.
 pub struct AsrPipeline {
-    // ── Shared GPU ──
-    pub gpu: GpuContext,
-
-    // ── Encoder ──
+    // ── Encoder (owns the shared GpuContext via encoder.gpu) ──
     pub encoder: AsrEncoder,
 
     // ── Decoder ──
@@ -283,35 +280,23 @@ impl AsrPipeline {
         // once the batched shader .wgsl files are finalized. These will be
         // analogous to build_int8_gemm_batched() etc. from asr_model.rs but
         // with MAX_PREFILL baked in.
-        let s_gemm_q = format!("// TODO: batched INT8 GEMM Q: [{h}, {}] seq={MAX_PREFILL}", nh * hd);
-        let s_gemm_kv = format!("// TODO: batched INT8 GEMM KV: [{h}, {}] seq={MAX_PREFILL}", nkv * hd);
-        let s_gemm_o = format!("// TODO: batched INT8 GEMM O: [{}, {h}] seq={MAX_PREFILL}", nh * hd);
-        let s_gemm_gate = format!("// TODO: batched INT8 GEMM gate: [{h}, {inter}] seq={MAX_PREFILL}");
-        let s_gemm_up = format!("// TODO: batched INT8 GEMM up: [{h}, {inter}] seq={MAX_PREFILL}");
-        let s_gemm_down = format!("// TODO: batched INT8 GEMM down: [{inter}, {h}] seq={MAX_PREFILL}");
-        let s_batched_rmsnorm = format!(
-            "// TODO: batched RMSNorm h={h} eps={} seq={MAX_PREFILL}",
-            decoder_config.rms_norm_eps
+        let s_gemm_q = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_gemm_kv = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_gemm_o = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_gemm_gate = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_gemm_up = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_gemm_down = shaders::BATCHED_INT8_GEMM.to_string();
+        let s_batched_rmsnorm = shaders::BATCHED_RMSNORM.to_string();
+        let s_batched_add_rmsnorm = shaders::BATCHED_ADD_RMSNORM.to_string();
+        let s_batched_qknorm = shaders::BATCHED_QKNORM_ROPE.to_string();
+        let s_batched_causal_attn = shaders::BATCHED_CAUSAL_ATTN.to_string(
         );
-        let s_batched_add_rmsnorm = format!(
-            "// TODO: batched Add+RMSNorm h={h} eps={} seq={MAX_PREFILL}",
-            decoder_config.rms_norm_eps
-        );
-        let s_batched_qknorm = format!(
-            "// TODO: batched QKNorm+RoPE nh={nh} nkv={nkv} hd={hd} seq={MAX_PREFILL}"
-        );
-        let s_batched_causal_attn = format!(
-            "// TODO: batched causal attention nh={nh} nkv={nkv} hd={hd} seq={MAX_PREFILL}"
-        );
-        let s_batched_silu_mul = format!(
-            "// TODO: batched SiLU×mul inter={inter} seq={MAX_PREFILL}"
-        );
+        let s_batched_silu_mul = shaders::BATCHED_SILU_MUL.to_string();
 
         let load_ms = t0.elapsed().as_millis();
         log::info!("[asr-pipeline] loaded in {}ms (encoder + decoder + prefill bufs)", load_ms);
 
         Self {
-            gpu: GpuContext::new(), // Placeholder — see note below about split borrow
             encoder,
             decoder,
             decoder_config: decoder_config.clone(),
@@ -379,48 +364,73 @@ impl AsrPipeline {
         buf
     }
 
-    /// Fill pre-embedded token buffers using the decoder's GPU embedding shader.
-    /// Called once during load after the pipeline is fully constructed.
+    /// CPU-side dequant of prefix/suffix embeddings. One-time cost at load (~16 tokens).
     fn fill_prefix_suffix_embeds(&mut self) {
         let h = self.decoder_config.hidden_size as usize;
+        let gs = self.decoder_quant.group_size as usize;
+        let bits = self.decoder_quant.bits;
         let gpu = &mut self.encoder.gpu;
 
-        let prefix_tokens: Vec<u32> = PREFIX_HEAD
-            .iter()
-            .chain(PREFIX_TAIL.iter())
-            .copied()
-            .collect();
+        // Read quantized embedding table from GPU
+        let embed_buf = if !self.decoder.weights.embed_chunks.is_empty() {
+            &self.decoder.weights.embed_chunks[0]
+        } else {
+            &self.decoder.weights.embed_tokens
+        };
+        let sc_buf = self.decoder.weights.mlx_embed_scales.as_ref().unwrap();
+        let bi_buf = self.decoder.weights.mlx_embed_biases.as_ref().unwrap();
 
-        // Embed each prefix token and copy into the pre-allocated buffer
-        for (i, &tok) in prefix_tokens.iter().enumerate() {
-            self.decoder.embedding(gpu, tok);
-            gpu.flush();
-            let offset = (i * h) as u64 * 4;
-            gpu.copy_buffer_offset(
-                &self.decoder.state.hidden, 0,
-                &self.prefix_embed_buf, offset,
-                h as u64 * 4,
-            );
+        let vals_per_u32 = if bits == 8 { 4 } else { 8 };
+        let packed_cols = h / vals_per_u32;
+        let n_groups = h / gs;
+
+        // Read buffers to CPU for dequant
+        let vocab = self.decoder_config.vocab_size as usize;
+        let qw_bytes = gpu.read_buffer(embed_buf, (vocab * packed_cols) as u64 * 4);
+        let qw: &[u32] = bytemuck::cast_slice(&qw_bytes);
+        let sc_bytes = gpu.read_buffer(sc_buf, (vocab * n_groups) as u64 * 2);
+        let sc_u16: &[u16] = bytemuck::cast_slice(&sc_bytes);
+        let bi_bytes = gpu.read_buffer(bi_buf, (vocab * n_groups) as u64 * 2);
+        let bi_u16: &[u16] = bytemuck::cast_slice(&bi_bytes);
+
+        let dequant_row = |tok: u32| -> Vec<f32> {
+            let tok = tok as usize;
+            let mut row = vec![0.0f32; h];
+            let row_off = tok * packed_cols;
+            let sg_off = tok * n_groups;
+            for g in 0..n_groups {
+                let scale = f32::from_bits((sc_u16[sg_off + g] as u32) << 16);
+                let bias = f32::from_bits((bi_u16[sg_off + g] as u32) << 16);
+                for p in 0..(gs / vals_per_u32) {
+                    let packed = qw[row_off + g * (gs / vals_per_u32) + p];
+                    for b in 0..vals_per_u32 {
+                        let shift = if bits == 8 { b * 8 } else { b * 4 };
+                        let mask = if bits == 8 { 0xFF } else { 0xF };
+                        let val = ((packed >> shift) & mask) as f32;
+                        row[g * gs + p * vals_per_u32 + b] = val * scale + bias;
+                    }
+                }
+            }
+            row
+        };
+
+        // Dequant prefix tokens
+        let prefix_tokens: Vec<u32> = PREFIX_HEAD.iter().chain(PREFIX_TAIL.iter()).copied().collect();
+        let mut prefix_data: Vec<f32> = Vec::with_capacity(prefix_tokens.len() * h);
+        for &tok in &prefix_tokens {
+            prefix_data.extend_from_slice(&dequant_row(tok));
         }
+        gpu.write_buffer(&self.prefix_embed_buf, 0, bytemuck::cast_slice(&prefix_data));
 
-        // Embed each suffix token
-        for (i, &tok) in SUFFIX_TOKENS.iter().enumerate() {
-            self.decoder.embedding(gpu, tok);
-            gpu.flush();
-            let offset = (i * h) as u64 * 4;
-            gpu.copy_buffer_offset(
-                &self.decoder.state.hidden, 0,
-                &self.suffix_embed_buf, offset,
-                h as u64 * 4,
-            );
+        // Dequant suffix tokens
+        let mut suffix_data: Vec<f32> = Vec::with_capacity(SUFFIX_TOKENS.len() * h);
+        for &tok in SUFFIX_TOKENS {
+            suffix_data.extend_from_slice(&dequant_row(tok));
         }
+        gpu.write_buffer(&self.suffix_embed_buf, 0, bytemuck::cast_slice(&suffix_data));
 
-        gpu.flush();
-        log::info!(
-            "[asr-pipeline] pre-embedded {} prefix + {} suffix tokens on GPU",
-            prefix_tokens.len(),
-            SUFFIX_TOKENS.len()
-        );
+        log::info!("[asr-pipeline] pre-embedded {} prefix + {} suffix tokens (CPU dequant)",
+            prefix_tokens.len(), SUFFIX_TOKENS.len());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -714,6 +724,7 @@ impl AsrPipeline {
             gpu.flush();
             gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(&norm_p));
             if layer_idx == 0 {
+                eprintln!("[pf] dispatching pf_norm with 4 bindings");
                 gpu.dispatch("pf_norm", &self.s_batched_rmsnorm, &[
                     bind(0, &self.prefill_residual),
                     bind(1, &layer.input_layernorm),
@@ -722,13 +733,15 @@ impl AsrPipeline {
                 ], (actual_len, 1, 1));
             } else {
                 gpu.dispatch("pf_addnorm", &self.s_batched_add_rmsnorm, &[
-                    bind(0, &self.prefill_residual),
+                    bind(0, &self.prefill_residual),  // also written: residual += addend
                     bind(1, &self.prefill_mlp_out),
                     bind(2, &layer.input_layernorm),
                     bind(3, &self.prefill_normed),
                     bind(4, &self.prefill_params),
                 ], (actual_len, 1, 1));
             }
+            // Invalidate bind groups since buffers are reused across layers
+            gpu.invalidate_bind_groups();
 
             // 2. QKV projections
             if let Some(sa) = layer.self_attn() {

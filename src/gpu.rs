@@ -218,6 +218,10 @@ impl GpuContext {
         buffers: &[(u32, &wgpu::Buffer)],
         workgroups: (u32, u32, u32),
     ) {
+        if pipeline_name.starts_with("pf_") {
+            eprintln!("[gpu] dispatch {pipeline_name}: {} bindings, wg=({},{},{})",
+                buffers.len(), workgroups.0, workgroups.1, workgroups.2);
+        }
         self.ensure_pipeline(pipeline_name, shader_src);
 
         // Create bind group (can't borrow self mutably and immutably, so do it in steps)
