@@ -490,7 +490,7 @@ impl AsrPipeline {
         let load_ms = t0.elapsed().as_millis();
         log::info!("[asr-pipeline] loaded in {}ms (encoder + decoder + prefill bufs)", load_ms);
 
-        Self {
+        let mut pipeline = Self {
             encoder,
             decoder,
             decoder_config: decoder_config.clone(),
@@ -521,7 +521,9 @@ impl AsrPipeline {
             s_batched_causal_attn,
             s_batched_silu_mul,
             prefix_kv_cached: false,
-        }
+        };
+        pipeline.fill_prefix_suffix_embeds();
+        pipeline
     }
 
     /// Pre-embed a list of token IDs into a single GPU buffer [len, hidden] f32.
@@ -622,8 +624,10 @@ impl AsrPipeline {
         }
         gpu.write_buffer(&self.suffix_embed_buf, 0, bytemuck::cast_slice(&suffix_data));
 
-        log::info!("[asr-pipeline] pre-embedded {} prefix + {} suffix tokens (CPU dequant)",
-            prefix_tokens.len(), SUFFIX_TOKENS.len());
+        // Debug: log first few embedding values
+        let fp: Vec<String> = prefix_data.iter().take(4).map(|v| format!("{:.4}", v)).collect();
+        log::info!("[asr-pipeline] pre-embedded {} prefix + {} suffix tokens, embed[0..4]=[{}]",
+            prefix_tokens.len(), SUFFIX_TOKENS.len(), fp.join(" "));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -913,6 +917,17 @@ impl AsrPipeline {
                     bind(2, &layer.input_layernorm),
                     bind(3, &self.prefill_normed),
                 ], (actual_len, 1, 1));
+            }
+
+            // Debug: check norm output at layer 0
+            if layer_idx == 0 {
+                gpu.flush();
+                let norm_bytes = gpu.read_buffer(&self.prefill_normed, 16);
+                let norm_vals: &[f32] = bytemuck::cast_slice(&norm_bytes);
+                let res_bytes = gpu.read_buffer(&self.prefill_residual, 16);
+                let res_vals: &[f32] = bytemuck::cast_slice(&res_bytes);
+                log::info!("[pf-debug] layer 0: residual[0..4]={:?} normed[0..4]={:?}",
+                    &res_vals[..4], &norm_vals[..4]);
             }
 
             // 2. QKV projections (batched GEMM, dims const-specialized)
