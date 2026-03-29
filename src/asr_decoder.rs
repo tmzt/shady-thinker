@@ -594,7 +594,7 @@ pub fn asr_decode_zero_write(
         model.seq_len += 1;
         // No logit readback — only need KV cache filled
     }
-    // Last suffix token — log top logits for diagnostics
+    // Last suffix token — use GPU argmax (8 bytes readback instead of 607KB)
     model.embedding(gpu, suffix[suffix.len() - 1]);
     gpu.flush();
     gpu.copy_buffer(&model.state.hidden, &model.state.residual,
@@ -603,24 +603,23 @@ pub fn asr_decode_zero_write(
         bytemuck::cast_slice(&[model.seq_len]));
     model.forward_layers(gpu);
     model.seq_len += 1;
-    let logits_bytes = gpu.read_buffer(&model.state.logits, model.config.vocab_size as u64 * 4);
-    let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
-    // Find top 3 tokens
-    let mut top3: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    top3.truncate(3);
-    let first_decode_token = top3[0].0 as u32;
+    // Read argmax result (8 bytes: {idx: u32, val: f32})
+    gpu.flush();
+    let ar_bytes = gpu.read_buffer(&model.state.argmax_result, 8);
+    let first_decode_token = u32::from_le_bytes(ar_bytes[0..4].try_into().unwrap());
+    let first_logit = f32::from_le_bytes(ar_bytes[4..8].try_into().unwrap());
     model.generated_tokens.push(first_decode_token);
     let prefill_total_ms = t0.elapsed().as_millis();
-    let top3_str: Vec<String> = top3.iter().map(|(i, v)| format!("{:x}={:.2}", i, v)).collect();
-    log::info!("[asr-zw] first_decode: top3=[{}] seq_len={} ({}ms)",
-        top3_str.join(" "), model.seq_len, prefill_total_ms);
+    log::info!("[asr-zw] first_decode: {:x}({:.1}) seq_len={} ({}ms)",
+        first_decode_token, first_logit, model.seq_len, prefill_total_ms);
 
     // Early exit if first token is EOS
     if first_decode_token == TOKEN_ENDOFTEXT || first_decode_token == TOKEN_IM_END {
-        let top3_data: Vec<(u32, f32)> = top3.iter().map(|&(i, v)| (i as u32, v)).collect();
         log::info!("[asr-zw] first token is EOS — no speech detected ({}ms)", prefill_total_ms);
-        return DecodeResult::NoSpeech { top3: top3_data, prefill_ms: prefill_total_ms };
+        return DecodeResult::NoSpeech {
+            top3: vec![(first_decode_token, first_logit)],
+            prefill_ms: prefill_total_ms,
+        };
     }
 
     // Autoregressive decode: zero-write loop
@@ -685,7 +684,7 @@ pub fn asr_decode_zero_write(
     DecodeResult::Speech {
         token_ids,
         raw_ring,
-        first_token: (first_decode_token, top3[0].1),
+        first_token: (first_decode_token, first_logit),
         prefill_ms: prefill_total_ms,
         decode_ms,
     }
