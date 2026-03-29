@@ -577,17 +577,22 @@ pub fn asr_decode_zero_write(
         gpu.write_buffer(&model.state.seq_counter, 0, bytemuck::cast_slice(&[model.seq_len]));
         model.forward_layers(gpu);
         model.seq_len += 1;
-        let lb = gpu.read_buffer(&model.state.logits, model.config.vocab_size as u64 * 4);
-        let lb: &[f32] = bytemuck::cast_slice(&lb);
-        let (mi, _) = lb.iter().enumerate().fold((0, f32::NEG_INFINITY), |(bi,bv),(i,&v)| if v>bv {(i,v)} else {(bi,bv)});
-        model.generated_tokens.push(mi as u32);
+        // No logit readback — only need KV cache filled
     }
     log::info!("[asr-zw] encoder prefill: {} tokens in {}ms", enc_seq_len, t1.elapsed().as_millis());
 
-    // Prefill: suffix tokens
+    // Prefill: suffix tokens (no logit readback except last)
     let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
     for &tok in &suffix[..suffix.len() - 1] {
-        model.forward_argmax_simple(gpu, tok);
+        model.embedding(gpu, tok);
+        gpu.flush();
+        gpu.copy_buffer(&model.state.hidden, &model.state.residual,
+            model.config.hidden_size as u64 * 4);
+        gpu.write_buffer(&model.state.seq_counter, 0,
+            bytemuck::cast_slice(&[model.seq_len]));
+        model.forward_layers(gpu);
+        model.seq_len += 1;
+        // No logit readback — only need KV cache filled
     }
     // Last suffix token — log top logits for diagnostics
     model.embedding(gpu, suffix[suffix.len() - 1]);
