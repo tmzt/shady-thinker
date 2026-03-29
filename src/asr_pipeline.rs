@@ -46,15 +46,213 @@ const PREFIX_LEN: u32 = (PREFIX_HEAD.len() + PREFIX_TAIL.len()) as u32; // 9
 /// Number of fixed suffix tokens.
 const SUFFIX_LEN: u32 = SUFFIX_TOKENS.len() as u32; // 7
 
-// ── Batched prefill shader sources ──────────────────────────────────────
+// ── Const-specialized batched prefill shader builders ──────────────────
+// Model dimensions baked as `const` (one-time at load). Only `seq_len` is
+// runtime — read from a storage buffer (same as seq_counter pattern).
+// Bindings: all storage (no uniform), same as single-token path.
 
-mod shaders {
-    pub const BATCHED_INT8_GEMM: &str = include_str!("shaders/batched_int8_gemm.wgsl");
-    pub const BATCHED_RMSNORM: &str = include_str!("shaders/batched_rmsnorm.wgsl");
-    pub const BATCHED_ADD_RMSNORM: &str = include_str!("shaders/batched_add_rmsnorm.wgsl");
-    pub const BATCHED_QKNORM_ROPE: &str = include_str!("shaders/batched_qknorm_rope.wgsl");
-    pub const BATCHED_CAUSAL_ATTN: &str = include_str!("shaders/causal_attention_prefill.wgsl");
-    pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul_elementwise.wgsl");
+/// Batched INT8 GEMM: input[seq_len, IN_DIM] × qweight[OUT_DIM, IN_DIM/4] → output[seq_len, OUT_DIM]
+/// Dispatch: (OUT_DIM/32, seq_len, 1)
+fn build_batched_int8_gemm(in_dim: u32, out_dim: u32, gs: u32) -> String {
+    format!("\
+const OUT_DIM: u32 = {out_dim}u;
+const IN_DIM: u32 = {in_dim}u;
+const PACKED_COLS: u32 = {pc}u;
+const N_GROUPS: u32 = {ng}u;
+const PACKED_PER_GROUP: u32 = {ppg}u;
+const GROUP_SIZE: u32 = {gs}u;
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> qweight: array<u32>;
+@group(0) @binding(2) var<storage, read> scales: array<u32>;
+@group(0) @binding(3) var<storage, read> biases: array<u32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<storage, read> seq_counter: array<u32>;
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let col = wg_id.x * 32u + lid.x;
+    let row = wg_id.y;
+    let seq_len = seq_counter[0];
+    if (col >= OUT_DIM || row >= seq_len) {{ return; }}
+    let w_row_off = col * PACKED_COLS;
+    let sg_row_off = col * N_GROUPS;
+    let in_base = row * IN_DIM;
+    var sum: f32 = 0.0;
+    for (var g: u32 = 0u; g < N_GROUPS; g++) {{
+        let sb_idx = sg_row_off + g;
+        let scale = bitcast<f32>(((scales[sb_idx / 2u] >> ((sb_idx & 1u) * 16u)) & 0xFFFFu) << 16u);
+        let bias = bitcast<f32>(((biases[sb_idx / 2u] >> ((sb_idx & 1u) * 16u)) & 0xFFFFu) << 16u);
+        let group_start = g * PACKED_PER_GROUP;
+        let input_base = in_base + g * GROUP_SIZE;
+        for (var p: u32 = 0u; p < PACKED_PER_GROUP; p++) {{
+            let packed = qweight[w_row_off + group_start + p];
+            let ib = input_base + p * 4u;
+            sum += (f32((packed) & 0xFFu) * scale + bias) * input[ib];
+            sum += (f32((packed >> 8u) & 0xFFu) * scale + bias) * input[ib + 1u];
+            sum += (f32((packed >> 16u) & 0xFFu) * scale + bias) * input[ib + 2u];
+            sum += (f32((packed >> 24u) & 0xFFu) * scale + bias) * input[ib + 3u];
+        }}
+    }}
+    output[row * OUT_DIM + col] = sum;
+}}", out_dim=out_dim, in_dim=in_dim, gs=gs, pc=in_dim/4, ng=in_dim/gs, ppg=gs/4)
+}
+
+/// Batched RMSNorm: input[seq_len, N] → output[seq_len, N]
+/// Weight is bf16 packed. Dispatch: (seq_len, 1, 1)
+fn build_batched_rmsnorm(hidden: u32, eps: f32) -> String {
+    format!("\
+const N: u32 = {n}u;
+const EPS: f32 = {eps};
+const HALF_N: u32 = {hn}u;
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+var<workgroup> wg_scratch: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let row = wg_id.x;
+    let tid = lid.x;
+    let base = row * N;
+    var sum_sq: f32 = 0.0;
+    var i = tid;
+    while (i < N) {{ let v = input[base + i]; sum_sq += v * v; i += 256u; }}
+    wg_scratch[tid] = sum_sq;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {{ if (tid < stride) {{ wg_scratch[tid] += wg_scratch[tid + stride]; }} workgroupBarrier(); stride >>= 1u; }}
+    let rms = 1.0 / sqrt(wg_scratch[0] / f32(N) + EPS);
+    i = tid;
+    while (i < N) {{
+        let w_packed = weight[i / 2u];
+        let w = bitcast<f32>(((w_packed >> ((i & 1u) * 16u)) & 0xFFFFu) << 16u);
+        output[base + i] = input[base + i] * rms * w;
+        i += 256u;
+    }}
+}}", n=hidden, eps=eps, hn=hidden/2)
+}
+
+/// Batched Add+RMSNorm: residual[seq_len, N] += addend; output = rmsnorm(residual)
+/// Dispatch: (seq_len, 1, 1)
+fn build_batched_add_rmsnorm(hidden: u32, eps: f32) -> String {
+    format!("\
+const N: u32 = {n}u;
+const EPS: f32 = {eps};
+@group(0) @binding(0) var<storage, read_write> residual: array<f32>;
+@group(0) @binding(1) var<storage, read> addend: array<f32>;
+@group(0) @binding(2) var<storage, read> weight: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> wg_scratch: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let row = wg_id.x;
+    let tid = lid.x;
+    let base = row * N;
+    // Add residual
+    var i = tid;
+    while (i < N) {{ residual[base + i] += addend[base + i]; i += 256u; }}
+    workgroupBarrier();
+    // RMSNorm
+    var sum_sq: f32 = 0.0;
+    i = tid;
+    while (i < N) {{ let v = residual[base + i]; sum_sq += v * v; i += 256u; }}
+    wg_scratch[tid] = sum_sq;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {{ if (tid < stride) {{ wg_scratch[tid] += wg_scratch[tid + stride]; }} workgroupBarrier(); stride >>= 1u; }}
+    let rms = 1.0 / sqrt(wg_scratch[0] / f32(N) + EPS);
+    i = tid;
+    while (i < N) {{
+        let w_packed = weight[i / 2u];
+        let w = bitcast<f32>(((w_packed >> ((i & 1u) * 16u)) & 0xFFFFu) << 16u);
+        output[base + i] = residual[base + i] * rms * w;
+        i += 256u;
+    }}
+}}", n=hidden, eps=eps)
+}
+
+/// Batched SiLU(gate) × up: gate[seq_len, INTER] = SiLU(gate) * up
+/// Dispatch: (ceil(INTER/256), seq_len, 1)
+fn build_batched_silu_mul(inter: u32) -> String {
+    format!("\
+const INTER: u32 = {inter}u;
+@group(0) @binding(0) var<storage, read_write> gate: array<f32>;
+@group(0) @binding(1) var<storage, read> up: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let col = wg_id.x * 256u + lid.x;
+    let row = wg_id.y;
+    if (col >= INTER) {{ return; }}
+    let idx = row * INTER + col;
+    let x = gate[idx];
+    gate[idx] = (x / (1.0 + exp(-x))) * up[idx];
+}}", inter=inter)
+}
+
+/// Batched causal GQA attention for prefill.
+/// Q from dense prefill_q, K/V from KV cache (written by qknorm shader).
+/// Dispatch: (num_q_heads, seq_len, 1)
+fn build_batched_causal_attn(nh: u32, nkv: u32, hd: u32) -> String {
+    format!("\
+const HEAD_DIM: u32 = {hd}u;
+const NUM_Q_HEADS: u32 = {nh}u;
+const NUM_KV_HEADS: u32 = {nkv}u;
+const HEADS_PER_KV: u32 = {hpk}u;
+@group(0) @binding(0) var<storage, read> q_proj: array<f32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(2) var<storage, read> v_cache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> wg_score: array<f32, 256>;
+var<workgroup> wg_reduce: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let tid = lid.x;
+    let q_head = wg_id.x;
+    let q_pos = wg_id.y;
+    let kv_head = q_head / HEADS_PER_KV;
+    if (q_head >= NUM_Q_HEADS) {{ return; }}
+    let q_base = q_pos * NUM_Q_HEADS * HEAD_DIM + q_head * HEAD_DIM;
+    let scale = 1.0 / sqrt(f32(HEAD_DIM));
+    let causal_len = q_pos + 1u;
+    // Phase 1: scores + max
+    var local_max: f32 = -1e30;
+    var j = tid;
+    while (j < causal_len) {{
+        let k_base = j * NUM_KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM;
+        var dot: f32 = 0.0;
+        for (var d = 0u; d < HEAD_DIM; d++) {{ dot += q_proj[q_base + d] * k_cache[k_base + d]; }}
+        let s = dot * scale;
+        wg_score[j] = s;
+        local_max = max(local_max, s);
+        j += 256u;
+    }}
+    wg_reduce[tid] = local_max;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {{ if (tid < stride) {{ wg_reduce[tid] = max(wg_reduce[tid], wg_reduce[tid + stride]); }} workgroupBarrier(); stride >>= 1u; }}
+    let max_score = wg_reduce[0];
+    workgroupBarrier();
+    // Phase 2: exp + sum
+    var local_sum: f32 = 0.0;
+    j = tid;
+    while (j < causal_len) {{ let e = exp(wg_score[j] - max_score); wg_score[j] = e; local_sum += e; j += 256u; }}
+    wg_reduce[tid] = local_sum;
+    workgroupBarrier();
+    stride = 128u;
+    while (stride > 0u) {{ if (tid < stride) {{ wg_reduce[tid] += wg_reduce[tid + stride]; }} workgroupBarrier(); stride >>= 1u; }}
+    let sum_exp = wg_reduce[0];
+    workgroupBarrier();
+    // Phase 3: weighted V
+    let out_base = q_pos * NUM_Q_HEADS * HEAD_DIM + q_head * HEAD_DIM;
+    var d = tid;
+    while (d < HEAD_DIM) {{
+        var wsum: f32 = 0.0;
+        for (var jj = 0u; jj < causal_len; jj++) {{
+            let v_base = jj * NUM_KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM;
+            wsum += (wg_score[jj] / sum_exp) * v_cache[v_base + d];
+        }}
+        output[out_base + d] = wsum;
+        d += 256u;
+    }}
+}}", hd=hd, nh=nh, nkv=nkv, hpk=nh/nkv)
 }
 
 // ── Pipeline struct ─────────────────────────────────────────────────────
@@ -79,8 +277,6 @@ pub struct AsrPipeline {
     suffix_embed_buf: wgpu::Buffer,
 
     // ── Prefill buffers (allocated at MAX_PREFILL × hidden) ──
-    /// Uniform params buffer for batched shader dispatches (overwritten per dispatch)
-    prefill_params: wgpu::Buffer,
     /// Assembled input embeddings for batched prefill: [MAX_PREFILL, hidden] f32
     prefill_input: wgpu::Buffer,
     /// Residual stream for prefill: [MAX_PREFILL, hidden] f32
@@ -265,8 +461,6 @@ impl AsrPipeline {
         let prefill_logits = encoder
             .gpu
             .create_storage_buffer("pf_logits", decoder_config.vocab_size as u64 * f);
-        let prefill_params = encoder.gpu.create_buffer("pf_params", 32,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
         // ── 6. Build const-specialized batched shader sources ──
         // These mirror the per-token shaders in AsrModel but operate on [seq_len, dim]
@@ -280,18 +474,18 @@ impl AsrPipeline {
         // once the batched shader .wgsl files are finalized. These will be
         // analogous to build_int8_gemm_batched() etc. from asr_model.rs but
         // with MAX_PREFILL baked in.
-        let s_gemm_q = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_gemm_kv = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_gemm_o = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_gemm_gate = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_gemm_up = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_gemm_down = shaders::BATCHED_INT8_GEMM.to_string();
-        let s_batched_rmsnorm = shaders::BATCHED_RMSNORM.to_string();
-        let s_batched_add_rmsnorm = shaders::BATCHED_ADD_RMSNORM.to_string();
-        let s_batched_qknorm = shaders::BATCHED_QKNORM_ROPE.to_string();
-        let s_batched_causal_attn = shaders::BATCHED_CAUSAL_ATTN.to_string(
-        );
-        let s_batched_silu_mul = shaders::BATCHED_SILU_MUL.to_string();
+        let s_gemm_q = build_batched_int8_gemm(h, nh * hd, gs);
+        let s_gemm_kv = build_batched_int8_gemm(h, nkv * hd, gs);
+        let s_gemm_o = build_batched_int8_gemm(nh * hd, h, gs);
+        let s_gemm_gate = build_batched_int8_gemm(h, inter as u32, gs);
+        let s_gemm_up = build_batched_int8_gemm(h, inter as u32, gs);
+        let s_gemm_down = build_batched_int8_gemm(inter as u32, h, gs);
+        let s_batched_rmsnorm = build_batched_rmsnorm(h, decoder_config.rms_norm_eps);
+        let s_batched_add_rmsnorm = build_batched_add_rmsnorm(h, decoder_config.rms_norm_eps);
+        // QKNorm+RoPE uses existing static shader (handles variable seq via dispatch dims)
+        let s_batched_qknorm = include_str!("shaders/batched_qknorm_rope.wgsl").to_string();
+        let s_batched_causal_attn = build_batched_causal_attn(nh, nkv, hd);
+        let s_batched_silu_mul = build_batched_silu_mul(inter as u32);
 
         let load_ms = t0.elapsed().as_millis();
         log::info!("[asr-pipeline] loaded in {}ms (encoder + decoder + prefill bufs)", load_ms);
@@ -303,7 +497,6 @@ impl AsrPipeline {
             decoder_quant,
             prefix_embed_buf,
             suffix_embed_buf,
-            prefill_params,
             prefill_input,
             prefill_residual,
             prefill_normed,
@@ -684,34 +877,20 @@ impl AsrPipeline {
         let hd = self.decoder_config.head_dim;
         let inter = self.decoder_config.intermediate_size;
         let nl = self.decoder_config.num_hidden_layers as usize;
-        let gs = self.decoder_quant.group_size;
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
-        let eps = self.decoder_config.rms_norm_eps;
         let gpu = &mut self.encoder.gpu;
 
-        // Params structs (written to uniform buffer before each dispatch type)
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct GemmParams { in_dim: u32, out_dim: u32, seq_len: u32, group_size: u32 }
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct NormParams { n: u32, eps_bits: u32, seq_len: u32, _pad: u32 }
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct AttnParams { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct SiluParams { inter_dim: u32, seq_len: u32 }
+        // Write seq_len to seq_counter — batched GEMM shaders read it
+        gpu.write_buffer(&self.decoder.state.seq_counter, 0,
+            bytemuck::cast_slice(&[actual_len]));
 
-        let norm_p = NormParams { n: h, eps_bits: eps.to_bits(), seq_len: actual_len, _pad: 0 };
-        let attn_p = AttnParams { seq_len: actual_len, head_dim: hd, num_kv_heads: nkv, num_q_heads: nh, heads_per_kv: nh / nkv };
-
-        // Helper: write GEMM params and dispatch
+        // Helper: dispatch batched GEMM (dims baked as const, seq_len from seq_counter)
         macro_rules! gemm {
-            ($name:expr, $shader:expr, $input:expr, $qw:expr, $sc:expr, $bi:expr, $output:expr, $in_d:expr, $out_d:expr) => {{
-                gpu.flush();
-                gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(
-                    &GemmParams { in_dim: $in_d, out_dim: $out_d, seq_len: actual_len, group_size: gs }));
+            ($name:expr, $shader:expr, $input:expr, $qw:expr, $sc:expr, $bi:expr, $output:expr, $out_d:expr) => {{
                 gpu.dispatch($name, $shader, &[
                     bind(0, $input), bind(1, $qw), bind(2, $sc), bind(3, $bi),
-                    bind(4, $output), bind(5, &self.prefill_params),
+                    bind(4, $output), bind(5, &self.decoder.state.seq_counter),
                 ], ($out_d.div_ceil(32), actual_len, 1));
             }};
         }
@@ -720,40 +899,33 @@ impl AsrPipeline {
             let layer = &self.decoder.weights.layers[layer_idx];
             let biases = &self.decoder.weights.mlx_biases[layer_idx];
 
-            // 1. Norm
-            gpu.flush();
-            gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(&norm_p));
+            // 1. Norm (dims baked as const, no params needed)
             if layer_idx == 0 {
-                eprintln!("[pf] dispatching pf_norm with 4 bindings");
                 gpu.dispatch("pf_norm", &self.s_batched_rmsnorm, &[
                     bind(0, &self.prefill_residual),
                     bind(1, &layer.input_layernorm),
                     bind(2, &self.prefill_normed),
-                    bind(3, &self.prefill_params),
                 ], (actual_len, 1, 1));
             } else {
                 gpu.dispatch("pf_addnorm", &self.s_batched_add_rmsnorm, &[
-                    bind(0, &self.prefill_residual),  // also written: residual += addend
+                    bind(0, &self.prefill_residual),
                     bind(1, &self.prefill_mlp_out),
                     bind(2, &layer.input_layernorm),
                     bind(3, &self.prefill_normed),
-                    bind(4, &self.prefill_params),
                 ], (actual_len, 1, 1));
             }
-            // Invalidate bind groups since buffers are reused across layers
-            gpu.invalidate_bind_groups();
 
-            // 2. QKV projections
+            // 2. QKV projections (batched GEMM, dims const-specialized)
             if let Some(sa) = layer.self_attn() {
                 gemm!("pf_q", &self.s_gemm_q, &self.prefill_normed,
                     &sa.q_proj_qweight, &sa.q_proj_scales, &biases[0],
-                    &self.prefill_q, h, q_dim);
+                    &self.prefill_q, q_dim);
                 gemm!("pf_k", &self.s_gemm_kv, &self.prefill_normed,
                     &sa.k_proj_qweight, &sa.k_proj_scales, &biases[1],
-                    &self.prefill_k, h, kv_dim);
+                    &self.prefill_k, kv_dim);
                 gemm!("pf_v", &self.s_gemm_kv, &self.prefill_normed,
                     &sa.v_proj_qweight, &sa.v_proj_scales, &biases[2],
-                    &self.prefill_v, h, kv_dim);
+                    &self.prefill_v, kv_dim);
 
                 // 3. QKNorm + RoPE + KV cache write
                 gpu.dispatch("pf_qknorm", &self.s_batched_qknorm, &[
@@ -765,67 +937,54 @@ impl AsrPipeline {
                     bind(5, &self.decoder.state.qknorm_params[layer_idx]),
                 ], ((nh + nkv), actual_len, 1));
 
-                // 4. Causal attention
-                gpu.flush();
-                gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(&attn_p));
+                // 4. Causal attention (dims const-specialized)
                 gpu.dispatch("pf_attn", &self.s_batched_causal_attn, &[
                     bind(0, &self.prefill_q),
                     bind(1, &self.decoder.state.k_cache[layer_idx]),
                     bind(2, &self.decoder.state.v_cache[layer_idx]),
                     bind(3, &self.prefill_attn_out),
-                    bind(4, &self.prefill_params),
                 ], (nh, actual_len, 1));
 
                 // 5. O projection
                 gemm!("pf_o", &self.s_gemm_o, &self.prefill_attn_out,
                     &sa.o_proj_qweight, &sa.o_proj_scales, &biases[3],
-                    &self.prefill_o_out, q_dim, h);
+                    &self.prefill_o_out, h);
             }
 
             // 6. Post-attention add+norm
-            gpu.flush();
-            gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(&norm_p));
             gpu.dispatch("pf_postnorm", &self.s_batched_add_rmsnorm, &[
                 bind(0, &self.prefill_residual),
                 bind(1, &self.prefill_o_out),
                 bind(2, &layer.post_attn_layernorm),
                 bind(3, &self.prefill_normed),
-                bind(4, &self.prefill_params),
             ], (actual_len, 1, 1));
 
             // 7. MLP
             gemm!("pf_gate", &self.s_gemm_gate, &self.prefill_normed,
                 &layer.gate_proj_qweight, &layer.gate_proj_scales, &biases[4],
-                &self.prefill_gate, h, inter);
+                &self.prefill_gate, inter);
             gemm!("pf_up", &self.s_gemm_up, &self.prefill_normed,
                 &layer.up_proj_qweight, &layer.up_proj_scales, &biases[5],
-                &self.prefill_up, h, inter);
+                &self.prefill_up, inter);
 
-            // SiLU(gate) × up
-            gpu.flush();
-            gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(
-                &SiluParams { inter_dim: inter, seq_len: actual_len }));
+            // SiLU(gate) × up (dims const-specialized)
             gpu.dispatch("pf_silu", &self.s_batched_silu_mul, &[
                 bind(0, &self.prefill_gate),
                 bind(1, &self.prefill_up),
-                bind(2, &self.prefill_params),
             ], (inter.div_ceil(256), actual_len, 1));
 
             // Down projection
             gemm!("pf_down", &self.s_gemm_down, &self.prefill_gate,
                 &layer.down_proj_qweight, &layer.down_proj_scales, &biases[6],
-                &self.prefill_mlp_out, inter, h);
+                &self.prefill_mlp_out, h);
         }
 
         // 8. Final add+norm
-        gpu.flush();
-        gpu.write_buffer(&self.prefill_params, 0, bytemuck::bytes_of(&norm_p));
         gpu.dispatch("pf_final_norm", &self.s_batched_add_rmsnorm, &[
             bind(0, &self.prefill_residual),
             bind(1, &self.prefill_mlp_out),
             bind(2, &self.decoder.weights.final_norm),
             bind(3, &self.prefill_normed),
-            bind(4, &self.prefill_params),
         ], (actual_len, 1, 1));
 
         // 9. LM head on last token
