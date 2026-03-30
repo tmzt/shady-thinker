@@ -71,7 +71,7 @@ pub struct AsrModel {
     s_qknorm: String,
     s_gqa: String,
     pub s_lm_head: Vec<String>,  // one per embed chunk
-    s_argmax: String,
+    pub s_argmax: String,
     s_embed_from_argmax: String,
     s_fused_gate_up_silu: Option<String>, // 8-bit fused gate+up+SiLU (None for 4-bit)
     s_embedding: String, // int4 or int8 embedding shader

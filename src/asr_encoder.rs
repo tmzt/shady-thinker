@@ -544,7 +544,7 @@ fn dispatch_bidir_attn(
 /// Conv2D + GELU shader. c_in and c_out are baked as constants.
 /// Spatial dims (h_in, w_in, h_out, w_out) come from uniform params.
 /// Kernel: 3×3, stride=2, padding=1.
-fn build_conv2d_gelu_shader(c_in: u32, c_out: u32) -> String {
+pub fn build_conv2d_gelu_shader(c_in: u32, c_out: u32) -> String {
     format!("\
 const C_IN: u32 = {c_in}u;
 const C_OUT: u32 = {c_out}u;
@@ -594,7 +594,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 /// Reads conv3 output [480, h3, w3], reshapes to [w3, 480*h3],
 /// multiplies by proj_w [d_model, 480*h3], adds sinusoidal PE.
 /// Dispatch: (w3, ceil(d_model/32), 1) — one thread per (token, d_model_chunk).
-fn build_reshape_proj_pe_shader() -> String {
+pub fn build_reshape_proj_pe_shader() -> String {
     format!("\
 const CONV_H: u32 = {ch}u;
 

@@ -333,7 +333,7 @@ impl AsrPipeline {
         let gpu = GpuContext::new();
 
         // ── 2. Load encoder weights (reuses AsrEncoder::load with shared GPU) ──
-        let encoder = AsrEncoder::load(gpu, model_dir);
+        let mut encoder = AsrEncoder::load(gpu, model_dir);
         // Take the gpu back out — AsrEncoder::load consumed it, but we need to
         // pass it around. The encoder stores it as `self.gpu`.
         // NOTE: We split-borrow through the pipeline struct instead.
@@ -487,8 +487,45 @@ impl AsrPipeline {
         let s_batched_causal_attn = build_batched_causal_attn(nh, nkv, hd);
         let s_batched_silu_mul = build_batched_silu_mul(inter as u32);
 
+        // ── Compile all batched prefill shaders now (deterministic, no lazy compilation) ──
+        let t_shaders = std::time::Instant::now();
+        encoder.gpu.ensure_pipeline("pf_q", &s_gemm_q);
+        encoder.gpu.ensure_pipeline("pf_k", &s_gemm_kv);
+        encoder.gpu.ensure_pipeline("pf_v", &s_gemm_kv); // same source as K
+        encoder.gpu.ensure_pipeline("pf_o", &s_gemm_o);
+        encoder.gpu.ensure_pipeline("pf_gate", &s_gemm_gate);
+        encoder.gpu.ensure_pipeline("pf_up", &s_gemm_up); // same source as gate
+        encoder.gpu.ensure_pipeline("pf_down", &s_gemm_down);
+        encoder.gpu.ensure_pipeline("pf_norm", &s_batched_rmsnorm);
+        encoder.gpu.ensure_pipeline("pf_addnorm", &s_batched_add_rmsnorm);
+        encoder.gpu.ensure_pipeline("pf_postnorm", &s_batched_add_rmsnorm); // same source
+        encoder.gpu.ensure_pipeline("pf_final_norm", &s_batched_add_rmsnorm); // same source
+        encoder.gpu.ensure_pipeline("pf_qknorm", &s_batched_qknorm);
+        encoder.gpu.ensure_pipeline("pf_attn", &s_batched_causal_attn);
+        encoder.gpu.ensure_pipeline("pf_silu", &s_batched_silu_mul);
+        // Also compile the decoder's LM head shaders used after prefill
+        for (ci, shader) in decoder.s_lm_head.iter().enumerate() {
+            encoder.gpu.ensure_pipeline(&format!("pf_lmh_{ci}"), shader);
+        }
+        encoder.gpu.ensure_pipeline("asr_argmax_const", &decoder.s_argmax);
+        // Also pre-compile encoder shaders (names must match dispatch calls in asr_encoder.rs)
+        encoder.gpu.ensure_pipeline("bf16_gemm", include_str!("shaders/bf16_gemm.wgsl"));
+        encoder.gpu.ensure_pipeline("layernorm", include_str!("shaders/layernorm.wgsl"));
+        encoder.gpu.ensure_pipeline("gelu_mul", include_str!("shaders/gelu_mul.wgsl"));
+        encoder.gpu.ensure_pipeline("qwen_asr_bidir_attn", include_str!("shaders/qwen_asr_bidir_attn.wgsl"));
+        encoder.gpu.ensure_pipeline("add", include_str!("shaders/add.wgsl"));
+        // Conv stem shaders (runtime-generated, need model dims)
+        let conv1_shader = crate::asr_encoder::build_conv2d_gelu_shader(1, 480);
+        let conv23_shader = crate::asr_encoder::build_conv2d_gelu_shader(480, 480);
+        let proj_shader = crate::asr_encoder::build_reshape_proj_pe_shader();
+        encoder.gpu.ensure_pipeline("conv_stem_1", &conv1_shader);
+        encoder.gpu.ensure_pipeline("conv_stem_2", &conv23_shader);
+        encoder.gpu.ensure_pipeline("conv_stem_3", &conv23_shader);
+        encoder.gpu.ensure_pipeline("conv_proj_pe", &proj_shader);
+        log::info!("[asr-pipeline] shaders compiled in {}ms", t_shaders.elapsed().as_millis());
+
         let load_ms = t0.elapsed().as_millis();
-        log::info!("[asr-pipeline] loaded in {}ms (encoder + decoder + prefill bufs)", load_ms);
+        log::info!("[asr-pipeline] loaded in {}ms (weights + shaders + embeds)", load_ms);
 
         let mut pipeline = Self {
             encoder,

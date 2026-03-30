@@ -150,7 +150,8 @@ impl GpuContext {
         )
     }
 
-    fn ensure_pipeline(&mut self, name: &str, shader_src: &str) {
+    /// Pre-compile a shader pipeline. Call during load to avoid first-dispatch stalls.
+    pub fn ensure_pipeline(&mut self, name: &str, shader_src: &str) {
         if !self.pipelines.contains_key(name) {
             let module = self
                 .device
