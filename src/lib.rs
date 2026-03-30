@@ -1,7 +1,5 @@
 pub mod asr_decoder;
 pub mod asr_encoder;
-pub mod asr_model;
-pub mod asr_pipeline;
 pub mod gpu;
 pub mod inference;
 #[cfg(feature = "jit-lora")]
