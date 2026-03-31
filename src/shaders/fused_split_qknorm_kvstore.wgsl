@@ -3,6 +3,8 @@ const MROPE_S1_LIMIT: u32 = 11u;
 const MROPE_S2_LIMIT: u32 = 22u;
 const PARTIAL_DIM: u32 = 64u;
 const MROPE_INTERLEAVED: bool = true;
+const Q_GATED: bool = true;
+const NORM_OFFSET: f32 = 1.0;
 
 // Fused Q/gate split, Q/K RMSNorm, mRoPE positional encoding, and KV cache write.
 // Dispatch: (num_heads + num_kv_heads, 1, 1)
@@ -119,17 +121,22 @@ fn main(
     if (is_q_head) {
         // ===================== Q HEAD PROCESSING =====================
         let h = wg_id.x;
-        let src_off = h * head_dim * 2u;
+        var src_off: u32;
+        if (Q_GATED) {
+            src_off = h * head_dim * 2u;
+        } else {
+            src_off = h * head_dim;
+        }
 
-        // Step 1: Split Q+gate (contiguous blocks: Q[0..hd], gate[hd..2*hd])
-        // and accumulate sum of squares for Q norm
+        // Step 1: Load Q (and gate if gated), accumulate sum of squares for Q norm
         var sum_sq: f32 = 0.0;
         var d = tid;
         while (d < head_dim) {
             let q_val = q_proj_full[src_off + d];
-            let gate_val = q_proj_full[src_off + head_dim + d];
             wg_vals[d] = q_val;
-            wg_gate[d] = gate_val;
+            if (Q_GATED) {
+                wg_gate[d] = q_proj_full[src_off + head_dim + d];
+            }
             sum_sq += q_val * q_val;
             d += 256u;
         }
@@ -155,7 +162,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * (NORM_OFFSET + w);
             d += 256u;
         }
         workgroupBarrier();
@@ -168,7 +175,9 @@ fn main(
         d = tid;
         while (d < head_dim) {
             q_proj[h * head_dim + d] = wg_vals[d];
-            q_gate[h * head_dim + d] = wg_gate[d];
+            if (Q_GATED) {
+                q_gate[h * head_dim + d] = wg_gate[d];
+            }
             d += 256u;
         }
 
@@ -207,7 +216,7 @@ fn main(
         d = tid;
         while (d < head_dim) {
             let w = get_norm_weight(head_dim + d);
-            wg_vals[d] = wg_vals[d] * rms * (1.0 + w);
+            wg_vals[d] = wg_vals[d] * rms * (NORM_OFFSET + w);
             d += 256u;
         }
         workgroupBarrier();

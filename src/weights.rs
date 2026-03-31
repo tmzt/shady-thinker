@@ -5,6 +5,93 @@ use safetensors::SafeTensors;
 
 use crate::gpu::GpuContext;
 
+/// Convert a bf16 weight matrix [rows, cols] to GPTQ INT4 format.
+/// Returns (qweight_buffer, scales_buffer) ready for GPU upload.
+/// Symmetric quantization: val ≈ (nibble - 8) * scale.
+/// Column-major qweight layout matches gptq_matvec.wgsl.
+fn quantize_bf16_to_int4(
+    gpu: &GpuContext,
+    label: &str,
+    bf16_data: &[u8],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> (wgpu::Buffer, wgpu::Buffer) {
+    assert_eq!(bf16_data.len(), rows * cols * 2, "{label}: bf16 size mismatch");
+    assert!(rows % 8 == 0, "{label}: rows must be multiple of 8");
+
+    let packed_rows = rows / 8;
+    let n_groups = (rows + group_size - 1) / group_size;
+
+    // Step 1: bf16 → f32 batch conversion (row-major → column-major transpose)
+    // Process one column at a time to be cache-friendly for the output
+    let mut qweight = vec![0u32; packed_rows * cols];
+    let mut scales_f16 = vec![0u16; n_groups * cols];
+
+    for c in 0..cols {
+        // Extract column c from row-major bf16 data, convert to f32
+        // Stride: every `cols` elements, offset by c
+        let mut col_f32 = vec![0.0f32; rows];
+        for r in 0..rows {
+            let idx = (r * cols + c) * 2;
+            let bits = (bf16_data[idx] as u32) | ((bf16_data[idx + 1] as u32) << 8);
+            col_f32[r] = f32::from_bits(bits << 16);
+        }
+
+        // Step 2: Per-group quantization for this column
+        for g in 0..n_groups {
+            let start = g * group_size;
+            let end = (start + group_size).min(rows);
+
+            // Find max absolute value in group (vectorizable)
+            let mut max_abs: f32 = 0.0;
+            for r in start..end {
+                let a = col_f32[r].abs();
+                if a > max_abs { max_abs = a; }
+            }
+
+            let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+            let inv_scale = 1.0 / scale;
+            scales_f16[g * cols + c] = half::f16::from_f32(scale).to_bits();
+
+            // Quantize and pack 8 values per u32
+            let group_pr_start = start / 8;
+            let group_pr_end = (end + 7) / 8;
+            for pr in group_pr_start..group_pr_end.min(packed_rows) {
+                let mut packed: u32 = 0;
+                for nibble in 0..8u32 {
+                    let r = pr * 8 + nibble as usize;
+                    if r < end && r >= start {
+                        let q = ((col_f32[r] * inv_scale).round() as i32 + 8).clamp(0, 15) as u32;
+                        packed |= q << (nibble * 4);
+                    } else if r < rows {
+                        // Row belongs to adjacent group — already handled or will be
+                        // Read existing packed value and preserve this nibble
+                        let existing = qweight[pr * cols + c];
+                        packed |= existing & (0xF << (nibble * 4));
+                    }
+                }
+                qweight[pr * cols + c] = packed;
+            }
+        }
+    }
+
+    // Step 3: Upload to GPU
+    let qw_buf = gpu.upload_buffer(&format!("{label}.qw"), bytemuck::cast_slice(&qweight));
+
+    // Pack scales: two f16 per u32
+    let scales_u32_len = (n_groups * cols + 1) / 2;
+    let mut scales_packed = vec![0u32; scales_u32_len];
+    for i in (0..n_groups * cols).step_by(2) {
+        let lo = scales_f16[i] as u32;
+        let hi = if i + 1 < n_groups * cols { scales_f16[i + 1] as u32 } else { 0 };
+        scales_packed[i / 2] = lo | (hi << 16);
+    }
+    let sc_buf = gpu.upload_buffer(&format!("{label}.sc"), bytemuck::cast_slice(&scales_packed));
+
+    (qw_buf, sc_buf)
+}
+
 /// Standard self-attention layer weights
 pub struct SelfAttnWeights {
     pub q_proj_qweight: wgpu::Buffer,
@@ -87,6 +174,15 @@ pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
     /// Which layers are self-attention (vs DeltaNet)
     pub self_attn_layers: Vec<usize>,
+    /// Chunked embedding table for 128MB binding limit.
+    pub embed_chunks: Vec<wgpu::Buffer>,
+    /// Tokens per chunk (0 if not chunked)
+    pub embed_chunk_size: u32,
+    /// MLX INT4 biases per layer: [q, k, v, o, gate, up, down]
+    /// Empty for GPTQ/bf16 modes.
+    pub mlx_biases: Vec<[wgpu::Buffer; 7]>,
+    pub mlx_embed_scales: Option<wgpu::Buffer>,
+    pub mlx_embed_biases: Option<wgpu::Buffer>,
 }
 
 /// Model configuration parsed from config.json
@@ -539,9 +635,366 @@ pub fn load_weights(
             lm_head_is_bf16: lm_head_is_unquantized,
             self_attn_layers: self_attn_indices,
             layers,
+            embed_chunks: Vec::new(),
+            embed_chunk_size: 0,
+            mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
         },
         RawNormWeights {
             layers: norm_weights,
         },
     )
+}
+
+/// Load bf16 (unquantized) weights for the ASR decoder.
+/// Creates ModelWeights with bf16 data in qweight fields, dummy scales.
+/// The model.rs forward uses bf16_matvec when bf16_mode=true.
+pub fn load_weights_bf16(
+    gpu: &GpuContext,
+    model_dir: &Path,
+    config: &ModelConfig,
+) -> (ModelWeights, RawNormWeights) {
+    let mut shard_files: Vec<_> = std::fs::read_dir(model_dir)
+        .expect("read model dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
+        .map(|e| e.path())
+        .collect();
+    shard_files.sort();
+
+    log::info!("[bf16] loading {} shard(s) from {:?}", shard_files.len(), model_dir);
+
+    // Memory-map shards to avoid loading entire files into RAM.
+    // On Android this reduces peak RSS from ~6.9GB to ~2GB.
+    let shard_mmaps: Vec<memmap2::Mmap> = shard_files.iter()
+        .map(|p| {
+            let file = std::fs::File::open(p).expect("open shard");
+            unsafe { memmap2::Mmap::map(&file).expect("mmap shard") }
+        })
+        .collect();
+    let shards: Vec<SafeTensors> = shard_mmaps.iter()
+        .map(|m| SafeTensors::deserialize(m).expect("parse"))
+        .collect();
+
+    let get = |name: &str| -> &[u8] {
+        for st in &shards {
+            if let Ok(t) = st.tensor(name) { return t.data(); }
+        }
+        panic!("[bf16] tensor not found: {name}");
+    };
+
+    let upload = |label: &str, name: &str| -> wgpu::Buffer {
+        gpu.upload_buffer(label, get(name))
+    };
+
+    // Dummy 4-byte buffer for scales (unused in bf16 mode)
+    let dummy = gpu.create_storage_buffer("dummy", 4);
+
+    // Embedding — chunk if needed for binding limit
+    let embed_raw = get("thinker.model.embed_tokens.weight");
+    let binding_limit = gpu.max_storage_binding_size() as usize;
+    let embed_total_bytes = embed_raw.len();
+    let bytes_per_token = config.hidden_size as usize * 2; // bf16
+    let needs_chunking = embed_total_bytes > binding_limit;
+
+    let (embed, embed_chunks, embed_chunk_size) = if needs_chunking {
+        let max_chunk_bytes = (binding_limit - 1024) & !3; // stay under limit, aligned
+        let tokens_per_chunk = max_chunk_bytes / bytes_per_token;
+        let n_chunks = (config.vocab_size as usize + tokens_per_chunk - 1) / tokens_per_chunk;
+        log::info!("[bf16] embedding {}MB > {}MB binding — splitting into {} chunks of {} tokens",
+            embed_total_bytes / (1024*1024), binding_limit / (1024*1024), n_chunks, tokens_per_chunk);
+
+        let mut chunks = Vec::new();
+        for c in 0..n_chunks {
+            let start = c * tokens_per_chunk * bytes_per_token;
+            let end = ((c + 1) * tokens_per_chunk * bytes_per_token).min(embed_raw.len());
+            chunks.push(gpu.upload_buffer(&format!("embed_chunk_{c}"), &embed_raw[start..end]));
+        }
+        // First chunk doubles as embed_tokens for compatibility
+        let dummy_embed = gpu.create_storage_buffer("embed_dummy", 4);
+        (dummy_embed, chunks, tokens_per_chunk as u32)
+    } else {
+        let embed_bytes = embed_raw.to_vec();
+        let embed = gpu.upload_buffer("embed", &embed_bytes);
+        (embed, Vec::new(), 0u32)
+    };
+    let final_norm = upload("final_norm", "thinker.model.norm.weight");
+
+    // lm_head
+    let lm_head_exists = shards.iter().any(|st| st.tensor("thinker.lm_head.weight").is_ok());
+    let lm_head = if lm_head_exists {
+        upload("lm_head", "thinker.lm_head.weight")
+    } else {
+        log::info!("[bf16] no lm_head — assuming tied embeddings");
+        gpu.create_storage_buffer("lm_head_dummy", 4)
+    };
+
+    let mut layers = Vec::new();
+    let mut norm_weights = Vec::new();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p = format!("thinker.model.layers.{i}");
+
+        // Q/K norm raw bytes for qknorm_params
+        let q_norm_bytes = get(&format!("{p}.self_attn.q_norm.weight")).to_vec();
+        let k_norm_bytes = get(&format!("{p}.self_attn.k_norm.weight")).to_vec();
+        norm_weights.push(Some((q_norm_bytes, k_norm_bytes)));
+
+        let sa = SelfAttnWeights {
+            q_proj_qweight: upload(&format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
+            q_proj_scales: dummy.clone(),
+            k_proj_qweight: upload(&format!("{p}.k"), &format!("{p}.self_attn.k_proj.weight")),
+            k_proj_scales: dummy.clone(),
+            v_proj_qweight: upload(&format!("{p}.v"), &format!("{p}.self_attn.v_proj.weight")),
+            v_proj_scales: dummy.clone(),
+            o_proj_qweight: upload(&format!("{p}.o"), &format!("{p}.self_attn.o_proj.weight")),
+            o_proj_scales: dummy.clone(),
+            q_norm: upload(&format!("{p}.qn"), &format!("{p}.self_attn.q_norm.weight")),
+            k_norm: upload(&format!("{p}.kn"), &format!("{p}.self_attn.k_norm.weight")),
+        };
+
+        let layer = LayerWeights {
+            attn: AttnWeights::SelfAttn(sa),
+            gate_proj_qweight: upload(&format!("{p}.gate"), &format!("{p}.mlp.gate_proj.weight")),
+            gate_proj_scales: dummy.clone(),
+            up_proj_qweight: upload(&format!("{p}.up"), &format!("{p}.mlp.up_proj.weight")),
+            up_proj_scales: dummy.clone(),
+            down_proj_qweight: upload(&format!("{p}.down"), &format!("{p}.mlp.down_proj.weight")),
+            down_proj_scales: dummy.clone(),
+            input_layernorm: upload(&format!("{p}.in"), &format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm: upload(&format!("{p}.pa"), &format!("{p}.post_attention_layernorm.weight")),
+        };
+        layers.push(layer);
+
+        if (i + 1) % 7 == 0 {
+            log::info!("[bf16] loaded layer {}/{}", i + 1, config.num_hidden_layers);
+        }
+    }
+
+    let self_attn_indices: Vec<usize> = (0..config.num_hidden_layers as usize).collect();
+
+    log::info!("[bf16] loaded {} layers", layers.len());
+
+    (
+        ModelWeights {
+            embed_tokens: embed,
+            final_norm,
+            lm_head_qweight: lm_head,
+            lm_head_scales: dummy,
+            lm_head_is_bf16: true,
+            self_attn_layers: self_attn_indices,
+            layers,
+            embed_chunks,
+            embed_chunk_size,
+            mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
+        },
+        RawNormWeights {
+            layers: norm_weights,
+        },
+    )
+}
+
+/// Load weights with runtime bf16→INT4 quantization.
+/// Linear layers → GPTQ INT4 (symmetric, group_size). Norms/embeddings → bf16.
+/// ~4x less GPU memory + bandwidth, uses standard gptq_matvec shader (no bf16_mode).
+pub fn load_weights_int4(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, group_size: u32,
+) -> (ModelWeights, RawNormWeights) {
+    let mut sf: Vec<_> = std::fs::read_dir(model_dir).expect("read dir")
+        .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
+        .map(|e| e.path()).collect();
+    sf.sort();
+    log::info!("[int4] {} shard(s), group_size={}", sf.len(), group_size);
+    let mm: Vec<memmap2::Mmap> = sf.iter()
+        .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
+    let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
+
+    let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let shp = |n: &str| -> Vec<usize> { for s in &st { if let Ok(t)=s.tensor(n) { return t.shape().to_vec(); } } panic!("{n}"); };
+    let bf = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
+    let q4 = |l:&str,n:&str| -> (wgpu::Buffer,wgpu::Buffer) {
+        let s=shp(n); quantize_bf16_to_int4(gpu,l,get(n),s[0],s[1],group_size as usize)
+    };
+
+    let er = get("thinker.model.embed_tokens.weight");
+    let bl = gpu.max_storage_binding_size() as usize;
+    let bt = config.hidden_size as usize * 2;
+    let (emb,ech,ecs) = if er.len()>bl {
+        let mc=(bl-1024)&!3; let tp=mc/bt; let nc=(config.vocab_size as usize+tp-1)/tp;
+        log::info!("[int4] embed: {} bf16 chunks", nc);
+        let mut c=Vec::new();
+        for i in 0..nc { let s=i*tp*bt; let e=((i+1)*tp*bt).min(er.len()); c.push(gpu.upload_buffer(&format!("ec{i}"),&er[s..e])); }
+        (gpu.create_storage_buffer("ed",4),c,tp as u32)
+    } else { (gpu.upload_buffer("e",er),Vec::new(),0u32) };
+
+    let fnrm = bf("fn","thinker.model.norm.weight");
+    let lmh = if st.iter().any(|s| s.tensor("thinker.lm_head.weight").is_ok()) { bf("lh","thinker.lm_head.weight") }
+              else { gpu.create_storage_buffer("ld",4) };
+    let ds = gpu.create_storage_buffer("ds",4);
+    let mut ly=Vec::new(); let mut nw=Vec::new(); let t0=std::time::Instant::now();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p=format!("thinker.model.layers.{i}");
+        nw.push(Some((get(&format!("{p}.self_attn.q_norm.weight")).to_vec(),
+                       get(&format!("{p}.self_attn.k_norm.weight")).to_vec())));
+        let (qq,qs)=q4("q",&format!("{p}.self_attn.q_proj.weight"));
+        let (kq,ks)=q4("k",&format!("{p}.self_attn.k_proj.weight"));
+        let (vq,vs)=q4("v",&format!("{p}.self_attn.v_proj.weight"));
+        let (oq,os)=q4("o",&format!("{p}.self_attn.o_proj.weight"));
+        let (gq,gs)=q4("g",&format!("{p}.mlp.gate_proj.weight"));
+        let (uq,us)=q4("u",&format!("{p}.mlp.up_proj.weight"));
+        let (dq,dss)=q4("d",&format!("{p}.mlp.down_proj.weight"));
+        ly.push(LayerWeights {
+            attn: AttnWeights::SelfAttn(SelfAttnWeights {
+                q_proj_qweight:qq,q_proj_scales:qs, k_proj_qweight:kq,k_proj_scales:ks,
+                v_proj_qweight:vq,v_proj_scales:vs, o_proj_qweight:oq,o_proj_scales:os,
+                q_norm:bf("qn",&format!("{p}.self_attn.q_norm.weight")),
+                k_norm:bf("kn",&format!("{p}.self_attn.k_norm.weight")),
+            }),
+            gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
+            down_proj_qweight:dq,down_proj_scales:dss,
+            input_layernorm:bf("il",&format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm:bf("pl",&format!("{p}.post_attention_layernorm.weight")),
+        });
+        if (i+1)%7==0 { log::info!("[int4] layer {}/{} ({}ms)", i+1, config.num_hidden_layers, t0.elapsed().as_millis()); }
+    }
+    log::info!("[int4] done: {} layers in {}ms", ly.len(), t0.elapsed().as_millis());
+
+    (ModelWeights {
+        embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
+        lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
+        layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
+        mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
+    }, RawNormWeights { layers: nw })
+}
+
+/// Load pre-quantized MLX INT4 weights (minmax, group_size=64).
+/// Tensor names: model.layers.N.* (MLX convention, no "thinker." prefix).
+/// Returns weights ready for int4_matvec_mlx shader.
+pub fn load_weights_mlx(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, bits: u32,
+) -> (ModelWeights, RawNormWeights) {
+    load_weights_mlx_inner(gpu, model_dir, config, bits)
+}
+
+pub fn load_weights_mlx_int4(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig,
+) -> (ModelWeights, RawNormWeights) {
+    load_weights_mlx_inner(gpu, model_dir, config, 4)
+}
+
+fn load_weights_mlx_inner(
+    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, bits: u32,
+) -> (ModelWeights, RawNormWeights) {
+    let mut sf: Vec<_> = std::fs::read_dir(model_dir).expect("read dir")
+        .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
+        .map(|e| e.path()).collect();
+    sf.sort();
+    log::info!("[mlx-int4] {} shard(s)", sf.len());
+    let mm: Vec<memmap2::Mmap> = sf.iter()
+        .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
+    let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
+
+    let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let up = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
+
+    // Embedding — quantized, may need chunking for 128MB binding limit.
+    let vals_per_u32 = 32 / bits;
+    let embed_data = get("model.embed_tokens.weight");
+    let embed_sc_data = get("model.embed_tokens.scales");
+    let embed_bi_data = get("model.embed_tokens.biases");
+    let max_binding = gpu.max_storage_binding_size() as usize;
+    let bytes_per_token = (config.hidden_size / vals_per_u32 * 4) as usize;
+    let tokens_per_chunk = max_binding / bytes_per_token;
+
+    let mut embed_chunks: Vec<wgpu::Buffer> = Vec::new();
+    let embed_chunk_size: u32;
+    let embed_qw;
+    if embed_data.len() > max_binding {
+        embed_chunk_size = tokens_per_chunk as u32;
+        let mut offset = 0usize;
+        let mut ci = 0u32;
+        while offset < embed_data.len() {
+            let end = (offset + tokens_per_chunk * bytes_per_token).min(embed_data.len());
+            embed_chunks.push(gpu.upload_buffer(&format!("emb_c{ci}"), &embed_data[offset..end]));
+            offset = end;
+            ci += 1;
+        }
+        log::info!("[mlx-{}bit] embed chunked: {} chunks of {} tokens", bits, embed_chunks.len(), tokens_per_chunk);
+        embed_qw = gpu.create_storage_buffer("emb_dummy", 4);
+    } else {
+        embed_chunk_size = 0;
+        embed_qw = gpu.upload_buffer("emb_qw", embed_data);
+    };
+    let embed_sc = gpu.upload_buffer("emb_sc", embed_sc_data);
+    let embed_bi = gpu.upload_buffer("emb_bi", embed_bi_data);
+
+    let fnorm = up("fn", "model.norm.weight");
+    let has_lm_head = st.iter().any(|s| s.tensor("lm_head.weight").is_ok());
+    let lmh = if has_lm_head { up("lmh", "lm_head.weight") } else { gpu.create_storage_buffer("lmh_dummy", 4) };
+    let dsc = gpu.create_storage_buffer("ds", 4);
+
+    let mut layers = Vec::new();
+    let mut nw = Vec::new();
+    let mut biases = Vec::new();
+    let t0 = std::time::Instant::now();
+
+    for i in 0..config.num_hidden_layers as usize {
+        let p = format!("model.layers.{i}");
+        nw.push(Some((
+            get(&format!("{p}.self_attn.q_norm.weight")).to_vec(),
+            get(&format!("{p}.self_attn.k_norm.weight")).to_vec(),
+        )));
+
+        let qq=up("qw",&format!("{p}.self_attn.q_proj.weight"));
+        let qs=up("qs",&format!("{p}.self_attn.q_proj.scales"));
+        let qb=up("qb",&format!("{p}.self_attn.q_proj.biases"));
+        let kq=up("kw",&format!("{p}.self_attn.k_proj.weight"));
+        let ks=up("ks",&format!("{p}.self_attn.k_proj.scales"));
+        let kb=up("kb",&format!("{p}.self_attn.k_proj.biases"));
+        let vq=up("vw",&format!("{p}.self_attn.v_proj.weight"));
+        let vs=up("vs",&format!("{p}.self_attn.v_proj.scales"));
+        let vb=up("vb",&format!("{p}.self_attn.v_proj.biases"));
+        let oq=up("ow",&format!("{p}.self_attn.o_proj.weight"));
+        let os=up("os",&format!("{p}.self_attn.o_proj.scales"));
+        let ob=up("ob",&format!("{p}.self_attn.o_proj.biases"));
+        let gq=up("gw",&format!("{p}.mlp.gate_proj.weight"));
+        let gs=up("gs",&format!("{p}.mlp.gate_proj.scales"));
+        let gb=up("gb",&format!("{p}.mlp.gate_proj.biases"));
+        let uq=up("uw",&format!("{p}.mlp.up_proj.weight"));
+        let us=up("us",&format!("{p}.mlp.up_proj.scales"));
+        let ub=up("ub",&format!("{p}.mlp.up_proj.biases"));
+        let dq=up("dw",&format!("{p}.mlp.down_proj.weight"));
+        let dss=up("dss",&format!("{p}.mlp.down_proj.scales"));
+        let db=up("db",&format!("{p}.mlp.down_proj.biases"));
+
+        layers.push(LayerWeights {
+            attn: AttnWeights::SelfAttn(SelfAttnWeights {
+                q_proj_qweight:qq, q_proj_scales:qs,
+                k_proj_qweight:kq, k_proj_scales:ks,
+                v_proj_qweight:vq, v_proj_scales:vs,
+                o_proj_qweight:oq, o_proj_scales:os,
+                q_norm:up("qn",&format!("{p}.self_attn.q_norm.weight")),
+                k_norm:up("kn",&format!("{p}.self_attn.k_norm.weight")),
+            }),
+            gate_proj_qweight:gq, gate_proj_scales:gs,
+            up_proj_qweight:uq, up_proj_scales:us,
+            down_proj_qweight:dq, down_proj_scales:dss,
+            input_layernorm:up("il",&format!("{p}.input_layernorm.weight")),
+            post_attn_layernorm:up("pl",&format!("{p}.post_attention_layernorm.weight")),
+        });
+        biases.push([qb, kb, vb, ob, gb, ub, db]);
+
+        if (i+1)%7==0 { log::info!("[mlx-int4] layer {}/{} ({}ms)", i+1, config.num_hidden_layers, t0.elapsed().as_millis()); }
+    }
+    log::info!("[mlx-int4] done: {} layers in {}ms", layers.len(), t0.elapsed().as_millis());
+
+    (ModelWeights {
+        embed_tokens: embed_qw, final_norm: fnorm,
+        lm_head_qweight: lmh, lm_head_scales: dsc, lm_head_is_bf16: true,
+        self_attn_layers: (0..config.num_hidden_layers as usize).collect(),
+        layers, embed_chunks, embed_chunk_size,
+        mlx_biases: biases,
+        mlx_embed_scales: Some(embed_sc),
+        mlx_embed_biases: Some(embed_bi),
+    }, RawNormWeights { layers: nw })
 }

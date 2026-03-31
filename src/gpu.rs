@@ -11,6 +11,7 @@ pub struct GpuContext {
     bind_group_cache: HashMap<BindGroupKey, wgpu::BindGroup>,
     encoder: Option<wgpu::CommandEncoder>,
     pending_dispatches: u32,
+    max_storage_binding: u32,
 }
 
 impl GpuContext {
@@ -22,6 +23,7 @@ impl GpuContext {
     /// This allows the caller to create a surface-compatible device and
     /// share it with both the UI renderer and the compute pipeline.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let limit = device.limits().max_storage_buffer_binding_size;
         Self {
             device,
             queue,
@@ -29,7 +31,12 @@ impl GpuContext {
             bind_group_cache: HashMap::new(),
             encoder: None,
             pending_dispatches: 0,
+            max_storage_binding: limit,
         }
+    }
+
+    pub fn max_storage_binding_size(&self) -> u32 {
+        self.max_storage_binding
     }
 
     async fn init() -> Self {
@@ -56,9 +63,20 @@ impl GpuContext {
             limits.max_buffer_size / (1024 * 1024),
             limits.max_storage_buffer_binding_size / (1024 * 1024),
         );
-        // Ensure large enough for embedding tables (~1GB for 248K vocab)
-        limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
-        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.max(1u32 << 30);
+        #[cfg(feature = "simulate-imgtech")]
+        {
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size
+                .min(128 * 1024 * 1024);
+            // max_buffer_size must fit 8-bit embedding table (~311MB for 151936 vocab)
+            limits.max_buffer_size = limits.max_buffer_size.min(512 * 1024 * 1024);
+            log::warn!("[simulate-imgtech] clamped: max_storage_binding={}MB, max_buffer={}MB",
+                limits.max_storage_buffer_binding_size / (1024 * 1024),
+                limits.max_buffer_size / (1024 * 1024));
+        }
+        #[cfg(not(feature = "simulate-imgtech"))]
+        if limits.max_storage_buffer_binding_size >= (1u32 << 30) as u32 {
+            limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
+        }
 
         let (device, queue) = adapter
             .request_device(
@@ -73,6 +91,7 @@ impl GpuContext {
             .await
             .expect("failed to create device");
 
+        let max_storage_binding = device.limits().max_storage_buffer_binding_size;
         Self {
             device,
             queue,
@@ -80,6 +99,7 @@ impl GpuContext {
             bind_group_cache: HashMap::new(),
             encoder: None,
             pending_dispatches: 0,
+            max_storage_binding,
         }
     }
 
@@ -130,7 +150,8 @@ impl GpuContext {
         )
     }
 
-    fn ensure_pipeline(&mut self, name: &str, shader_src: &str) {
+    /// Pre-compile a shader pipeline. Call during load to avoid first-dispatch stalls.
+    pub fn ensure_pipeline(&mut self, name: &str, shader_src: &str) {
         if !self.pipelines.contains_key(name) {
             let module = self
                 .device
@@ -198,6 +219,10 @@ impl GpuContext {
         buffers: &[(u32, &wgpu::Buffer)],
         workgroups: (u32, u32, u32),
     ) {
+        if pipeline_name.starts_with("pf_") {
+            eprintln!("[gpu] dispatch {pipeline_name}: {} bindings, wg=({},{},{})",
+                buffers.len(), workgroups.0, workgroups.1, workgroups.2);
+        }
         self.ensure_pipeline(pipeline_name, shader_src);
 
         // Create bind group (can't borrow self mutably and immutably, so do it in steps)
@@ -254,6 +279,13 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(src, 0, dst, 0, size);
     }
 
+    pub fn copy_buffer_offset(&mut self, src: &wgpu::Buffer, src_off: u64,
+                               dst: &wgpu::Buffer, dst_off: u64, size: u64) {
+        self.ensure_encoder();
+        let encoder = self.encoder.as_mut().unwrap();
+        encoder.copy_buffer_to_buffer(src, src_off, dst, dst_off, size);
+    }
+
     /// Read back a buffer to CPU. Flushes pending work first.
     pub fn read_buffer(&mut self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
         // Flush any pending dispatches
@@ -281,8 +313,51 @@ impl GpuContext {
         data
     }
 
+    /// Read a sub-range of a buffer to CPU.
+    pub fn read_buffer_offset(&mut self, buffer: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
+        self.flush();
+        let staging = self.create_readback_buffer("readback_off", size);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback_off"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        data
+    }
+
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.queue.write_buffer(buffer, offset, data);
+    }
+
+    /// Invalidate cached bind groups. Call when temporary buffers are dropped
+    /// and their addresses may be reused by the allocator.
+    pub fn invalidate_bind_groups(&mut self) {
+        self.bind_group_cache.clear();
+    }
+
+    /// Zero-fill a buffer using a command encoder clear.
+    pub fn clear_buffer(&mut self, buffer: &wgpu::Buffer) {
+        let enc = self.encoder.get_or_insert_with(||
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }));
+        enc.clear_buffer(buffer, 0, None);
+        self.pending_dispatches += 1;
+    }
+
+    /// Zero-fill a buffer from offset to end.
+    pub fn clear_buffer_range(&mut self, buffer: &wgpu::Buffer, offset: u64) {
+        let size = buffer.size();
+        if offset >= size { return; }
+        let enc = self.encoder.get_or_insert_with(||
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }));
+        enc.clear_buffer(buffer, offset, None);
+        self.pending_dispatches += 1;
     }
 }
 

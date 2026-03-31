@@ -11,6 +11,7 @@ name = "shady_thinker"
 default = []
 chat = ["dep:tokenizers"]
 jit-lora = ["chat"]
+simulate-imgtech = []
 
 [[example]]
 name = "chat"
@@ -33,3 +34,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
 libc = "0.2"
+memmap2 = "0.9"

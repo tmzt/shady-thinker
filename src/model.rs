@@ -17,7 +17,21 @@ mod shaders {
     pub const GPTQ_MATVEC: &str = include_str!("shaders/gptq_matvec.wgsl");
     pub const FUSED_SILU_GPTQ: &str = include_str!("shaders/fused_silu_gptq.wgsl");
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
+    pub const BF16_MATVEC_TILED: &str = include_str!("shaders/bf16_matvec_tiled.wgsl");
+    pub const SILU_MUL: &str = include_str!("shaders/silu_mul.wgsl");
     pub const FUSED_CONV_DELTANET_NORM: &str = include_str!("shaders/fused_conv_deltanet_norm.wgsl");
+
+    // Batched prefill shaders
+    pub const BF16_GEMM: &str = include_str!("shaders/bf16_gemm.wgsl");
+    pub const RMSNORM_DIRECT: &str = include_str!("shaders/rmsnorm_direct.wgsl");
+    pub const ADD_RMSNORM_DIRECT: &str = include_str!("shaders/add_rmsnorm_direct.wgsl");
+    pub const BATCHED_RMSNORM: &str = include_str!("shaders/batched_rmsnorm.wgsl");
+    pub const BATCHED_ADD_RMSNORM: &str = include_str!("shaders/batched_add_rmsnorm.wgsl");
+    pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
+    pub const CAUSAL_ATTENTION_PREFILL: &str = include_str!("shaders/causal_attention_prefill.wgsl");
+    pub const INT4_MATVEC_MLX: &str = include_str!("shaders/int4_matvec_mlx.wgsl");
+    pub const FUSED_SILU_INT4_MLX: &str = include_str!("shaders/fused_silu_int4_mlx.wgsl");
+    pub const INT4_EMBEDDING_MLX: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
 
     // LoRA shaders
     #[cfg(feature = "jit-lora")]
@@ -30,24 +44,35 @@ mod shaders {
 
 /// Build the fused_split_qknorm_kvstore shader source with model-specific constants.
 fn build_qknorm_shader(config: &ModelConfig) -> String {
+    build_qknorm_shader_gated(config, true)
+}
+
+fn build_qknorm_shader_gated(config: &ModelConfig, q_gated: bool) -> String {
+    build_qknorm_shader_full(config, q_gated, 1.0) // Qwen3.5: (1 + w) norm scaling
+}
+
+fn build_qknorm_shader_full(config: &ModelConfig, q_gated: bool, norm_offset: f32) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
     let interleaved = config.mrope_interleaved();
-    // mRoPE section limits for modulo-3 interleaved selection
     let s_limit = partial_dim / 2;
     format!(
         "const ROPE_THETA: f32 = {:.1};\n\
          const MROPE_S1_LIMIT: u32 = {}u;\n\
          const MROPE_S2_LIMIT: u32 = {}u;\n\
          const PARTIAL_DIM: u32 = {}u;\n\
-         const MROPE_INTERLEAVED: bool = {};\n\n{}",
+         const MROPE_INTERLEAVED: bool = {};\n\
+         const Q_GATED: bool = {};\n\
+         const NORM_OFFSET: f32 = {:.1};\n\n{}",
         config.rope_theta,
         s_limit,
         s_limit,
         partial_dim,
         interleaved,
+        q_gated,
+        norm_offset,
         include_str!("shaders/fused_split_qknorm_kvstore.wgsl")
             .lines()
-            .skip(5) // skip the hardcoded const lines (now 5 lines)
+            .skip(7) // skip the 7 hardcoded const lines
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -116,6 +141,21 @@ pub struct Model {
     /// Simple RNG state for sampling
     rng_state: u64,
     use_4t: bool,
+    /// When true, all weights are bf16 (not GPTQ). Dispatch bf16_matvec instead of gptq_matvec.
+    pub bf16_mode: bool,
+    /// When true, Q projection outputs [nh * hd * 2] (Qwen3.5 SiGLU gated attention).
+    /// When false, Q outputs [nh * hd] (standard attention, e.g. Qwen3-ASR decoder).
+    pub q_gated: bool,
+    /// When true, RMSNorm uses direct `w` scaling (ASR decoder).
+    /// When false, uses `(1 + w)` scaling (Qwen3.5).
+    pub norm_direct: bool,
+    /// When true, weights are MLX INT4 (asymmetric minmax, row-major).
+    /// Uses int4_matvec_mlx shader with separate biases buffer.
+    pub mlx_int4_mode: bool,
+    /// Current layer index during forward pass (for accessing mlx_biases)
+    mlx_current_layer: usize,
+    /// Which projection within a layer: 0=q,1=k,2=v,3=o,4=gate,5=up,6=down
+    mlx_current_proj: usize,
     tied_embeddings: bool,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
@@ -126,7 +166,7 @@ pub struct Model {
 
 /// Build the QK norm uniform buffer data for fused_split_qknorm_kvstore.
 /// Layout: 8 u32 scalars + array<vec4<u32>, 320> of packed BF16 norm weights.
-fn build_qknorm_params(
+pub fn build_qknorm_params(
     config: &ModelConfig,
     q_norm_bytes: &[u8],
     k_norm_bytes: &[u8],
@@ -327,6 +367,12 @@ impl Model {
             #[cfg(feature = "jit-lora")]
             lora: None,
             use_4t,
+            bf16_mode: false,
+            q_gated: true, // default: Qwen3.5 gated attention
+            norm_direct: false,
+            mlx_int4_mode: false,
+            mlx_current_layer: 0,
+            mlx_current_proj: 0,
             tied_embeddings,
             qknorm_shader_src,
         }
@@ -345,7 +391,14 @@ impl Model {
         gpu.write_buffer(&self.state.qknorm_params[layer_idx], 0, &data);
     }
 
-    fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
+    /// Rebuild the QK norm shader with the current q_gated setting.
+    /// Must be called after changing q_gated.
+    pub fn rebuild_qknorm_shader(&mut self) {
+        let norm_offset = if self.norm_direct { 0.0 } else { 1.0 };
+        self.qknorm_shader_src = build_qknorm_shader_full(&self.config, self.q_gated, norm_offset);
+    }
+
+    pub fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
         // Must flush pending dispatches before overwriting params uniform,
         // otherwise previous dispatches would read the new params value.
         gpu.flush();
@@ -354,11 +407,61 @@ impl Model {
 
     // ── Dispatch helpers ──────────────────────────────────────────────
 
-    fn gptq_matvec(
+    /// Dispatch matvec with mode-aware shader selection.
+    /// For MLX INT4: pass biases from mlx_biases[layer][proj].
+    /// proj: 0=q, 1=k, 2=v, 3=o, 4=gate, 5=up, 6=down
+    pub fn matvec_layer(
+        &self, gpu: &mut GpuContext, name: &str,
+        input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
+        output: &wgpu::Buffer, k: u32, n: u32,
+        layer: usize, proj: usize,
+    ) {
+        if self.mlx_int4_mode && !self.weights.mlx_biases.is_empty() {
+            let biases = &self.weights.mlx_biases[layer][proj];
+            self.mlx_matvec(gpu, name, input, qweight, scales, biases, output, k, n);
+        } else {
+            self.gptq_matvec(gpu, name, input, qweight, scales, output, k, n);
+        }
+    }
+
+    /// MLX INT4 matvec: asymmetric dequant with separate biases buffer.
+    pub fn mlx_matvec(
+        &self, gpu: &mut GpuContext, name: &str,
+        input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
+        biases: &wgpu::Buffer, output: &wgpu::Buffer, k: u32, n: u32,
+    ) {
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct P { in_dim: u32, out_dim: u32, group_size: u32 }
+        self.write_params(gpu, bytemuck::bytes_of(&P {
+            in_dim: k, out_dim: n, group_size: self.quant_config.group_size,
+        }));
+        gpu.dispatch(name, shaders::INT4_MATVEC_MLX, &[
+            gpu::bind(0, input), gpu::bind(1, qweight),
+            gpu::bind(2, scales), gpu::bind(3, biases),
+            gpu::bind(4, output), gpu::bind(5, &self.state.params),
+        ], (n.div_ceil(32), 1, 1));
+    }
+
+    pub fn gptq_matvec(
         &self, gpu: &mut GpuContext, name: &str,
         input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
         output: &wgpu::Buffer, k: u32, n: u32,
     ) {
+        if self.bf16_mode {
+            // BF16 mode: qweight contains bf16 packed weights, scales is unused
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct Bf16P { hidden_size: u32, vocab_size: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&Bf16P {
+                hidden_size: k, vocab_size: n,
+            }));
+            gpu.dispatch(name, shaders::BF16_MATVEC, &[
+                gpu::bind(0, input), gpu::bind(1, qweight),
+                gpu::bind(2, output), gpu::bind(3, &self.state.params),
+            ], (n.div_ceil(32), 1, 1));
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { k: u32, n: u32, group_size: u32 }
@@ -380,12 +483,88 @@ impl Model {
         }
     }
 
-    fn fused_silu_gptq_down(
+    pub fn fused_silu_gptq_down(
         &self, gpu: &mut GpuContext,
         gate_out: &wgpu::Buffer, up_out: &wgpu::Buffer,
         down_qw: &wgpu::Buffer, down_sc: &wgpu::Buffer,
         output: &wgpu::Buffer, k: u32, n: u32,
     ) {
+        if self.bf16_mode {
+            // BF16 mode: SiLU(gate) * up → temp, then bf16_matvec(temp, down_proj) → output
+            // Use gate_out as temp: silu_mul reads from gate(binding 0) and up(binding 1),
+            // writes to output(binding 2). We set output=gate_out here. WGSL allows
+            // the same buffer as both read (binding 0) and write (binding 2) when
+            // they don't overlap within a dispatch. But to be safe, use up_out as the temp
+            // since it's sized for intermediate_size and we don't need it after.
+            // Actually: WGSL does NOT allow aliasing storage bindings within the same
+            // dispatch. So we write to a temp buffer. gate_out is [inter] sized which
+            // is exactly what we need. But it's also binding 0 (read). Same problem.
+            //
+            // Solution: two dispatches. First write SiLU result to gate_out by using
+            // a separate read-only copy. Actually simplest: just use output (mlp_output)
+            // as temp, then a second dispatch copies to the correct place.
+            //
+            // Best approach: silu_mul → gate_out (as temp, safe because dispatch is
+            // serialized and gate_out read completes before gate_out write in next dispatch).
+            // But WGSL validation requires different bindings for read vs write.
+            //
+            // Final approach: dispatch silu_mul writing to output (mlp_output, [hidden_size]),
+            // but intermediate_size > hidden_size for this model (6144 > 2048), so output
+            // is too small! We need a buffer of size intermediate_size.
+            //
+            // Use o_proj_out as temp — it's [hidden_size] = 2048, also too small.
+            // The only buffers sized >= inter are gate_out and up_out.
+            //
+            // Real solution: allocate a dedicated silu temp buffer, OR do the silu in-place
+            // on gate_out using a modified shader that reads+writes the same buffer.
+            //
+            // For now: write silu result to up_out (safe: silu reads up at each element
+            // before writing, and within a single dispatch, element i's read completes
+            // before element i's write). Actually WGSL doesn't guarantee this for aliased
+            // bindings within the same bind group.
+            //
+            // Safest: two separate dispatches.
+            // 1. silu_mul: gate_out → gate_out (with a silu-in-place shader)
+            // 2. manual multiply: gate_out *= up_out
+            // 3. bf16_matvec: output = down @ gate_out
+            //
+            // But we don't have a silu-in-place shader. Let's just flush between:
+            // 1. silu_mul(gate, up) → up_out  [overwrite up, which we no longer need]
+            //    Nope, can't alias binding 1 (read up) and binding 2 (write up).
+            //
+            // OK: the ONLY safe option without a new buffer is to flush between dispatches
+            // to ensure sequential execution, then reuse a buffer.
+            // After silu_mul completes (flushed), gate_out and up_out are free to overwrite.
+            //
+            // Approach: silu_mul → output (mlp_output). But output is only [hidden_size].
+            // We need [intermediate_size]. So we MUST allocate a temp buffer or use one
+            // that's large enough.
+            //
+            // Let's use the logits buffer — it's [vocab_size] = 151936, way more than enough.
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct SiluP { n: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&SiluP { n: k }));
+            gpu.dispatch("silu_mul_bf16", shaders::SILU_MUL, &[
+                gpu::bind(0, gate_out), gpu::bind(1, up_out),
+                gpu::bind(2, &self.state.logits), // temp: logits buffer is large enough
+                gpu::bind(3, &self.state.params),
+            ], (k.div_ceil(256), 1, 1));
+            // bf16_matvec: output[row] = sum(down_proj[row,k] * silu_result[k])
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct Bf16P { hidden_size: u32, vocab_size: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&Bf16P {
+                hidden_size: k, vocab_size: n,
+            }));
+            gpu.dispatch("down_bf16", shaders::BF16_MATVEC, &[
+                gpu::bind(0, &self.state.logits), // silu result from temp
+                gpu::bind(1, down_qw),
+                gpu::bind(2, output),
+                gpu::bind(3, &self.state.params),
+            ], (n.div_ceil(32), 1, 1));
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { k: u32, n: u32, group_size: u32 }
@@ -407,7 +586,7 @@ impl Model {
         }
     }
 
-    fn add_rmsnorm(
+    pub fn add_rmsnorm(
         &self, gpu: &mut GpuContext,
         hidden: &wgpu::Buffer, addend: &wgpu::Buffer,
         weight: &wgpu::Buffer, output: &wgpu::Buffer, n: u32,
@@ -416,14 +595,15 @@ impl Model {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { n: u32, eps: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&P { n, eps: self.config.rms_norm_eps }));
-        gpu.dispatch("add_rmsnorm", shaders::ADD_RMSNORM, &[
+        let shader = if self.norm_direct { shaders::ADD_RMSNORM_DIRECT } else { shaders::ADD_RMSNORM };
+        gpu.dispatch("add_rmsnorm", shader, &[
             gpu::bind(0, hidden), gpu::bind(1, addend),
             gpu::bind(2, weight), gpu::bind(3, output),
             gpu::bind(4, &self.state.params),
         ], (1, 1, 1));
     }
 
-    fn rmsnorm(
+    pub fn rmsnorm(
         &self, gpu: &mut GpuContext,
         input: &wgpu::Buffer, weight: &wgpu::Buffer,
         output: &wgpu::Buffer, n: u32,
@@ -432,13 +612,34 @@ impl Model {
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { n: u32, eps: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&P { n, eps: self.config.rms_norm_eps }));
-        gpu.dispatch("rmsnorm", shaders::RMSNORM, &[
+        let shader = if self.norm_direct { shaders::RMSNORM_DIRECT } else { shaders::RMSNORM };
+        gpu.dispatch("rmsnorm", shader, &[
             gpu::bind(0, input), gpu::bind(1, weight),
             gpu::bind(2, output), gpu::bind(3, &self.state.params),
         ], (1, 1, 1));
     }
 
-    fn embedding(&self, gpu: &mut GpuContext, token_id: u32) {
+    pub fn embedding(&self, gpu: &mut GpuContext, token_id: u32) {
+        // Chunked embedding lookup
+        if !self.weights.embed_chunks.is_empty() {
+            let chunk_size = self.weights.embed_chunk_size;
+            let chunk_idx = token_id / chunk_size;
+            let local_id = token_id % chunk_size;
+            let chunk = &self.weights.embed_chunks[chunk_idx as usize];
+
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct P { token_id: u32, dim: u32 }
+            self.write_params(gpu, bytemuck::bytes_of(&P {
+                token_id: local_id, dim: self.config.hidden_size,
+            }));
+            gpu.dispatch("embedding", shaders::EMBEDDING, &[
+                gpu::bind(0, chunk),
+                gpu::bind(1, &self.state.hidden),
+                gpu::bind(2, &self.state.params),
+            ], (self.config.hidden_size.div_ceil(256), 1, 1));
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct P { token_id: u32, dim: u32 }
@@ -453,6 +654,39 @@ impl Model {
     }
 
     fn bf16_lm_head(&self, gpu: &mut GpuContext, weight: &wgpu::Buffer, h: u32) {
+        // Chunked lm_head: dispatch bf16_matvec per chunk, write to logits at correct offset
+        if !self.weights.embed_chunks.is_empty() {
+            let chunk_size = self.weights.embed_chunk_size;
+            let vocab = self.config.vocab_size;
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct LmP { hidden_size: u32, vocab_size: u32 }
+
+            // Temp buffer for one chunk's logits (reused across chunks)
+            let max_chunk_vocab = chunk_size;
+            let chunk_logits = gpu.create_storage_buffer("lm_chunk_tmp", max_chunk_vocab as u64 * 4);
+
+            for (ci, chunk) in self.weights.embed_chunks.iter().enumerate() {
+                let chunk_start = ci as u32 * chunk_size;
+                let chunk_vocab = chunk_size.min(vocab - chunk_start);
+
+                self.write_params(gpu, bytemuck::bytes_of(&LmP {
+                    hidden_size: h, vocab_size: chunk_vocab,
+                }));
+                gpu.dispatch("lm_head_chunked", shaders::BF16_MATVEC, &[
+                    gpu::bind(0, &self.state.normed),
+                    gpu::bind(1, chunk),
+                    gpu::bind(2, &chunk_logits),
+                    gpu::bind(3, &self.state.params),
+                ], (chunk_vocab.div_ceil(32), 1, 1));
+
+                // GPU-side copy to the correct offset in the full logits buffer
+                gpu.copy_buffer_offset(&chunk_logits, 0,
+                    &self.state.logits, chunk_start as u64 * 4,
+                    chunk_vocab as u64 * 4);
+            }
+            return;
+        }
         #[repr(C)]
         #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
         struct LmP { hidden_size: u32, vocab_size: u32 }
@@ -483,7 +717,7 @@ impl Model {
 
     /// Fused Q/K norm + mRoPE + KV cache store.
     /// Dispatches (num_heads + num_kv_heads) workgroups.
-    fn fused_split_qknorm_kvstore(
+    pub fn fused_split_qknorm_kvstore(
         &self, gpu: &mut GpuContext, layer_idx: usize,
     ) {
         let nh = self.config.num_attention_heads;
@@ -496,7 +730,7 @@ impl Model {
         gpu.write_buffer(&self.state.qknorm_params[layer_idx], 16, bytemuck::cast_slice(&updates));
 
         gpu.dispatch(
-            &format!("qknorm_l{layer_idx}"),
+            "qknorm",
             &self.qknorm_shader_src,
             &[
                 gpu::bind(0, &self.state.q_out),   // q_proj_full (interleaved q+gate)
@@ -513,7 +747,7 @@ impl Model {
     }
 
     /// GQA attention: online softmax over KV cache.
-    fn gqa_attention(&self, gpu: &mut GpuContext, layer_idx: usize) {
+    pub fn gqa_attention(&self, gpu: &mut GpuContext, layer_idx: usize) {
         let nh = self.config.num_attention_heads;
         let nkv = self.config.num_key_value_heads;
         let hd = self.config.head_dim;
@@ -539,7 +773,7 @@ impl Model {
         };
 
         gpu.dispatch(
-            &format!("gqa_l{layer_idx}"),
+            "gqa",
             shaders::GQA_ATTENTION_HEAD,
             &[
                 gpu::bind(0, &self.state.q_proj),
@@ -560,7 +794,7 @@ impl Model {
                 head_dim: hd, num_splits: ns, num_heads: nh, _pad: 0,
             }));
             gpu.dispatch(
-                &format!("gqa_reduce_l{layer_idx}"),
+                "gqa_reduce",
                 shaders::GQA_REDUCE,
                 &[
                     gpu::bind(0, &self.state.attn_partials),
@@ -644,7 +878,7 @@ impl Model {
         struct DownP { in_features: u32, rank: u32 }
         self.write_params(gpu, bytemuck::bytes_of(&DownP { in_features: inter, rank }));
         gpu.dispatch(
-            &format!("lora_down_silu_l{layer_idx}"), shaders::LORA_DOWN_SILU,
+            "lora_down_silu", shaders::LORA_DOWN_SILU,
             &[gpu::bind(0, &self.state.gate_out), gpu::bind(1, &self.state.up_out),
               gpu::bind(2, &lora.layers[layer_idx].down_proj_a),
               gpu::bind(3, &lora.lora_hidden), gpu::bind(4, &self.state.params)],
@@ -656,7 +890,7 @@ impl Model {
         struct UpP { rank: u32, out_features: u32, scale: f32 }
         self.write_params(gpu, bytemuck::bytes_of(&UpP { rank, out_features: h, scale }));
         gpu.dispatch(
-            &format!("lora_up_down_l{layer_idx}"), shaders::LORA_UP_ADD,
+            "lora_up_down", shaders::LORA_UP_ADD,
             &[gpu::bind(0, &lora.lora_hidden),
               gpu::bind(1, &lora.layers[layer_idx].down_proj_b),
               gpu::bind(2, &self.state.mlp_output), gpu::bind(3, &self.state.params)],
@@ -668,17 +902,36 @@ impl Model {
 
     pub fn forward(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
         let h = self.config.hidden_size;
-        let inter = self.config.intermediate_size;
-        let nh = self.config.num_attention_heads;
-        let nkv = self.config.num_key_value_heads;
-        let hd = self.config.head_dim;
 
         // 1. Embedding (flush after to ensure params aren't overwritten)
         self.embedding(gpu, token_id);
         gpu.flush();
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
 
-        // 2. Layer loop
+        // 2. Layers + LM head + sampling
+        self.forward_layers(gpu)
+    }
+
+    /// Forward pass with raw f32 embedding instead of token ID lookup.
+    /// Used for ASR decoder where encoder output embeddings are injected directly.
+    pub fn forward_embed(&mut self, gpu: &mut GpuContext, embed: &[f32]) -> u32 {
+        let h = self.config.hidden_size;
+        // Write raw embedding to hidden buffer
+        gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(embed));
+        gpu.flush();
+        gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
+        self.forward_layers(gpu)
+    }
+
+    /// Run transformer layers + lm_head + sampling (shared by forward and forward_embed).
+    fn forward_layers(&mut self, gpu: &mut GpuContext) -> u32 {
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nh = self.config.num_attention_heads;
+        let nkv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+
+        // Layer loop
         for i in 0..self.config.num_hidden_layers as usize {
             let layer = &self.weights.layers[i];
 
@@ -692,66 +945,63 @@ impl Model {
 
             // ── Attention (self-attn or DeltaNet) ──
             if let Some(sa) = layer.self_attn() {
-                // Standard self-attention path
-                let q_dim = nh * hd * 2;
+                let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
                 let kv_dim = nkv * hd;
-                self.gptq_matvec(gpu, &format!("qproj_l{i}"),
+                self.gptq_matvec(gpu, "qproj",
                     &self.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
                     &self.state.q_out, h, q_dim);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[0]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("qproj_l{i}"),
+                    self.lora_apply(gpu, "qproj",
                         &self.state.normed, &lw.q_proj_a, &lw.q_proj_b,
                         &self.state.q_out, h, q_dim);
                 }
 
-                self.gptq_matvec(gpu, &format!("kproj_l{i}"),
+                self.gptq_matvec(gpu, "kproj",
                     &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
                     &self.state.k_out, h, kv_dim);
-                self.gptq_matvec(gpu, &format!("vproj_l{i}"),
+                self.gptq_matvec(gpu, "vproj",
                     &self.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
                     &self.state.v_out, h, kv_dim);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[1]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("vproj_l{i}"),
+                    self.lora_apply(gpu, "vproj",
                         &self.state.normed, &lw.v_proj_a, &lw.v_proj_b,
                         &self.state.v_out, h, kv_dim);
                 }
 
                 self.fused_split_qknorm_kvstore(gpu, i);
                 self.gqa_attention(gpu, i);
-                self.sigmoid_mul_gate(gpu);
+                if self.q_gated {
+                    self.sigmoid_mul_gate(gpu);
+                }
 
-                self.gptq_matvec(gpu, &format!("oproj_l{i}"),
+                self.gptq_matvec(gpu, "oproj",
                     &self.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
                     &self.state.o_proj_out, nh * hd, h);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[2]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
-                    self.lora_apply(gpu, &format!("oproj_l{i}"),
+                    self.lora_apply(gpu, "oproj",
                         &self.state.attn_output, &lw.o_proj_a, &lw.o_proj_b,
                         &self.state.o_proj_out, nh * hd, h);
                 }
             } else if let Some(la) = layer.linear_attn() {
-                // DeltaNet linear attention
                 let lnkh = self.linear_num_key_heads;
                 let lkd = self.linear_key_dim;
                 let lnvh = self.linear_num_value_heads;
                 let lvd = self.linear_value_dim;
                 let total_ch = lnkh * lkd + lnkh * lkd + lnvh * lvd;
 
-                // Count which linear-attn layer index this is
                 let lin_idx = (0..i).filter(|j| !self.weights.self_attn_layers.contains(j)).count();
 
-                // QKV projection
-                self.gptq_matvec(gpu, &format!("dn_qkv_l{i}"),
+                self.gptq_matvec(gpu, "dn_qkv",
                     &self.state.normed, &la.in_proj_qkv_qweight, &la.in_proj_qkv_scales,
                     &self.state.deltanet_qkv, h, total_ch);
 
-                // Z-gate projection: normed -> z_gate [num_value_heads * value_dim]
-                self.gptq_matvec(gpu, &format!("dn_z_l{i}"),
+                self.gptq_matvec(gpu, "dn_z",
                     &self.state.normed, &la.in_proj_z_qweight, &la.in_proj_z_scales,
                     &self.state.deltanet_z, h, lnvh * lvd);
 
@@ -767,7 +1017,7 @@ impl Model {
                 }));
 
                 gpu.dispatch(
-                    &format!("deltanet_l{i}"),
+                    "deltanet",
                     shaders::FUSED_CONV_DELTANET_NORM,
                     &[
                         gpu::bind(0, &self.state.deltanet_qkv),
@@ -775,7 +1025,7 @@ impl Model {
                         gpu::bind(2, &la.conv1d_weight),
                         gpu::bind(3, &self.state.deltanet_state[lin_idx]),
                         gpu::bind(4, &self.state.deltanet_output),
-                        gpu::bind(5, &self.state.normed), // hidden_input for alpha/beta
+                        gpu::bind(5, &self.state.normed),
                         gpu::bind(6, &la.ab_weight),
                         gpu::bind(7, &la.a_log),
                         gpu::bind(8, &la.dt_bias),
@@ -785,13 +1035,11 @@ impl Model {
                     (lnkh, 1, 1),
                 );
 
-                // Fused SiLU(z_gate) * deltanet_output @ out_proj → o_proj_out
                 self.fused_silu_gptq_down(gpu,
                     &self.state.deltanet_z, &self.state.deltanet_output,
                     &la.out_proj_qweight, &la.out_proj_scales,
                     &self.state.o_proj_out, lnvh * lvd, h);
             } else {
-                // Fallback: pass through
                 gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
             }
 
@@ -799,11 +1047,11 @@ impl Model {
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed, h);
 
-            // ── MLP: separate gate+up, then fused SiLU+down ──
-            self.gptq_matvec(gpu, &format!("gate_l{i}"),
+            // ── MLP ──
+            self.gptq_matvec(gpu, "gate",
                 &self.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
                 &self.state.gate_out, h, inter);
-            self.gptq_matvec(gpu, &format!("up_l{i}"),
+            self.gptq_matvec(gpu, "up",
                 &self.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
                 &self.state.up_out, h, inter);
             self.fused_silu_gptq_down(gpu,
@@ -816,16 +1064,14 @@ impl Model {
             }
         }
 
-        // 3. Final norm
+        // Final norm
         self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
             &self.weights.final_norm, &self.state.normed, h);
 
-        // 4. LM head
+        // LM head
         if self.tied_embeddings {
-            // Tied embeddings: logits = embed_tokens (BF16) @ normed
             self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
         } else if self.weights.lm_head_is_bf16 {
-            // Separate unquantized BF16 lm_head weight
             self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
         } else {
             self.gptq_matvec(gpu, "lm_head",
@@ -833,20 +1079,23 @@ impl Model {
                 &self.state.logits, h, self.config.vocab_size);
         }
 
-        // 5. Read logits, apply frequency penalty + temperature, sample
         self.seq_len += 1;
 
-        // Training mode: skip the expensive logits readback + sampling
         #[cfg(feature = "jit-lora")]
         if self.training_mode {
             return 0;
         }
 
+        self.sample_token(gpu)
+    }
+
+    /// Read logits from GPU and sample a token.
+    fn sample_token(&mut self, gpu: &mut GpuContext) -> u32 {
         let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
         let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
         let mut logits_vec = logits.to_vec();
 
-        // Repetition penalty (multiplicative, matching browser version)
+        // Repetition penalty
         let rep_penalty = 1.0f32;
         let presence_penalty = 1.5f32;
         {
@@ -857,19 +1106,17 @@ impl Model {
             for &tok in &seen {
                 let idx = tok as usize;
                 if idx < logits_vec.len() {
-                    // Multiplicative repetition penalty
                     if logits_vec[idx] > 0.0 {
                         logits_vec[idx] /= rep_penalty.max(1.001);
                     } else {
                         logits_vec[idx] *= rep_penalty.max(1.001);
                     }
-                    // Additive presence penalty
                     logits_vec[idx] -= presence_penalty;
                 }
             }
         }
 
-        // Hard ban: if last 2 tokens are the same, ban that token
+        // Hard ban: repeated tokens
         let n = self.generated_tokens.len();
         if n >= 2 && self.generated_tokens[n-1] == self.generated_tokens[n-2] {
             let banned = self.generated_tokens[n-1] as usize;
@@ -877,12 +1124,10 @@ impl Model {
                 logits_vec[banned] = f32::NEG_INFINITY;
             }
         }
-        // Hard ban: if last 2-token pair repeats (catches "What\nWhat\n" patterns)
         if n >= 4
             && self.generated_tokens[n-1] == self.generated_tokens[n-3]
             && self.generated_tokens[n-2] == self.generated_tokens[n-4]
         {
-            // Ban both tokens in the pair
             for &banned_tok in &[self.generated_tokens[n-1], self.generated_tokens[n-2]] {
                 let idx = banned_tok as usize;
                 if idx < logits_vec.len() {
@@ -890,7 +1135,6 @@ impl Model {
                 }
             }
         }
-        // Hard ban: if last 3-token pattern repeats (catches "X Y Z X Y Z" loops)
         if n >= 6
             && self.generated_tokens[n-1] == self.generated_tokens[n-4]
             && self.generated_tokens[n-2] == self.generated_tokens[n-5]
@@ -902,21 +1146,20 @@ impl Model {
             }
         }
 
-        // Temperature (0.7)
+        // Temperature
         let temperature = 0.7f32;
         let vocab_size = logits_vec.len();
         for v in logits_vec.iter_mut() {
             *v /= temperature;
         }
 
-        // Top-k (k=20)
+        // Top-k
         let k = 20usize.min(vocab_size);
         let mut indices: Vec<usize> = (0..vocab_size).collect();
         indices.select_nth_unstable_by(k, |&a, &b| logits_vec[b].partial_cmp(&logits_vec[a]).unwrap());
         let top_k_threshold = logits_vec[indices[k - 1]];
 
-        // Top-p (p=0.80) — nucleus sampling within top-k
-        // First softmax the top-k candidates
+        // Top-p nucleus sampling
         let max_val = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut probs: Vec<(usize, f32)> = logits_vec.iter().enumerate()
             .filter(|(_, &v)| v >= top_k_threshold)
@@ -926,8 +1169,6 @@ impl Model {
         for (_, p) in probs.iter_mut() {
             *p /= sum;
         }
-
-        // Sort by probability descending for top-p truncation
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let top_p = 0.80f32;
         let mut cumsum = 0.0f32;
@@ -935,18 +1176,14 @@ impl Model {
         for (i, p) in &probs {
             cumsum += p;
             nucleus.push((*i, *p));
-            if cumsum >= top_p {
-                break;
-            }
+            if cumsum >= top_p { break; }
         }
-
-        // Renormalize nucleus
         let nuc_sum: f32 = nucleus.iter().map(|(_, p)| p).sum();
         for (_, p) in nucleus.iter_mut() {
             *p /= nuc_sum;
         }
 
-        // Sample from nucleus
+        // Sample
         self.rng_state ^= self.rng_state << 13;
         self.rng_state ^= self.rng_state >> 7;
         self.rng_state ^= self.rng_state << 17;
@@ -966,6 +1203,542 @@ impl Model {
         self.last_token_prob = sampled_prob;
         self.generated_tokens.push(sampled);
         sampled
+    }
+
+    /// Greedy argmax decode — no sampling, no penalties. For ASR.
+    pub fn forward_argmax(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
+        let h = self.config.hidden_size;
+        self.embedding(gpu, token_id);
+        gpu.flush();
+        gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
+        self.forward_layers_argmax(gpu)
+    }
+
+    /// Greedy argmax with raw embedding injection. For ASR encoder output tokens.
+    pub fn forward_embed_argmax(&mut self, gpu: &mut GpuContext, embed: &[f32]) -> u32 {
+        let h = self.config.hidden_size;
+        gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(embed));
+        gpu.flush();
+        gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
+        self.forward_layers_argmax(gpu)
+    }
+
+    /// Run transformer layers + lm_head + argmax (no sampling).
+    fn forward_layers_argmax(&mut self, gpu: &mut GpuContext) -> u32 {
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+
+        // Layer loop (same as forward_layers but skip sampling)
+        for i in 0..self.config.num_hidden_layers as usize {
+            let layer = &self.weights.layers[i];
+
+            if i == 0 {
+                self.rmsnorm(gpu, &self.state.hidden, &layer.input_layernorm, &self.state.normed, h);
+            } else {
+                self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+                    &layer.input_layernorm, &self.state.normed, h);
+            }
+
+            if let Some(sa) = layer.self_attn() {
+                let nh = self.config.num_attention_heads;
+                let nkv = self.config.num_key_value_heads;
+                let hd = self.config.head_dim;
+                let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
+                let kv_dim = nkv * hd;
+                self.gptq_matvec(gpu, "qproj",
+                    &self.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
+                    &self.state.q_out, h, q_dim);
+                self.gptq_matvec(gpu, "kproj",
+                    &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
+                    &self.state.k_out, h, kv_dim);
+                self.gptq_matvec(gpu, "vproj",
+                    &self.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
+                    &self.state.v_out, h, kv_dim);
+                self.fused_split_qknorm_kvstore(gpu, i);
+                self.gqa_attention(gpu, i);
+                if self.q_gated {
+                    self.sigmoid_mul_gate(gpu);
+                }
+                self.gptq_matvec(gpu, "oproj",
+                    &self.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
+                    &self.state.o_proj_out, nh * hd, h);
+            } else {
+                gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
+            }
+
+            self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
+                &layer.post_attn_layernorm, &self.state.normed, h);
+
+            self.gptq_matvec(gpu, "gate",
+                &self.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
+                &self.state.gate_out, h, inter);
+            self.gptq_matvec(gpu, "up",
+                &self.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
+                &self.state.up_out, h, inter);
+            self.fused_silu_gptq_down(gpu,
+                &self.state.gate_out, &self.state.up_out,
+                &layer.down_proj_qweight, &layer.down_proj_scales,
+                &self.state.mlp_output, inter, h);
+        }
+
+        // Final norm + LM head
+        self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+            &self.weights.final_norm, &self.state.normed, h);
+
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, h, self.config.vocab_size);
+        }
+
+        self.seq_len += 1;
+
+        // Greedy argmax
+        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, _) = logits.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let token = max_idx as u32;
+        self.generated_tokens.push(token);
+        token
+    }
+
+    /// MLX INT4 embedding lookup.
+    pub fn embedding_mlx(&self, gpu: &mut GpuContext, token_id: u32) {
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct P { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+        self.write_params(gpu, bytemuck::bytes_of(&P {
+            token_id, dim: self.config.hidden_size,
+            group_size: self.quant_config.group_size, _pad: 0,
+        }));
+        // mlx_biases is empty for embed — use the dedicated embed buffers from weights
+        // The MLX loader stored embed qweight in embed_tokens, scales in lm_head_scales (reused)
+        // Actually we need dedicated embed scale/bias buffers. For now, fall back to the
+        // ModelWeights fields. The MLX loader puts embed_qw in embed_tokens.
+        // But we need embed_scales and embed_biases too...
+        // TODO: store embed scales/biases properly. For now, use the shader with
+        // the correct buffers passed from the asr_decoder.
+        panic!("embedding_mlx needs dedicated embed scale/bias buffers — call from asr_decoder");
+    }
+
+    /// MLX INT4 forward: single token through all layers using int4_matvec_mlx.
+    /// Dedicated forward path — no changes to existing gptq/bf16 methods.
+    pub fn forward_mlx_argmax(&mut self, gpu: &mut GpuContext) -> u32 {
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nh = self.config.num_attention_heads;
+        let nkv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct Mlx4P { in_dim: u32, out_dim: u32, group_size: u32 }
+
+        let gs = self.quant_config.group_size;
+
+        for i in 0..self.config.num_hidden_layers as usize {
+            let layer = &self.weights.layers[i];
+            let biases = &self.weights.mlx_biases[i];
+            // biases: [q=0, k=1, v=2, o=3, gate=4, up=5, down=6]
+
+            // Pre-attention norm
+            if i == 0 {
+                self.rmsnorm(gpu, &self.state.hidden, &layer.input_layernorm, &self.state.normed, h);
+            } else {
+                self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+                    &layer.input_layernorm, &self.state.normed, h);
+            }
+
+            if let Some(sa) = layer.self_attn() {
+                let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
+                let kv_dim = nkv * hd;
+
+                // Q projection (MLX INT4)
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: q_dim, group_size: gs }));
+                gpu.dispatch("qproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.q_proj_qweight),
+                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &biases[0]),
+                    gpu::bind(4, &self.state.q_out), gpu::bind(5, &self.state.params),
+                ], (q_dim.div_ceil(32), 1, 1));
+
+                // K projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: kv_dim, group_size: gs }));
+                gpu.dispatch("kproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.k_proj_qweight),
+                    gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &biases[1]),
+                    gpu::bind(4, &self.state.k_out), gpu::bind(5, &self.state.params),
+                ], (kv_dim.div_ceil(32), 1, 1));
+
+                // V projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: kv_dim, group_size: gs }));
+                gpu.dispatch("vproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.v_proj_qweight),
+                    gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &biases[2]),
+                    gpu::bind(4, &self.state.v_out), gpu::bind(5, &self.state.params),
+                ], (kv_dim.div_ceil(32), 1, 1));
+
+                self.fused_split_qknorm_kvstore(gpu, i);
+                self.gqa_attention(gpu, i);
+                if self.q_gated { self.sigmoid_mul_gate(gpu); }
+
+                // O projection
+                self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: nh * hd, out_dim: h, group_size: gs }));
+                gpu.dispatch("oproj", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.attn_output), gpu::bind(1, &sa.o_proj_qweight),
+                    gpu::bind(2, &sa.o_proj_scales), gpu::bind(3, &biases[3]),
+                    gpu::bind(4, &self.state.o_proj_out), gpu::bind(5, &self.state.params),
+                ], (h.div_ceil(32), 1, 1));
+            } else {
+                gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
+            }
+
+            // Post-attention norm
+            self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
+                &layer.post_attn_layernorm, &self.state.normed, h);
+
+            // MLP: gate + up (INT4), then fused SiLU + down (INT4)
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: inter, group_size: gs }));
+            gpu.dispatch("gate", shaders::INT4_MATVEC_MLX, &[
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.gate_proj_qweight),
+                gpu::bind(2, &layer.gate_proj_scales), gpu::bind(3, &biases[4]),
+                gpu::bind(4, &self.state.gate_out), gpu::bind(5, &self.state.params),
+            ], (inter.div_ceil(32), 1, 1));
+
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: h, out_dim: inter, group_size: gs }));
+            gpu.dispatch("up", shaders::INT4_MATVEC_MLX, &[
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.up_proj_qweight),
+                gpu::bind(2, &layer.up_proj_scales), gpu::bind(3, &biases[5]),
+                gpu::bind(4, &self.state.up_out), gpu::bind(5, &self.state.params),
+            ], (inter.div_ceil(32), 1, 1));
+
+            // Fused SiLU(gate) * up → INT4 down_proj → mlp_output
+            self.write_params(gpu, bytemuck::bytes_of(&Mlx4P { in_dim: inter, out_dim: h, group_size: gs }));
+            gpu.dispatch("silu_down", shaders::FUSED_SILU_INT4_MLX, &[
+                gpu::bind(0, &self.state.gate_out), gpu::bind(1, &self.state.up_out),
+                gpu::bind(2, &layer.down_proj_qweight),
+                gpu::bind(3, &layer.down_proj_scales), gpu::bind(4, &biases[6]),
+                gpu::bind(5, &self.state.mlp_output), gpu::bind(6, &self.state.params),
+            ], (h.div_ceil(32), 1, 1));
+        }
+
+        // Final norm
+        self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
+            &self.weights.final_norm, &self.state.normed, h);
+
+        // LM head (bf16 — not quantized in MLX model)
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, h, self.config.vocab_size);
+        }
+
+        self.seq_len += 1;
+
+        // Greedy argmax
+        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, _) = logits.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let token = max_idx as u32;
+        self.generated_tokens.push(token);
+        token
+    }
+
+    /// Batched prefill: process input_embeds [seq_len, hidden_size] through all layers.
+    /// Populates KV cache for subsequent autoregressive decode.
+    /// Returns the argmax token predicted from the last position.
+    /// bf16_mode must be true. q_gated must be false (ASR decoder).
+    pub fn prefill(&mut self, gpu: &mut GpuContext, input_embeds: &[f32], seq_len: u32) -> u32 {
+        assert!(self.bf16_mode, "prefill requires bf16_mode");
+        assert!(!self.q_gated, "prefill only supports non-gated Q (ASR decoder)");
+
+        let h = self.config.hidden_size;
+        let inter = self.config.intermediate_size;
+        let nh = self.config.num_attention_heads;
+        let nkv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+        let f = 4u64; // bytes per f32
+        let sl = seq_len as u64;
+
+        // Upload input embeddings
+        let x_buf = gpu.upload_buffer("prefill_x", bytemuck::cast_slice(input_embeds));
+
+        // Allocate batched scratch buffers
+        let residual = gpu.create_storage_buffer("pf_residual", sl * h as u64 * f);
+        let normed = gpu.create_storage_buffer("pf_normed", sl * h as u64 * f);
+        let q_buf = gpu.create_storage_buffer("pf_q", sl * (nh * hd) as u64 * f);
+        let k_buf = gpu.create_storage_buffer("pf_k", sl * (nkv * hd) as u64 * f);
+        let v_buf = gpu.create_storage_buffer("pf_v", sl * (nkv * hd) as u64 * f);
+        let attn_out = gpu.create_storage_buffer("pf_attn", sl * (nh * hd) as u64 * f);
+        let o_out = gpu.create_storage_buffer("pf_o", sl * h as u64 * f);
+        let gate_buf = gpu.create_storage_buffer("pf_gate", sl * inter as u64 * f);
+        let up_buf = gpu.create_storage_buffer("pf_up", sl * inter as u64 * f);
+        let silu_buf = gpu.create_storage_buffer("pf_silu", sl * inter as u64 * f);
+        let mlp_out = gpu.create_storage_buffer("pf_mlp", sl * h as u64 * f);
+
+        // Params buffer for prefill dispatches
+        let params = gpu.create_buffer("pf_params", 256,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+
+        // Copy x → residual
+        gpu.copy_buffer(&x_buf, &residual, sl * h as u64 * f);
+
+        // Build batched qknorm shader with model constants
+        let batched_qknorm_src = {
+            let partial_dim = (self.config.head_dim as f32 * self.config.partial_rotary_factor) as u32;
+            let s_limit = partial_dim / 2;
+            format!(
+                "const ROPE_THETA: f32 = {:.1};\n\
+                 const PARTIAL_DIM: u32 = {}u;\n\
+                 const MROPE_INTERLEAVED: bool = {};\n\n{}",
+                self.config.rope_theta,
+                partial_dim,
+                self.config.mrope_interleaved(),
+                include_str!("shaders/batched_qknorm_rope.wgsl")
+                    .lines()
+                    .skip(12) // skip comment block (9 lines) + 3 const lines
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+
+        for layer_idx in 0..self.config.num_hidden_layers as usize {
+            let layer = &self.weights.layers[layer_idx];
+
+            // ── RMSNorm ──
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct NormP { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+
+            if layer_idx == 0 {
+                // First layer: rmsnorm(x_buf)
+                gpu.flush();
+                gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                    n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+                gpu.dispatch("pf_norm", shaders::BATCHED_RMSNORM, &[
+                    gpu::bind(0, &x_buf),
+                    gpu::bind(1, &layer.input_layernorm),
+                    gpu::bind(2, &normed),
+                    gpu::bind(3, &params),
+                ], (seq_len, 1, 1));
+            } else {
+                // add_rmsnorm(residual += mlp_out, normed)
+                gpu.flush();
+                gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                    n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+                gpu.dispatch("pf_addnorm", shaders::BATCHED_ADD_RMSNORM, &[
+                    gpu::bind(0, &residual),
+                    gpu::bind(1, &mlp_out),
+                    gpu::bind(2, &layer.input_layernorm),
+                    gpu::bind(3, &normed),
+                    gpu::bind(4, &params),
+                ], (seq_len, 1, 1));
+            }
+
+            // ── Q/K/V projections (bf16 GEMM) ──
+            let sa = layer.self_attn().expect("ASR decoder must be self-attn");
+
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct GemmP { d_in: u32, d_out: u32, seq_len: u32, has_bias: u32 }
+
+            // Q: [seq_len, h] × [nh*hd, h]^T → [seq_len, nh*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nh * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_q", shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.q_proj_qweight),
+                gpu::bind(2, &normed), // bias unused (has_bias=0)
+                gpu::bind(3, &q_buf),
+                gpu::bind(4, &params),
+            ], ((nh * hd).div_ceil(32), seq_len, 1));
+
+            // K: [seq_len, h] → [seq_len, nkv*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_k", shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.k_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &k_buf),
+                gpu::bind(4, &params),
+            ], ((nkv * hd).div_ceil(32), seq_len, 1));
+
+            // V: [seq_len, h] → [seq_len, nkv*hd]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: nkv * hd, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_v", shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &sa.v_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &v_buf),
+                gpu::bind(4, &params),
+            ], ((nkv * hd).div_ceil(32), seq_len, 1));
+
+            // ── Q/K Norm + RoPE + KV cache write ──
+            // qknorm_params[layer_idx] was pre-filled by init_qknorm_params with
+            // header (num_heads, kv_heads, head_dim, eps) + packed norm weights.
+            // The batched shader reads position from workgroup_id.y, not the buffer.
+            gpu.flush();
+            gpu.dispatch("pf_qknorm", &batched_qknorm_src, &[
+                gpu::bind(0, &q_buf),
+                gpu::bind(1, &k_buf),
+                gpu::bind(2, &v_buf),
+                gpu::bind(3, &self.state.k_cache[layer_idx]),
+                gpu::bind(4, &self.state.v_cache[layer_idx]),
+                gpu::bind(5, &self.state.qknorm_params[layer_idx]),
+            ], (nh + nkv, seq_len, 1));
+
+            // ── Causal attention ──
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct AttnP { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&AttnP {
+                seq_len, head_dim: hd, num_kv_heads: nkv, num_q_heads: nh,
+                heads_per_kv: nh / nkv }));
+            gpu.dispatch("pf_attn", shaders::CAUSAL_ATTENTION_PREFILL, &[
+                gpu::bind(0, &q_buf),
+                gpu::bind(1, &k_buf),
+                gpu::bind(2, &v_buf),
+                gpu::bind(3, &attn_out),
+                gpu::bind(4, &params),
+            ], (nh, seq_len, 1));
+
+            // ── O projection: [seq_len, nh*hd] → [seq_len, h] ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: nh * hd, d_out: h, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_o", shaders::BF16_GEMM, &[
+                gpu::bind(0, &attn_out),
+                gpu::bind(1, &sa.o_proj_qweight),
+                gpu::bind(2, &attn_out),
+                gpu::bind(3, &o_out),
+                gpu::bind(4, &params),
+            ], (h.div_ceil(32), seq_len, 1));
+
+            // ── Post-attention norm: residual += o_out ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP {
+                n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+            gpu.dispatch("pf_postnorm", shaders::BATCHED_ADD_RMSNORM, &[
+                gpu::bind(0, &residual),
+                gpu::bind(1, &o_out),
+                gpu::bind(2, &layer.post_attn_layernorm),
+                gpu::bind(3, &normed),
+                gpu::bind(4, &params),
+            ], (seq_len, 1, 1));
+
+            // ── MLP: gate + up → SiLU → down ──
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: inter, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_gate", shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &layer.gate_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &gate_buf),
+                gpu::bind(4, &params),
+            ], (inter.div_ceil(32), seq_len, 1));
+
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: h, d_out: inter, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_up", shaders::BF16_GEMM, &[
+                gpu::bind(0, &normed),
+                gpu::bind(1, &layer.up_proj_qweight),
+                gpu::bind(2, &normed),
+                gpu::bind(3, &up_buf),
+                gpu::bind(4, &params),
+            ], (inter.div_ceil(32), seq_len, 1));
+
+            // SiLU(gate) * up → silu_buf
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct SiluP { n: u32 }
+            let total_silu = seq_len * inter;
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&SiluP { n: total_silu }));
+            gpu.dispatch("pf_silu", shaders::BATCHED_SILU_MUL, &[
+                gpu::bind(0, &gate_buf),
+                gpu::bind(1, &up_buf),
+                gpu::bind(2, &silu_buf),
+                gpu::bind(3, &params),
+            ], (total_silu.div_ceil(256), 1, 1));
+
+            // down_proj: [seq_len, inter] → [seq_len, h]
+            gpu.flush();
+            gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
+                d_in: inter, d_out: h, seq_len, has_bias: 0 }));
+            gpu.dispatch("pf_down", shaders::BF16_GEMM, &[
+                gpu::bind(0, &silu_buf),
+                gpu::bind(1, &layer.down_proj_qweight),
+                gpu::bind(2, &silu_buf),
+                gpu::bind(3, &mlp_out),
+                gpu::bind(4, &params),
+            ], (h.div_ceil(32), seq_len, 1));
+
+            if (layer_idx + 1) % 7 == 0 {
+                log::info!("[prefill] layer {}/{}", layer_idx + 1, self.config.num_hidden_layers);
+            }
+        }
+
+        // Final: residual += mlp_out from last layer
+        gpu.flush();
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct NormP2 { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+        gpu.write_buffer(&params, 0, bytemuck::bytes_of(&NormP2 {
+            n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
+        gpu.dispatch("pf_final_addnorm", shaders::BATCHED_ADD_RMSNORM, &[
+            gpu::bind(0, &residual),
+            gpu::bind(1, &mlp_out),
+            gpu::bind(2, &self.weights.final_norm),
+            gpu::bind(3, &normed),
+            gpu::bind(4, &params),
+        ], (seq_len, 1, 1));
+
+        // Extract last position's hidden state → state.normed for LM head
+        gpu.flush();
+        let last_offset = ((seq_len - 1) as u64) * h as u64 * f;
+        {
+            let last_bytes = gpu.read_buffer_offset(&normed, last_offset, h as u64 * f);
+            gpu.write_buffer(&self.state.normed, 0, &last_bytes);
+        }
+
+        // LM head
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, h, self.config.vocab_size);
+        }
+
+        self.seq_len = seq_len;
+
+        // Greedy argmax
+        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, _) = logits.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let token = max_idx as u32;
+        self.generated_tokens.push(token);
+        token
     }
 
     /// Allocate a second cache slot on GPU for running a separate prompt
