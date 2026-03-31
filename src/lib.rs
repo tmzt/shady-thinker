@@ -3,8 +3,10 @@ pub mod inference;
 #[cfg(feature = "jit-lora")]
 pub mod lora;
 pub mod model;
+pub mod nomic;
 #[cfg(feature = "jit-lora")]
 pub mod train;
 pub mod weights;
+pub mod wordpiece;
 #[cfg(feature = "chat")]
 pub mod chat;
