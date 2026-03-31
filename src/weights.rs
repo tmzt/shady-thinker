@@ -181,8 +181,6 @@ pub struct ModelWeights {
     /// MLX INT4 biases per layer: [q, k, v, o, gate, up, down]
     /// Empty for GPTQ/bf16 modes.
     pub mlx_biases: Vec<[wgpu::Buffer; 7]>,
-    pub mlx_embed_scales: Option<wgpu::Buffer>,
-    pub mlx_embed_biases: Option<wgpu::Buffer>,
 }
 
 /// Model configuration parsed from config.json
@@ -637,7 +635,7 @@ pub fn load_weights(
             layers,
             embed_chunks: Vec::new(),
             embed_chunk_size: 0,
-            mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
+            mlx_biases: Vec::new(),
         },
         RawNormWeights {
             layers: norm_weights,
@@ -785,7 +783,7 @@ pub fn load_weights_bf16(
             layers,
             embed_chunks,
             embed_chunk_size,
-            mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
+            mlx_biases: Vec::new(),
         },
         RawNormWeights {
             layers: norm_weights,
@@ -863,27 +861,15 @@ pub fn load_weights_int4(
         embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
         lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
         layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
-        mlx_biases: Vec::new(), mlx_embed_scales: None, mlx_embed_biases: None,
+        mlx_biases: Vec::new(),
     }, RawNormWeights { layers: nw })
 }
 
 /// Load pre-quantized MLX INT4 weights (minmax, group_size=64).
 /// Tensor names: model.layers.N.* (MLX convention, no "thinker." prefix).
 /// Returns weights ready for int4_matvec_mlx shader.
-pub fn load_weights_mlx(
-    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, bits: u32,
-) -> (ModelWeights, RawNormWeights) {
-    load_weights_mlx_inner(gpu, model_dir, config, bits)
-}
-
 pub fn load_weights_mlx_int4(
     gpu: &GpuContext, model_dir: &Path, config: &ModelConfig,
-) -> (ModelWeights, RawNormWeights) {
-    load_weights_mlx_inner(gpu, model_dir, config, 4)
-}
-
-fn load_weights_mlx_inner(
-    gpu: &GpuContext, model_dir: &Path, config: &ModelConfig, bits: u32,
 ) -> (ModelWeights, RawNormWeights) {
     let mut sf: Vec<_> = std::fs::read_dir(model_dir).expect("read dir")
         .filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x=="safetensors"))
@@ -897,40 +883,16 @@ fn load_weights_mlx_inner(
     let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
     let up = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
 
-    // Embedding — quantized, may need chunking for 128MB binding limit.
-    let vals_per_u32 = 32 / bits;
-    let embed_data = get("model.embed_tokens.weight");
-    let embed_sc_data = get("model.embed_tokens.scales");
-    let embed_bi_data = get("model.embed_tokens.biases");
-    let max_binding = gpu.max_storage_binding_size() as usize;
-    let bytes_per_token = (config.hidden_size / vals_per_u32 * 4) as usize;
-    let tokens_per_chunk = max_binding / bytes_per_token;
-
-    let mut embed_chunks: Vec<wgpu::Buffer> = Vec::new();
-    let embed_chunk_size: u32;
-    let embed_qw;
-    if embed_data.len() > max_binding {
-        embed_chunk_size = tokens_per_chunk as u32;
-        let mut offset = 0usize;
-        let mut ci = 0u32;
-        while offset < embed_data.len() {
-            let end = (offset + tokens_per_chunk * bytes_per_token).min(embed_data.len());
-            embed_chunks.push(gpu.upload_buffer(&format!("emb_c{ci}"), &embed_data[offset..end]));
-            offset = end;
-            ci += 1;
-        }
-        log::info!("[mlx-{}bit] embed chunked: {} chunks of {} tokens", bits, embed_chunks.len(), tokens_per_chunk);
-        embed_qw = gpu.create_storage_buffer("emb_dummy", 4);
-    } else {
-        embed_chunk_size = 0;
-        embed_qw = gpu.upload_buffer("emb_qw", embed_data);
-    };
-    let embed_sc = gpu.upload_buffer("emb_sc", embed_sc_data);
-    let embed_bi = gpu.upload_buffer("emb_bi", embed_bi_data);
+    // Embedding — quantized in MLX format, needs chunking for 128MB binding
+    // For embedding lookup we need a special dequant shader too.
+    // For now, upload qweight + scales + biases and dequant on CPU during lookup.
+    // TODO: GPU embedding dequant shader
+    let embed_qw = up("emb_qw", "model.embed_tokens.weight");
+    let embed_sc = up("emb_sc", "model.embed_tokens.scales");
+    let embed_bi = up("emb_bi", "model.embed_tokens.biases");
 
     let fnorm = up("fn", "model.norm.weight");
-    let has_lm_head = st.iter().any(|s| s.tensor("lm_head.weight").is_ok());
-    let lmh = if has_lm_head { up("lmh", "lm_head.weight") } else { gpu.create_storage_buffer("lmh_dummy", 4) };
+    let lmh = up("lmh", "lm_head.weight");
     let dsc = gpu.create_storage_buffer("ds", 4);
 
     let mut layers = Vec::new();
@@ -992,9 +954,7 @@ fn load_weights_mlx_inner(
         embed_tokens: embed_qw, final_norm: fnorm,
         lm_head_qweight: lmh, lm_head_scales: dsc, lm_head_is_bf16: true,
         self_attn_layers: (0..config.num_hidden_layers as usize).collect(),
-        layers, embed_chunks, embed_chunk_size,
+        layers, embed_chunks: Vec::new(), embed_chunk_size: 0,
         mlx_biases: biases,
-        mlx_embed_scales: Some(embed_sc),
-        mlx_embed_biases: Some(embed_bi),
     }, RawNormWeights { layers: nw })
 }

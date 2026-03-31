@@ -166,7 +166,7 @@ pub struct Model {
 
 /// Build the QK norm uniform buffer data for fused_split_qknorm_kvstore.
 /// Layout: 8 u32 scalars + array<vec4<u32>, 320> of packed BF16 norm weights.
-pub fn build_qknorm_params(
+fn build_qknorm_params(
     config: &ModelConfig,
     q_norm_bytes: &[u8],
     k_norm_bytes: &[u8],

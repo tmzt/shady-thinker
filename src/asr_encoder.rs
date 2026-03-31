@@ -56,20 +56,9 @@ struct EncoderLayer {
 }
 
 /// GPU ASR encoder.
-const CONV_HIDDEN: u32 = 480;
-
-/// Conv stem weights on GPU (f32, not quantized).
-struct ConvStemGpu {
-    conv1_w: wgpu::Buffer, conv1_b: wgpu::Buffer, // [480, 1, 3, 3] + [480]
-    conv2_w: wgpu::Buffer, conv2_b: wgpu::Buffer, // [480, 480, 3, 3] + [480]
-    conv3_w: wgpu::Buffer, conv3_b: wgpu::Buffer, // [480, 480, 3, 3] + [480]
-    proj_w: wgpu::Buffer,                           // [d_model, 480*16] f32
-}
-
 pub struct AsrEncoder {
-    pub gpu: GpuContext,
+    gpu: GpuContext,
     layers: Vec<EncoderLayer>,
-    conv: ConvStemGpu,
     // Final layer norm
     ln_post_w: wgpu::Buffer,
     ln_post_b: wgpu::Buffer,
@@ -102,20 +91,11 @@ impl AsrEncoder {
             .map(|data| SafeTensors::deserialize(data).expect("failed to parse safetensors"))
             .collect();
 
-        // Helper: find tensor across shards. Tries both HF and MLX prefixes.
+        // Helper: find tensor across shards (raw bf16 bytes)
         let get_tensor = |name: &str| -> &[u8] {
             for st in &shards {
                 if let Ok(t) = st.tensor(name) {
                     return t.data();
-                }
-            }
-            // Try without "thinker." prefix (MLX models)
-            if name.starts_with("thinker.") {
-                let alt = &name["thinker.".len()..];
-                for st in &shards {
-                    if let Ok(t) = st.tensor(alt) {
-                        return t.data();
-                    }
                 }
             }
             panic!("[asr-encoder] tensor not found: {name}");
@@ -183,29 +163,7 @@ impl AsrEncoder {
 
         log::info!("[asr-encoder] loaded {} layers onto GPU", layers.len());
 
-        // Load conv stem weights → GPU (f32, not quantized)
-        let upload_conv_weight = |gpu: &GpuContext, label: &str, name: &str, c_in: usize| -> wgpu::Buffer {
-            let data = get_tensor(name);
-            let f32_bytes = bf16_to_f32(data);
-            let w: &[f32] = bytemuck::cast_slice(&f32_bytes);
-            let c_out = w.len() / (c_in * 3 * 3);
-            // Detect and transpose MLX layout [out, kH, kW, in] → PyTorch [out, in, kH, kW]
-            let w_pt = transpose_conv2d_if_mlx(w, c_out, c_in, 3, 3);
-            gpu.upload_buffer(label, bytemuck::cast_slice(&w_pt))
-        };
-
-        let conv = ConvStemGpu {
-            conv1_w: upload_conv_weight(&gpu, "conv1_w", "thinker.audio_tower.conv2d1.weight", 1),
-            conv1_b: upload_f32(&gpu, "conv1_b", "thinker.audio_tower.conv2d1.bias"),
-            conv2_w: upload_conv_weight(&gpu, "conv2_w", "thinker.audio_tower.conv2d2.weight", CONV_HIDDEN as usize),
-            conv2_b: upload_f32(&gpu, "conv2_b", "thinker.audio_tower.conv2d2.bias"),
-            conv3_w: upload_conv_weight(&gpu, "conv3_w", "thinker.audio_tower.conv2d3.weight", CONV_HIDDEN as usize),
-            conv3_b: upload_f32(&gpu, "conv3_b", "thinker.audio_tower.conv2d3.bias"),
-            proj_w: { let d = bf16_to_f32(get_tensor("thinker.audio_tower.conv_out.weight"));
-                       gpu.upload_buffer("conv_proj_w", &d) },
-        };
-
-        Self { gpu, layers, conv, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config }
+        Self { gpu, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config }
     }
 
     fn load_shards(model_dir: &Path) -> Vec<Vec<u8>> {
@@ -220,112 +178,6 @@ impl AsrEncoder {
         shard_files.iter()
             .map(|p| std::fs::read(p).expect(&format!("failed to read {:?}", p)))
             .collect()
-    }
-
-    /// Full pipeline: mel → conv stem (GPU) → transformer (GPU).
-    /// Input: mel data `[128, mel_frames]` as f32.
-    /// Returns `(output, n_tokens, conv_ms, enc_ms)`.
-    pub fn forward_mel(&mut self, mel: &[f32], mel_frames: u32) -> (Vec<f32>, u32, u128, u128) {
-        // Invalidate bind group cache — temporary buffers from previous call may
-        // have been deallocated and their addresses reused by the allocator.
-        self.gpu.invalidate_bind_groups();
-        let t0 = std::time::Instant::now();
-        let (conv_out, n_tokens) = self.conv_stem_gpu(mel, mel_frames);
-        let conv_ms = t0.elapsed().as_millis();
-        let t1 = std::time::Instant::now();
-        let output = self.forward(&conv_out, n_tokens);
-        let enc_ms = t1.elapsed().as_millis();
-        (output, n_tokens, conv_ms, enc_ms)
-    }
-
-    /// GPU conv stem: mel [128, frames] → token embeddings [n_tokens, d_model].
-    /// 3× Conv2D(3×3, stride=2, pad=1) + GELU → reshape → linear proj → sinusoidal PE.
-    fn conv_stem_gpu(&mut self, mel: &[f32], mel_frames: u32) -> (Vec<f32>, u32) {
-        use crate::gpu::bind;
-        let d_model = self.config.d_model;
-        let mf = mel_frames as usize;
-
-        // Spatial dims after each conv layer (stride=2, pad=1, kernel=3)
-        let h0 = 128u32; let w0 = mel_frames;
-        let h1 = (h0 + 2 - 3) / 2 + 1; // 64
-        let w1 = (w0 + 2 - 3) / 2 + 1;
-        let h2 = (h1 + 2 - 3) / 2 + 1; // 32
-        let w2 = (w1 + 2 - 3) / 2 + 1;
-        let h3 = (h2 + 2 - 3) / 2 + 1; // 16
-        let w3 = (w2 + 2 - 3) / 2 + 1;
-        let n_tokens = w3;
-        let proj_dim = CONV_HIDDEN * h3; // 480 * 16 = 7680
-
-        // Upload mel to GPU
-        let mel_buf = self.gpu.upload_buffer("conv_mel", bytemuck::cast_slice(mel));
-
-        // Params uniform for conv dispatches
-        let params = self.gpu.create_buffer("conv_params", 32,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-
-        // Conv1: [1, 128, w0] → [480, 64, w1]
-        let c1_size = (CONV_HIDDEN * h1 * w1) as u64 * 4;
-        let c1_buf = self.gpu.create_storage_buffer("conv1_out", c1_size);
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct ConvParams { c_in: u32, h_in: u32, w_in: u32, h_out: u32, w_out: u32, _pad: [u32; 3] }
-        self.gpu.flush();
-        self.gpu.write_buffer(&params, 0, bytemuck::bytes_of(&ConvParams {
-            c_in: 1, h_in: h0, w_in: w0, h_out: h1, w_out: w1, _pad: [0; 3]
-        }));
-        let shader1 = build_conv2d_gelu_shader(1, CONV_HIDDEN);
-        self.gpu.dispatch("conv_stem_1", &shader1, &[
-            bind(0, &mel_buf), bind(1, &self.conv.conv1_w), bind(2, &self.conv.conv1_b),
-            bind(3, &c1_buf), bind(4, &params),
-        ], ((CONV_HIDDEN * h1 * w1).div_ceil(256), 1, 1));
-
-        // Conv2: [480, h1, w1] → [480, h2, w2]
-        let c2_size = (CONV_HIDDEN * h2 * w2) as u64 * 4;
-        let c2_buf = self.gpu.create_storage_buffer("conv2_out", c2_size);
-        self.gpu.flush();
-        self.gpu.write_buffer(&params, 0, bytemuck::bytes_of(&ConvParams {
-            c_in: CONV_HIDDEN, h_in: h1, w_in: w1, h_out: h2, w_out: w2, _pad: [0; 3]
-        }));
-        let shader2 = build_conv2d_gelu_shader(CONV_HIDDEN, CONV_HIDDEN);
-        self.gpu.dispatch("conv_stem_2", &shader2, &[
-            bind(0, &c1_buf), bind(1, &self.conv.conv2_w), bind(2, &self.conv.conv2_b),
-            bind(3, &c2_buf), bind(4, &params),
-        ], ((CONV_HIDDEN * h2 * w2).div_ceil(256), 1, 1));
-
-        // Conv3: [480, h2, w2] → [480, h3, w3]
-        let c3_size = (CONV_HIDDEN * h3 * w3) as u64 * 4;
-        let c3_buf = self.gpu.create_storage_buffer("conv3_out", c3_size);
-        self.gpu.flush();
-        self.gpu.write_buffer(&params, 0, bytemuck::bytes_of(&ConvParams {
-            c_in: CONV_HIDDEN, h_in: h2, w_in: w2, h_out: h3, w_out: w3, _pad: [0; 3]
-        }));
-        self.gpu.dispatch("conv_stem_3", &shader2, &[
-            bind(0, &c2_buf), bind(1, &self.conv.conv3_w), bind(2, &self.conv.conv3_b),
-            bind(3, &c3_buf), bind(4, &params),
-        ], ((CONV_HIDDEN * h3 * w3).div_ceil(256), 1, 1));
-
-        // Reshape [480, h3, w3] → [w3, 480*h3] + Linear proj → [w3, d_model] + sinusoidal PE
-        // Fused into one shader: reads conv3 output, reshapes, does matvec with proj_w, adds PE
-        let out_size = (n_tokens * d_model) as u64 * 4;
-        let out_buf = self.gpu.create_storage_buffer("conv_stem_out", out_size);
-        self.gpu.flush();
-        #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-        struct ProjParams { h3: u32, w3: u32, d_model: u32, _pad: u32 }
-        let proj_params = self.gpu.create_buffer("proj_params", 16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-        self.gpu.write_buffer(&proj_params, 0, bytemuck::bytes_of(&ProjParams {
-            h3, w3, d_model, _pad: 0
-        }));
-        let proj_shader = build_reshape_proj_pe_shader();
-        self.gpu.dispatch("conv_proj_pe", &proj_shader, &[
-            bind(0, &c3_buf), bind(1, &self.conv.proj_w),
-            bind(2, &out_buf), bind(3, &proj_params),
-        ], (n_tokens, d_model.div_ceil(32), 1));
-
-        // Read back
-        self.gpu.flush();
-        let bytes = self.gpu.read_buffer(&out_buf, out_size);
-        let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
-        (result, n_tokens)
     }
 
     /// Run the encoder transformer on GPU.
@@ -370,7 +222,7 @@ impl AsrEncoder {
         log::info!("[asr-encoder] buffers allocated in {}ms, seq_len={}", alloc_ms, seq_len);
 
         // ── Split borrows for transformer layers + output projection ──
-        let Self { gpu, layers, conv: _, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
+        let Self { gpu, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
 
         let x_cur = gpu.create_storage_buffer("enc_x_cur", buf_size);
         gpu.copy_buffer(&x, &x_cur, buf_size);
@@ -537,127 +389,6 @@ fn dispatch_bidir_attn(
     gpu.dispatch("qwen_asr_bidir_attn", shaders::BIDIR_ATTN, &[
         bind(0, q), bind(1, k), bind(2, v), bind(3, output), bind(4, params),
     ], (num_heads, seq_len, 1));
-}
-
-// ── Conv stem shader builders ───────────────────────────────────────────
-
-/// Conv2D + GELU shader. c_in and c_out are baked as constants.
-/// Spatial dims (h_in, w_in, h_out, w_out) come from uniform params.
-/// Kernel: 3×3, stride=2, padding=1.
-pub fn build_conv2d_gelu_shader(c_in: u32, c_out: u32) -> String {
-    format!("\
-const C_IN: u32 = {c_in}u;
-const C_OUT: u32 = {c_out}u;
-
-struct Params {{ c_in: u32, h_in: u32, w_in: u32, h_out: u32, w_out: u32, }}
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weight: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let idx = gid.x;
-    let total = C_OUT * p.h_out * p.w_out;
-    if (idx >= total) {{ return; }}
-    let oc = idx / (p.h_out * p.w_out);
-    let rem = idx % (p.h_out * p.w_out);
-    let oh = rem / p.w_out;
-    let ow = rem % p.w_out;
-    var sum = bias[oc];
-    let w_base = oc * C_IN * 9u;
-    for (var ic: u32 = 0u; ic < C_IN; ic++) {{
-        let ic_base = w_base + ic * 9u;
-        let in_base = ic * p.h_in * p.w_in;
-        for (var kh: u32 = 0u; kh < 3u; kh++) {{
-            let ih = oh * 2u + kh;
-            if (ih == 0u || ih > p.h_in) {{ continue; }}
-            let ih_adj = ih - 1u;
-            let row_base = in_base + ih_adj * p.w_in;
-            for (var kw: u32 = 0u; kw < 3u; kw++) {{
-                let iw = ow * 2u + kw;
-                if (iw == 0u || iw > p.w_in) {{ continue; }}
-                sum += input[row_base + iw - 1u] * weight[ic_base + kh * 3u + kw];
-            }}
-        }}
-    }}
-    // GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    let x = sum;
-    let cdf = 0.5 * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
-    output[idx] = x * cdf;
-}}", c_in=c_in, c_out=c_out)
-}
-
-/// Fused reshape + linear projection + sinusoidal PE.
-/// Reads conv3 output [480, h3, w3], reshapes to [w3, 480*h3],
-/// multiplies by proj_w [d_model, 480*h3], adds sinusoidal PE.
-/// Dispatch: (w3, ceil(d_model/32), 1) — one thread per (token, d_model_chunk).
-pub fn build_reshape_proj_pe_shader() -> String {
-    format!("\
-const CONV_H: u32 = {ch}u;
-
-struct Params {{ h3: u32, w3: u32, d_model: u32, }}
-
-@group(0) @binding(0) var<storage, read> conv3: array<f32>;
-@group(0) @binding(1) var<storage, read> proj_w: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<uniform> p: Params;
-
-@compute @workgroup_size(32)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
-    let t = wg.x;    // token index (0..w3)
-    let d = wg.y * 32u + lid.x;  // d_model index
-    if (t >= p.w3 || d >= p.d_model) {{ return; }}
-    let proj_dim = CONV_H * p.h3;
-    // Reshape: conv3[ch, f, w3] → reshaped[t, ch*h3+f]
-    // Then dot product with proj_w[d, :]
-    var sum: f32 = 0.0;
-    let w_base = d * proj_dim;
-    for (var ch: u32 = 0u; ch < CONV_H; ch++) {{
-        for (var f: u32 = 0u; f < p.h3; f++) {{
-            let k = ch * p.h3 + f;
-            let conv_idx = ch * p.h3 * p.w3 + f * p.w3 + t;
-            sum += conv3[conv_idx] * proj_w[w_base + k];
-        }}
-    }}
-    // Sinusoidal PE: pe[t, d] = sin/cos(t / 10000^(2*floor(d/2)/d_model))
-    let half_d = d / 2u;
-    let freq = 1.0 / pow(10000.0, f32(half_d * 2u) / f32(p.d_model));
-    let angle = f32(t) * freq;
-    let pe = select(cos(angle), sin(angle), d % 2u == 0u);
-    output[t * p.d_model + d] = sum + pe;
-}}", ch=CONV_HIDDEN)
-}
-
-/// Transpose conv2d weights from MLX [out,kH,kW,in] to PyTorch [out,in,kH,kW] if needed.
-fn transpose_conv2d_if_mlx(w: &[f32], c_out: usize, c_in: usize, kh: usize, kw: usize) -> Vec<f32> {
-    if c_in <= 1 { return w.to_vec(); } // can't detect for depthwise
-    // MLX layout: inner stride is c_in (adjacent values span input channels)
-    // PyTorch: inner stride is 1 (adjacent values span kW)
-    // Heuristic: compare variance at c_in stride vs unit stride
-    let stride = c_in;
-    if stride > kw && w.len() > stride * 2 {
-        let unit_var: f32 = (0..kw.min(3)).map(|i| (w[i] - w[0]).abs()).sum();
-        let strided_var: f32 = (0..kw.min(3)).map(|i| (w[i * stride] - w[0]).abs()).sum();
-        if strided_var >= unit_var { return w.to_vec(); } // already PyTorch layout
-    } else {
-        return w.to_vec();
-    }
-    log::info!("encoder: transposing conv2d weights from MLX layout ({}x{}x{}x{})", c_out, c_in, kh, kw);
-    let mut out = vec![0.0f32; c_out * c_in * kh * kw];
-    for oc in 0..c_out {
-        for ic in 0..c_in {
-            for h in 0..kh {
-                for wi in 0..kw {
-                    out[oc * c_in * kh * kw + ic * kh * kw + h * kw + wi] =
-                        w[oc * kh * kw * c_in + h * kw * c_in + wi * c_in + ic];
-                }
-            }
-        }
-    }
-    out
 }
 
 /// In-place add: a[i] += b[i].
