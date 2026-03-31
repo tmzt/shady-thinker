@@ -39,6 +39,7 @@ impl GpuContext {
         self.max_storage_binding
     }
 
+
     async fn init() -> Self {
         log::info!("[shady-thinker] requesting GPU adapter (Vulkan preferred)...");
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
