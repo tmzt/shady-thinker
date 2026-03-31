@@ -22,7 +22,7 @@ path = "tests/integration/jit_lora_test.rs"
 required-features = ["jit-lora"]
 
 [dependencies]
-wgpu = "24"
+wgpu = { version = "29", features = ["vulkan"] }
 pollster = "0.4"
 safetensors = "0.4"
 half = { version = "2", features = ["bytemuck"] }

@@ -11,7 +11,7 @@ pub struct GpuContext {
     bind_group_cache: HashMap<BindGroupKey, wgpu::BindGroup>,
     encoder: Option<wgpu::CommandEncoder>,
     pending_dispatches: u32,
-    max_storage_binding: u32,
+    max_storage_binding: u64,
 }
 
 impl GpuContext {
@@ -35,17 +35,14 @@ impl GpuContext {
         }
     }
 
-    pub fn max_storage_binding_size(&self) -> u32 {
+    pub fn max_storage_binding_size(&self) -> u64 {
         self.max_storage_binding
     }
 
 
     async fn init() -> Self {
         log::info!("[shady-thinker] requesting GPU adapter (Vulkan preferred)...");
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
-            ..Default::default()
-        });
+        let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -67,21 +64,19 @@ impl GpuContext {
         // For LLM: ensure large enough for embedding tables (~1GB for 248K vocab).
         // For ASR encoder: adapter defaults are sufficient (~128MB).
         // Only request larger if the adapter already supports it.
-        if limits.max_storage_buffer_binding_size >= (1u32 << 30) as u32 {
+        if limits.max_storage_buffer_binding_size >= (1u64 << 30) {
             limits.max_buffer_size = limits.max_buffer_size.max(1u64 << 31);
         }
         // Don't override max_storage_buffer_binding_size — use adapter's native limit.
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("shady-thinker"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("shady-thinker"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            })
             .await
             .expect("failed to create device");
 
@@ -132,7 +127,7 @@ impl GpuContext {
         }
         // Flush and wait for completion
         self.queue.submit(std::iter::empty());
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely());
         buffer
     }
 
@@ -294,7 +289,7 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).unwrap();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range().to_vec();
@@ -314,7 +309,7 @@ impl GpuContext {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range().to_vec();
         staging.unmap();
