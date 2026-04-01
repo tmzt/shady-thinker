@@ -26,6 +26,16 @@ pub struct GenerateResult {
     pub interrupted: bool,
 }
 
+/// Configurable think token injection for reasoning models.
+pub struct ThinkConfig {
+    /// Token IDs to inject after prefill to enter thinking mode.
+    /// For Qwen3.5: the tokenized `<think>\n` sequence.
+    pub think_prefix_ids: Vec<u32>,
+    /// Token ID(s) that mark end of thinking (e.g. `</think>`).
+    /// Generation won't stop at these — they just mark the boundary.
+    pub think_end_ids: Vec<u32>,
+}
+
 /// Pure inference session: model + GPU context.
 ///
 /// No tokenizer, no chat template, no conversation log.
@@ -34,6 +44,8 @@ pub struct InferenceSession {
     pub model: Model,
     pub gpu: GpuContext,
     pub config: ModelConfig,
+    /// Optional think token injection config.
+    pub think_config: Option<ThinkConfig>,
 }
 
 impl InferenceSession {
@@ -58,7 +70,12 @@ impl InferenceSession {
         }
 
         log::info!("[shady-thinker] model ready");
-        Self { model, gpu, config }
+        Self { model, gpu, config, think_config: None }
+    }
+
+    /// Set think token injection config for reasoning models.
+    pub fn set_think_config(&mut self, config: ThinkConfig) {
+        self.think_config = Some(config);
     }
 
     /// Load a LoRA adapter from safetensors file.
@@ -73,12 +90,37 @@ impl InferenceSession {
     /// Resets KV cache before generation. Prefills all input tokens,
     /// then generates up to `max_tokens` new tokens. Stops at any token
     /// in `eos_ids`.
+    ///
+    /// If `inject_think` is true and `think_config` is set, the think prefix
+    /// tokens are injected after prefill to force the model into reasoning mode.
     pub fn generate_tokens(
         &mut self,
         input_ids: &[u32],
         max_tokens: u32,
         eos_ids: &[u32],
         cancel: Option<&AtomicBool>,
+    ) -> GenerateResult {
+        self.generate_tokens_inner(input_ids, max_tokens, eos_ids, cancel, false)
+    }
+
+    /// Generate with think token injection (forces reasoning mode).
+    pub fn generate_tokens_thinking(
+        &mut self,
+        input_ids: &[u32],
+        max_tokens: u32,
+        eos_ids: &[u32],
+        cancel: Option<&AtomicBool>,
+    ) -> GenerateResult {
+        self.generate_tokens_inner(input_ids, max_tokens, eos_ids, cancel, true)
+    }
+
+    fn generate_tokens_inner(
+        &mut self,
+        input_ids: &[u32],
+        max_tokens: u32,
+        eos_ids: &[u32],
+        cancel: Option<&AtomicBool>,
+        inject_think: bool,
     ) -> GenerateResult {
         if input_ids.is_empty() {
             return GenerateResult {
@@ -103,7 +145,47 @@ impl InferenceSession {
         let prefill_ms = prefill_start.elapsed().as_millis();
         log::info!("[shady-thinker] prefill: {} tokens in {}ms", input_ids.len() - 1, prefill_ms);
 
-        // First decode step
+        // Inject think prefix tokens if requested
+        if inject_think {
+            if let Some(ref tc) = self.think_config {
+                let think_ids = tc.think_prefix_ids.clone();
+                log::info!("[shady-thinker] injecting {} think prefix tokens", think_ids.len());
+                // Feed last input token + think prefix through prefill
+                self.model.forward(&mut self.gpu, input_ids[input_ids.len() - 1]);
+                for &tok in &think_ids[..think_ids.len().saturating_sub(1)] {
+                    self.model.forward(&mut self.gpu, tok);
+                }
+                // Use last think token as the first decode input
+                let decode_start = std::time::Instant::now();
+                let last_think = *think_ids.last().unwrap_or(&input_ids[input_ids.len() - 1]);
+                let mut token = self.model.forward(&mut self.gpu, last_think);
+                let mut generated = Vec::new();
+                // Include think prefix in output so caller can see <think>..
+                for &t in &think_ids {
+                    generated.push(t);
+                }
+                let mut interrupted = false;
+                for _ in 0..max_tokens {
+                    if eos_ids.contains(&token) { break; }
+                    if let Some(flag) = cancel {
+                        if flag.load(Ordering::Relaxed) { interrupted = true; break; }
+                    }
+                    generated.push(token);
+                    token = self.model.forward(&mut self.gpu, token);
+                }
+                let elapsed = decode_start.elapsed();
+                let count = generated.len();
+                let tps = if count > 0 { count as f64 / elapsed.as_secs_f64() } else { 0.0 };
+                log::info!("[shady-thinker] decode (think): {} tokens in {:.0}ms ({:.1} tok/s)",
+                    count, elapsed.as_millis(), tps);
+                return GenerateResult {
+                    token_ids: generated, token_count: count,
+                    tokens_per_sec: tps, interrupted,
+                };
+            }
+        }
+
+        // First decode step (normal path)
         let decode_start = std::time::Instant::now();
         let mut token = self.model.forward(&mut self.gpu, input_ids[input_ids.len() - 1]);
         let mut generated = Vec::new();
