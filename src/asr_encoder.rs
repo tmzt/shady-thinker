@@ -287,17 +287,27 @@ impl AsrEncoder {
 
         // Readback
         let result_bytes = gpu.read_buffer(&output_buf, out_size);
-        let result: &[f32] = bytemuck::cast_slice(&result_bytes);
+        let result: Vec<f32> = result_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
 
         let total_ms = t0.elapsed().as_millis();
         log::info!("[asr-encoder] forward: {}ms for {} tokens ({} layers)",
             total_ms, seq_len, num_layers);
 
-        result.to_vec()
+        result
     }
 
     fn parse_config(path: &Path) -> AsrEncoderConfig {
-        let text = std::fs::read_to_string(path).expect("config.json not found");
+        let config_path = path.join("config.json");
+        if !config_path.exists() {
+            log::warn!("asr: config.json not found at {:?}, using defaults", config_path);
+            return AsrEncoderConfig {
+                d_model: 1024, num_layers: 24, num_heads: 16, head_dim: 64, ffn_dim: 4096, output_dim: 2048
+            };
+        }
+        let text = std::fs::read_to_string(&config_path).expect("failed to read config.json");
         let v: serde_json::Value = serde_json::from_str(&text).expect("invalid config.json");
 
         // Config path: thinker_config.audio_config or audio_config (Qwen3-ASR format)

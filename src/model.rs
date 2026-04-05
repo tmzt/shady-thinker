@@ -2,6 +2,7 @@ use crate::gpu::{self, GpuContext};
 #[cfg(feature = "jit-lora")]
 use crate::lora::LoraState;
 use crate::weights::{ModelConfig, ModelWeights, QuantConfig};
+use std::cell::Cell;
 
 mod shaders {
     pub const GPTQ_MATVEC_4T: &str = include_str!("shaders/gptq_matvec_4t.wgsl");
@@ -102,7 +103,11 @@ pub struct InferenceState {
     pub v_cache: Vec<wgpu::Buffer>,
     pub logits: wgpu::Buffer,
     pub argmax_result: wgpu::Buffer,
+    /// Legacy single params buffer — kept for code paths that still use write_params externally.
     pub params: wgpu::Buffer,
+    /// Ring of uniform buffers so all dispatches in one token forward can share a
+    /// single command encoder (no flush between ops). Each op claims a unique slot.
+    pub params_ring: Vec<wgpu::Buffer>,
     pub qknorm_params: Vec<wgpu::Buffer>,
     /// Bitmap of seen tokens for GPU repetition penalty (vocab_size/32 u32s)
     pub seen_bitmap: wgpu::Buffer,
@@ -126,6 +131,9 @@ pub struct InferenceState {
 const NUM_ATTN_SPLITS: u32 = 1; // 1 = no multi-split, single-pass online softmax
 /// Number of top-K candidates extracted on GPU for sampling
 const TOPK_K: u32 = 20;
+/// Number of params uniform slots in the ring buffer.
+/// Must be >= max dispatches between flush() calls (one full token forward pass ≈ 500 ops).
+const PARAMS_RING_SIZE: usize = 512;
 
 /// Swappable per-sequence state: KV caches + DeltaNet recurrent state.
 /// Allocate multiple slots to run different prompts without destroying context.
@@ -176,6 +184,9 @@ pub struct Model {
     prefill_kv_only: bool,
     /// CPU-side copy of seen_bitmap for incremental updates (one word written per token)
     pub seen_bitmap_cpu: Vec<u32>,
+    /// Ring position for params uniform slots — wraps at PARAMS_RING_SIZE.
+    /// Cell<> so write_params can take &self (no exclusive borrow needed).
+    params_ring_idx: Cell<usize>,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
     linear_key_dim: u32,
@@ -320,6 +331,13 @@ impl Model {
                 256,
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ),
+            params_ring: (0..PARAMS_RING_SIZE)
+                .map(|i| gpu.create_buffer(
+                    &format!("pr{i}"),
+                    256,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                ))
+                .collect(),
             qknorm_params,
             seen_bitmap: {
                 let words = config.vocab_size.div_ceil(32);
@@ -411,6 +429,7 @@ impl Model {
             tied_embeddings,
             prefill_kv_only: false,
             seen_bitmap_cpu: vec![0u32; vocab_size_for_bitmap.div_ceil(32) as usize],
+            params_ring_idx: Cell::new(0),
             qknorm_shader_src,
         }
     }
@@ -435,11 +454,26 @@ impl Model {
         self.qknorm_shader_src = build_qknorm_shader_full(&self.config, self.q_gated, norm_offset);
     }
 
-    pub fn write_params(&self, gpu: &mut GpuContext, data: &[u8]) {
-        // Must flush pending dispatches before overwriting params uniform,
-        // otherwise previous dispatches would read the new params value.
-        gpu.flush();
-        gpu.write_buffer(&self.state.params, 0, data);
+    /// Claim the next params ring slot, write `data` to it, and return `&self` (for chaining).
+    /// No flush — each op gets its own unique buffer slot, so no write hazard.
+    /// All dispatches within one token forward accumulate in a single command encoder.
+    pub(crate) fn write_params(&self, gpu: &GpuContext, data: &[u8]) {
+        let idx = self.params_ring_idx.get();
+        self.params_ring_idx.set((idx + 1) % PARAMS_RING_SIZE);
+        gpu.write_buffer(&self.state.params_ring[idx], 0, data);
+    }
+
+    /// Return the last-claimed params ring buffer (valid until next `write_params` call).
+    #[inline(always)]
+    pub(crate) fn params(&self) -> &wgpu::Buffer {
+        let prev = (self.params_ring_idx.get() + PARAMS_RING_SIZE - 1) % PARAMS_RING_SIZE;
+        &self.state.params_ring[prev]
+    }
+
+    /// Reset ring position. Call at the start of each token forward pass so we
+    /// don't exhaust the ring on very long sequences.
+    fn reset_params_ring(&self) {
+        self.params_ring_idx.set(0);
     }
 
     // ── Dispatch helpers ──────────────────────────────────────────────
@@ -939,23 +973,20 @@ impl Model {
 
     pub fn forward(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
         let h = self.config.hidden_size;
-
-        // 1. Embedding (flush after to ensure params aren't overwritten)
+        self.reset_params_ring();
         self.embedding(gpu, token_id);
-        gpu.flush();
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
-
-        // 2. Layers + LM head + sampling
         self.forward_layers(gpu)
     }
 
     /// Prefill-only forward pass: runs embedding + all layers + KV cache update,
-    /// but skips lm_head and the GPU→CPU logit readback. No device sync.
-    /// Use for all but the last prefill token to avoid 607KB/token readback overhead.
+    /// but skips lm_head and the GPU→CPU logit readback.
+    /// All dispatches for this token accumulate in one encoder; submit happens at the next
+    /// read_buffer call (or explicit flush).
     pub fn forward_kv_only(&mut self, gpu: &mut GpuContext, token_id: u32) {
         let h = self.config.hidden_size;
+        self.reset_params_ring();
         self.embedding(gpu, token_id);
-        gpu.flush();
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.prefill_kv_only = true;
         self.forward_layers(gpu);
@@ -966,9 +997,8 @@ impl Model {
     /// Used for ASR decoder where encoder output embeddings are injected directly.
     pub fn forward_embed(&mut self, gpu: &mut GpuContext, embed: &[f32]) -> u32 {
         let h = self.config.hidden_size;
-        // Write raw embedding to hidden buffer
+        self.reset_params_ring();
         gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(embed));
-        gpu.flush();
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.forward_layers(gpu)
     }
