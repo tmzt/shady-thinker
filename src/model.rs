@@ -33,6 +33,10 @@ mod shaders {
     pub const FUSED_SILU_INT4_MLX: &str = include_str!("shaders/fused_silu_int4_mlx.wgsl");
     pub const INT4_EMBEDDING_MLX: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
 
+    // Sampling shaders
+    pub const SAMPLE_PENALTY_TEMP: &str = include_str!("shaders/sample_penalty_temp.wgsl");
+    pub const SAMPLE_TOPK: &str = include_str!("shaders/sample_topk.wgsl");
+
     // LoRA shaders
     #[cfg(feature = "jit-lora")]
     pub const LORA_DOWN: &str = include_str!("shaders/lora_down.wgsl");
@@ -100,6 +104,14 @@ pub struct InferenceState {
     pub argmax_result: wgpu::Buffer,
     pub params: wgpu::Buffer,
     pub qknorm_params: Vec<wgpu::Buffer>,
+    /// Bitmap of seen tokens for GPU repetition penalty (vocab_size/32 u32s)
+    pub seen_bitmap: wgpu::Buffer,
+    /// Top-K output from GPU sampler: array of {idx: u32, val: f32}, length TOPK_K
+    pub topk_out: wgpu::Buffer,
+    /// Uniform buffer for penalty+temperature shader
+    pub penalty_uniform: wgpu::Buffer,
+    /// Uniform buffer for top-k shader
+    pub topk_uniform: wgpu::Buffer,
 
     // DeltaNet state (per linear-attn layer)
     pub deltanet_qkv: wgpu::Buffer,      // [total_channels] for conv input
@@ -112,6 +124,8 @@ pub struct InferenceState {
 
 /// Number of attention splits for GQA (trade off parallelism vs overhead)
 const NUM_ATTN_SPLITS: u32 = 1; // 1 = no multi-split, single-pass online softmax
+/// Number of top-K candidates extracted on GPU for sampling
+const TOPK_K: u32 = 20;
 
 /// Swappable per-sequence state: KV caches + DeltaNet recurrent state.
 /// Allocate multiple slots to run different prompts without destroying context.
@@ -157,6 +171,11 @@ pub struct Model {
     /// Which projection within a layer: 0=q,1=k,2=v,3=o,4=gate,5=up,6=down
     mlx_current_proj: usize,
     tied_embeddings: bool,
+    /// When true, skip lm_head + logit readback. Set during prefill to avoid
+    /// 607KB GPU→CPU sync per token; only the final decode step needs the readback.
+    prefill_kv_only: bool,
+    /// CPU-side copy of seen_bitmap for incremental updates (one word written per token)
+    pub seen_bitmap_cpu: Vec<u32>,
     qknorm_shader_src: String,
     linear_num_key_heads: u32,
     linear_key_dim: u32,
@@ -274,7 +293,7 @@ impl Model {
             v_out: gpu.create_storage_buffer("v_out", (nkv * hd) as u64 * f),
             attn_output: gpu.create_storage_buffer("attn_output", (nh * hd) as u64 * f),
             attn_partials: gpu.create_storage_buffer("attn_partials", partials_size),
-            o_proj_out: gpu.create_storage_buffer("o_proj_out", h as u64 * f),
+            o_proj_out: gpu.create_storage_buffer("o_proj_out", h.max(nh * hd) as u64 * f),
             gate_out: gpu.create_storage_buffer("gate_out", inter as u64 * f),
             up_out: gpu.create_storage_buffer("up_out", inter as u64 * f),
             mlp_output: gpu.create_storage_buffer("mlp_output", h as u64 * f),
@@ -302,6 +321,21 @@ impl Model {
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ),
             qknorm_params,
+            seen_bitmap: {
+                let words = config.vocab_size.div_ceil(32);
+                gpu.create_storage_buffer("seen_bitmap", words as u64 * 4)
+            },
+            topk_out: gpu.create_storage_buffer("topk_out", TOPK_K as u64 * 8),
+            penalty_uniform: gpu.create_buffer(
+                "penalty_uniform",
+                64, // PenaltyParams struct: 4*4 + 4*4 + 4 = 48 bytes, pad to 64
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            topk_uniform: gpu.create_buffer(
+                "topk_uniform",
+                16, // TopkParams: vocab_size + 3 pad = 16 bytes
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
 
             // DeltaNet buffers
             deltanet_qkv: {
@@ -348,6 +382,7 @@ impl Model {
 
         let tied_embeddings = config.tie_word_embeddings;
         let qknorm_shader_src = build_qknorm_shader(&config);
+        let vocab_size_for_bitmap = config.vocab_size;
 
         Self {
             linear_num_key_heads: config.linear_num_key_heads,
@@ -374,6 +409,8 @@ impl Model {
             mlx_current_layer: 0,
             mlx_current_proj: 0,
             tied_embeddings,
+            prefill_kv_only: false,
+            seen_bitmap_cpu: vec![0u32; vocab_size_for_bitmap.div_ceil(32) as usize],
             qknorm_shader_src,
         }
     }
@@ -912,6 +949,19 @@ impl Model {
         self.forward_layers(gpu)
     }
 
+    /// Prefill-only forward pass: runs embedding + all layers + KV cache update,
+    /// but skips lm_head and the GPU→CPU logit readback. No device sync.
+    /// Use for all but the last prefill token to avoid 607KB/token readback overhead.
+    pub fn forward_kv_only(&mut self, gpu: &mut GpuContext, token_id: u32) {
+        let h = self.config.hidden_size;
+        self.embedding(gpu, token_id);
+        gpu.flush();
+        gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
+        self.prefill_kv_only = true;
+        self.forward_layers(gpu);
+        self.prefill_kv_only = false;
+    }
+
     /// Forward pass with raw f32 embedding instead of token ID lookup.
     /// Used for ASR decoder where encoder output embeddings are injected directly.
     pub fn forward_embed(&mut self, gpu: &mut GpuContext, embed: &[f32]) -> u32 {
@@ -1068,6 +1118,14 @@ impl Model {
         self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
             &self.weights.final_norm, &self.state.normed, h);
 
+        self.seq_len += 1;
+
+        // Prefill-only mode: skip lm_head + GPU→CPU readback (607KB per token).
+        // Only the final decode step needs the logit readback.
+        if self.prefill_kv_only {
+            return 0;
+        }
+
         // LM head
         if self.tied_embeddings {
             self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
@@ -1079,122 +1137,154 @@ impl Model {
                 &self.state.logits, h, self.config.vocab_size);
         }
 
-        self.seq_len += 1;
-
         #[cfg(feature = "jit-lora")]
         if self.training_mode {
             return 0;
         }
 
-        self.sample_token(gpu)
+        self.sample_token_gpu(gpu)
     }
 
-    /// Read logits from GPU and sample a token.
-    fn sample_token(&mut self, gpu: &mut GpuContext) -> u32 {
-        let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
-        let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
-        let mut logits_vec = logits.to_vec();
-
-        // Repetition penalty
+    /// GPU-accelerated sampling:
+    ///   1. Apply repetition penalty + presence penalty + temperature on GPU (1 dispatch, O(V))
+    ///   2. Extract top-K candidates on GPU (1 dispatch, O(K·V) in one workgroup, no readback of full logits)
+    ///   3. CPU reads TOPK_K * 8 = 160 bytes, does softmax + top-p nucleus sampling
+    ///
+    /// Reduces GPU→CPU transfer from 607KB (full logits) to 160 bytes.
+    fn sample_token_gpu(&mut self, gpu: &mut GpuContext) -> u32 {
+        let vocab = self.config.vocab_size;
         let rep_penalty = 1.0f32;
         let presence_penalty = 1.5f32;
-        {
-            let mut seen = std::collections::HashSet::<u32>::new();
-            for &tok in &self.generated_tokens {
-                seen.insert(tok);
-            }
-            for &tok in &seen {
-                let idx = tok as usize;
-                if idx < logits_vec.len() {
-                    if logits_vec[idx] > 0.0 {
-                        logits_vec[idx] /= rep_penalty.max(1.001);
-                    } else {
-                        logits_vec[idx] *= rep_penalty.max(1.001);
-                    }
-                    logits_vec[idx] -= presence_penalty;
-                }
-            }
-        }
+        let temperature = 0.7f32;
 
-        // Hard ban: repeated tokens
+        // ── Hard-ban: compute up to 6 banned token IDs on CPU ──────────────
         let n = self.generated_tokens.len();
+        let mut bans = [u32::MAX; 6];
+        let mut n_bans = 0u32;
+
         if n >= 2 && self.generated_tokens[n-1] == self.generated_tokens[n-2] {
-            let banned = self.generated_tokens[n-1] as usize;
-            if banned < logits_vec.len() {
-                logits_vec[banned] = f32::NEG_INFINITY;
-            }
+            bans[n_bans as usize] = self.generated_tokens[n-1]; n_bans += 1;
         }
         if n >= 4
             && self.generated_tokens[n-1] == self.generated_tokens[n-3]
             && self.generated_tokens[n-2] == self.generated_tokens[n-4]
         {
-            for &banned_tok in &[self.generated_tokens[n-1], self.generated_tokens[n-2]] {
-                let idx = banned_tok as usize;
-                if idx < logits_vec.len() {
-                    logits_vec[idx] = f32::NEG_INFINITY;
-                }
-            }
+            bans[n_bans as usize] = self.generated_tokens[n-1]; n_bans += 1;
+            bans[n_bans as usize] = self.generated_tokens[n-2]; n_bans += 1;
         }
         if n >= 6
             && self.generated_tokens[n-1] == self.generated_tokens[n-4]
             && self.generated_tokens[n-2] == self.generated_tokens[n-5]
             && self.generated_tokens[n-3] == self.generated_tokens[n-6]
         {
-            let idx = self.generated_tokens[n-1] as usize;
-            if idx < logits_vec.len() {
-                logits_vec[idx] = f32::NEG_INFINITY;
-            }
+            bans[n_bans as usize] = self.generated_tokens[n-1]; n_bans += 1;
         }
 
-        // Temperature
-        let temperature = 0.7f32;
-        let vocab_size = logits_vec.len();
-        for v in logits_vec.iter_mut() {
-            *v /= temperature;
+        // ── Upload penalty uniform ─────────────────────────────────────────
+        // PenaltyParams layout (48 bytes, padded to 64):
+        //   u32 vocab_size, f32 rep_penalty, f32 presence_penalty, f32 temperature
+        //   u32 ban0..ban3  (16 bytes)
+        //   u32 ban4, ban5, u32 n_bans, u32 _pad
+        let mut pu = [0u8; 64];
+        pu[0..4].copy_from_slice(&vocab.to_le_bytes());
+        pu[4..8].copy_from_slice(&rep_penalty.to_le_bytes());
+        pu[8..12].copy_from_slice(&presence_penalty.to_le_bytes());
+        pu[12..16].copy_from_slice(&temperature.to_le_bytes());
+        pu[16..20].copy_from_slice(&bans[0].to_le_bytes());
+        pu[20..24].copy_from_slice(&bans[1].to_le_bytes());
+        pu[24..28].copy_from_slice(&bans[2].to_le_bytes());
+        pu[28..32].copy_from_slice(&bans[3].to_le_bytes());
+        pu[32..36].copy_from_slice(&bans[4].to_le_bytes());
+        pu[36..40].copy_from_slice(&bans[5].to_le_bytes());
+        pu[40..44].copy_from_slice(&n_bans.to_le_bytes());
+        gpu.flush();
+        gpu.write_buffer(&self.state.penalty_uniform, 0, &pu);
+
+        // ── Upload topk uniform ────────────────────────────────────────────
+        let mut tu = [0u8; 16];
+        tu[0..4].copy_from_slice(&vocab.to_le_bytes());
+        gpu.write_buffer(&self.state.topk_uniform, 0, &tu);
+
+        // ── Dispatch penalty+temperature shader ────────────────────────────
+        gpu.dispatch(
+            "sample_penalty_temp",
+            shaders::SAMPLE_PENALTY_TEMP,
+            &[
+                gpu::bind(0, &self.state.logits),
+                gpu::bind(1, &self.state.seen_bitmap),
+                gpu::bind(2, &self.state.penalty_uniform),
+            ],
+            (vocab.div_ceil(256), 1, 1),
+        );
+
+        // ── Dispatch top-K extraction shader ──────────────────────────────
+        // Single workgroup scans all vocab positions K times.
+        // Writes top-K {idx, val} to topk_out. Destroys logits in-place.
+        gpu.dispatch(
+            "sample_topk",
+            shaders::SAMPLE_TOPK,
+            &[
+                gpu::bind(0, &self.state.logits),
+                gpu::bind(1, &self.state.topk_out),
+                gpu::bind(2, &self.state.topk_uniform),
+            ],
+            (1, 1, 1),
+        );
+
+        // ── Read back only the top-K candidates (160 bytes) ───────────────
+        let topk_bytes = gpu.read_buffer(&self.state.topk_out, TOPK_K as u64 * 8);
+        // Each candidate is {idx: u32, val: f32} = 8 bytes
+        let mut candidates: Vec<(u32, f32)> = (0..TOPK_K as usize)
+            .map(|i| {
+                let base = i * 8;
+                let idx = u32::from_le_bytes(topk_bytes[base..base+4].try_into().unwrap());
+                let val = f32::from_le_bytes(topk_bytes[base+4..base+8].try_into().unwrap());
+                (idx, val)
+            })
+            .filter(|&(_, v)| v.is_finite())
+            .collect();
+
+        if candidates.is_empty() {
+            // Fallback: return first candidate unconditionally
+            let idx = u32::from_le_bytes(topk_bytes[0..4].try_into().unwrap());
+            self.last_token_prob = 1.0;
+            self.generated_tokens.push(idx);
+            self.mark_seen(gpu, idx);
+            return idx;
         }
 
-        // Top-k
-        let k = 20usize.min(vocab_size);
-        let mut indices: Vec<usize> = (0..vocab_size).collect();
-        indices.select_nth_unstable_by(k, |&a, &b| logits_vec[b].partial_cmp(&logits_vec[a]).unwrap());
-        let top_k_threshold = logits_vec[indices[k - 1]];
-
-        // Top-p nucleus sampling
-        let max_val = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut probs: Vec<(usize, f32)> = logits_vec.iter().enumerate()
-            .filter(|(_, &v)| v >= top_k_threshold)
-            .map(|(i, &v)| (i, (v - max_val).exp()))
+        // ── Top-p nucleus sampling on the small candidate set ─────────────
+        let max_val = candidates.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<(u32, f32)> = candidates.iter()
+            .map(|&(idx, v)| (idx, (v - max_val).exp()))
             .collect();
         let sum: f32 = probs.iter().map(|(_, p)| p).sum();
-        for (_, p) in probs.iter_mut() {
-            *p /= sum;
-        }
+        for (_, p) in probs.iter_mut() { *p /= sum; }
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
         let top_p = 0.80f32;
         let mut cumsum = 0.0f32;
-        let mut nucleus: Vec<(usize, f32)> = Vec::new();
-        for (i, p) in &probs {
+        let mut nucleus: Vec<(u32, f32)> = Vec::new();
+        for (idx, p) in &probs {
             cumsum += p;
-            nucleus.push((*i, *p));
+            nucleus.push((*idx, *p));
             if cumsum >= top_p { break; }
         }
         let nuc_sum: f32 = nucleus.iter().map(|(_, p)| p).sum();
-        for (_, p) in nucleus.iter_mut() {
-            *p /= nuc_sum;
-        }
+        for (_, p) in nucleus.iter_mut() { *p /= nuc_sum; }
 
-        // Sample
+        // ── XorShift64 sample ──────────────────────────────────────────────
         self.rng_state ^= self.rng_state << 13;
         self.rng_state ^= self.rng_state >> 7;
         self.rng_state ^= self.rng_state << 17;
         let r = (self.rng_state & 0xFFFFFFFF) as f64 / u32::MAX as f64;
         let mut cumulative = 0.0f64;
-        let mut sampled = nucleus[0].0 as u32;
+        let mut sampled = nucleus[0].0;
         let mut sampled_prob = nucleus[0].1;
         for &(idx, p) in &nucleus {
             cumulative += p as f64;
             if cumulative >= r {
-                sampled = idx as u32;
+                sampled = idx;
                 sampled_prob = p;
                 break;
             }
@@ -1202,7 +1292,19 @@ impl Model {
 
         self.last_token_prob = sampled_prob;
         self.generated_tokens.push(sampled);
+        self.mark_seen(gpu, sampled);
         sampled
+    }
+
+    /// Update the seen_bitmap (CPU + GPU) for a newly generated token.
+    /// Writes a single 4-byte word to GPU — negligible overhead.
+    fn mark_seen(&mut self, gpu: &GpuContext, token_id: u32) {
+        let word_idx = (token_id / 32) as usize;
+        if word_idx < self.seen_bitmap_cpu.len() {
+            self.seen_bitmap_cpu[word_idx] |= 1u32 << (token_id % 32);
+            let bytes = self.seen_bitmap_cpu[word_idx].to_le_bytes();
+            gpu.write_buffer(&self.state.seen_bitmap, word_idx as u64 * 4, &bytes);
+        }
     }
 
     /// Greedy argmax decode — no sampling, no penalties. For ASR.

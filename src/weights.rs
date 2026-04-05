@@ -307,8 +307,29 @@ impl ModelConfig {
 
 impl QuantConfig {
     pub fn from_file(path: &Path) -> Self {
-        let data = std::fs::read_to_string(path).expect("failed to read quantize_config.json");
-        serde_json::from_str(&data).expect("failed to parse quantize_config.json")
+        match std::fs::read_to_string(path) {
+            Ok(data) => {
+                serde_json::from_str(&data).unwrap_or_else(|e| {
+                    log::warn!("[shady-thinker] failed to parse quantize_config.json: {e}, using defaults");
+                    Self::default()
+                })
+            }
+            Err(_) => {
+                log::info!("[shady-thinker] no quantize_config.json, using defaults (bits=4, group_size=128)");
+                Self::default()
+            }
+        }
+    }
+}
+
+impl Default for QuantConfig {
+    fn default() -> Self {
+        Self {
+            bits: default_bits(),
+            group_size: default_group_size(),
+            quant_method: "gptq".to_string(),
+            sym: false,
+        }
     }
 }
 
@@ -329,8 +350,9 @@ fn detect_layer_prefix(tensor_map: &HashMap<String, wgpu::Buffer>) -> String {
     "model.layers".to_string()
 }
 
-fn detect_model_prefix(tensor_map: &HashMap<String, wgpu::Buffer>) -> (&'static str, &'static str, &'static str) {
-    if tensor_map.contains_key("model.language_model.embed_tokens.weight") {
+fn detect_model_prefix(tensor_map: &HashMap<String, wgpu::Buffer>, oversized_raw: &HashMap<String, Vec<u8>>) -> (&'static str, &'static str, &'static str) {
+    let has_key = |k: &str| tensor_map.contains_key(k) || oversized_raw.contains_key(k);
+    if has_key("model.language_model.embed_tokens.weight") {
         ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "model.language_model.lm_head")
     } else {
         ("model.embed_tokens.weight", "model.norm.weight", "lm_head")
@@ -427,6 +449,9 @@ pub fn load_weights(
 
     let mut tensor_map: HashMap<String, wgpu::Buffer> = HashMap::new();
     let mut raw_bytes_map: HashMap<String, Vec<u8>> = HashMap::new();
+    // Raw bytes for tensors too large to bind whole — needed for chunked upload
+    let mut oversized_raw: HashMap<String, Vec<u8>> = HashMap::new();
+    let max_binding = gpu.max_storage_binding_size();
 
     for shard_path in &shard_files {
         let data = std::fs::read(shard_path).expect("failed to read shard");
@@ -489,13 +514,18 @@ pub fn load_weights(
                 continue;
             }
 
+            // Defer oversized tensors — they need chunked upload after we know hidden_size
+            if bytes.len() as u64 > max_binding && name.ends_with("embed_tokens.weight") {
+                oversized_raw.insert(name.to_string(), bytes.to_vec());
+                continue;
+            }
             let buffer = gpu.upload_buffer(&name, bytes);
             tensor_map.insert(name.to_string(), buffer);
         }
     }
 
     let layer_prefix = detect_layer_prefix(&tensor_map);
-    let (embed_name, norm_name, lm_head_prefix) = detect_model_prefix(&tensor_map);
+    let (embed_name, norm_name, lm_head_prefix) = detect_model_prefix(&tensor_map, &oversized_raw);
     // Try both prefixed and unprefixed lm_head names
     let (lm_head_qw_name, lm_head_sc_name, lm_head_w_name) = {
         let prefixed_qw = format!("{lm_head_prefix}.qweight");
@@ -624,17 +654,45 @@ pub fn load_weights(
         (dummy_qw, dummy_sc)
     };
 
+    // Chunk the embedding table if it exceeds the GPU's max storage binding size.
+    // The embedding shader already supports chunked lookup (embed_chunks / embed_chunk_size).
+    let hidden = config.hidden_size as u64;
+    let bytes_per_row = hidden * 2; // BF16
+
+    let (embed_tokens, embed_chunks, embed_chunk_size) =
+        if let Some(embed_bytes) = oversized_raw.remove(embed_name) {
+            // Tensor was captured raw during shard scan (too large to bind whole).
+            let chunk_rows = (max_binding / bytes_per_row) as u32;
+            log::info!(
+                "embed_tokens {}MB > max_binding {}MB — chunking, rows_per_chunk={}",
+                embed_bytes.len() / (1 << 20), max_binding / (1 << 20), chunk_rows,
+            );
+            let total_rows = (embed_bytes.len() as u64 / bytes_per_row) as u32;
+            let num_chunks = total_rows.div_ceil(chunk_rows);
+            let mut chunks = Vec::with_capacity(num_chunks as usize);
+            for c in 0..num_chunks {
+                let start = c as usize * chunk_rows as usize * bytes_per_row as usize;
+                let end = (start + chunk_rows as usize * bytes_per_row as usize).min(embed_bytes.len());
+                chunks.push(gpu.upload_buffer(&format!("embed_chunk_{c}"), &embed_bytes[start..end]));
+            }
+            // embed_tokens must exist in the struct; embedding shader uses embed_chunks when non-empty.
+            let dummy = gpu.upload_buffer("embed_tokens_dummy", &[0u8; 4]);
+            (dummy, chunks, chunk_rows)
+        } else {
+            (take(&mut tensor_map, embed_name), Vec::new(), 0)
+        };
+
     (
         ModelWeights {
-            embed_tokens: take(&mut tensor_map, embed_name),
+            embed_tokens,
             final_norm: take(&mut tensor_map, norm_name),
             lm_head_qweight,
             lm_head_scales,
             lm_head_is_bf16: lm_head_is_unquantized,
             self_attn_layers: self_attn_indices,
             layers,
-            embed_chunks: Vec::new(),
-            embed_chunk_size: 0,
+            embed_chunks,
+            embed_chunk_size,
             mlx_biases: Vec::new(),
         },
         RawNormWeights {

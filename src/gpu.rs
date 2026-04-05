@@ -12,6 +12,8 @@ pub struct GpuContext {
     encoder: Option<wgpu::CommandEncoder>,
     pending_dispatches: u32,
     max_storage_binding: u64,
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    has_pipeline_cache_feature: bool,
 }
 
 impl GpuContext {
@@ -32,6 +34,8 @@ impl GpuContext {
             encoder: None,
             pending_dispatches: 0,
             max_storage_binding: limit,
+            pipeline_cache: None,
+            has_pipeline_cache_feature: false,
         }
     }
 
@@ -69,10 +73,19 @@ impl GpuContext {
         }
         // Don't override max_storage_buffer_binding_size — use adapter's native limit.
 
+        // Enable PIPELINE_CACHE if the adapter supports it (speeds up shader compilation on Android).
+        let pipeline_cache_feature = if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            log::info!("[shady-thinker] PIPELINE_CACHE feature available");
+            wgpu::Features::PIPELINE_CACHE
+        } else {
+            log::info!("[shady-thinker] PIPELINE_CACHE feature not available");
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("shady-thinker"),
-                required_features: wgpu::Features::empty(),
+                required_features: pipeline_cache_feature,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
@@ -80,6 +93,7 @@ impl GpuContext {
             .await
             .expect("failed to create device");
 
+        let has_pc = pipeline_cache_feature.contains(wgpu::Features::PIPELINE_CACHE);
         let max_storage_binding = device.limits().max_storage_buffer_binding_size;
         Self {
             device,
@@ -89,7 +103,46 @@ impl GpuContext {
             encoder: None,
             pending_dispatches: 0,
             max_storage_binding,
+            pipeline_cache: None,
+            has_pipeline_cache_feature: has_pc,
         }
+    }
+
+    pub fn supports_pipeline_cache(&self) -> bool {
+        self.has_pipeline_cache_feature
+    }
+
+    /// Load a Vulkan pipeline cache from raw bytes (previously returned by `get_pipeline_cache_data`).
+    /// This dramatically speeds up pipeline compilation on subsequent runs.
+    pub fn load_pipeline_cache(&mut self, data: &[u8]) {
+        // SAFETY: data was previously returned by get_pipeline_cache_data from the same device family.
+        // We use fallback=true so an incompatible cache is silently ignored.
+        let cache = unsafe {
+            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("shady-thinker"),
+                data: Some(data),
+                fallback: true,
+            })
+        };
+        self.pipeline_cache = Some(cache);
+        log::info!("[shady-thinker] pipeline cache loaded ({} bytes)", data.len());
+    }
+
+    /// Create an empty pipeline cache (for first-run, enables saving after compilation).
+    pub fn create_pipeline_cache(&mut self) {
+        let cache = unsafe {
+            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("shady-thinker"),
+                data: None,
+                fallback: true,
+            })
+        };
+        self.pipeline_cache = Some(cache);
+    }
+
+    /// Get the current pipeline cache data for persistence.
+    pub fn get_pipeline_cache_data(&self) -> Option<Vec<u8>> {
+        self.pipeline_cache.as_ref().and_then(|c| c.get_data())
     }
 
     pub fn create_buffer(
@@ -155,7 +208,7 @@ impl GpuContext {
                         module: &module,
                         entry_point: Some("main"),
                         compilation_options: Default::default(),
-                        cache: None,
+                        cache: self.pipeline_cache.as_ref(),
                     });
             self.pipelines.insert(name.to_string(), pipeline);
         }
