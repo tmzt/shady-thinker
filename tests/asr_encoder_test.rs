@@ -379,7 +379,7 @@ fn debug_decoder_verify_embedding() {
     // Now check RMSNorm: embed → normed using layer 0 input_layernorm
     // RMSNorm with (1+w) scaling
     model.rmsnorm(&mut gpu, &model.state.hidden, &model.weights.layers[0].input_layernorm,
-        &model.state.normed, h);
+        &model.state.normed);
     gpu.flush();
     let normed_bytes = gpu.read_buffer(&model.state.normed, h as u64 * 4);
     let gpu_normed: &[f32] = bytemuck::cast_slice(&normed_bytes);
@@ -398,13 +398,13 @@ fn debug_decoder_verify_embedding() {
     let kv_dim = model.config.num_key_value_heads * model.config.head_dim; // 1024
     model.gptq_matvec(&mut gpu, "test_qproj",
         &model.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
-        &model.state.q_out, h, q_dim);
+        &model.state.q_out, q_dim, &model.state.p_bf16_q);
     model.gptq_matvec(&mut gpu, "test_kproj",
         &model.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
-        &model.state.k_out, h, kv_dim);
+        &model.state.k_out, kv_dim, &model.state.p_bf16_kv);
     model.gptq_matvec(&mut gpu, "test_vproj",
         &model.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
-        &model.state.v_out, h, kv_dim);
+        &model.state.v_out, kv_dim, &model.state.p_bf16_kv);
     gpu.flush();
 
     let q_bytes = gpu.read_buffer(&model.state.q_out, q_dim as u64 * 4);
@@ -479,29 +479,29 @@ fn verify_single_token_forward() {
     let kv_dim = nkv * hd;
 
     let layer = &model.weights.layers[0];
-    model.rmsnorm(&mut gpu, &model.state.hidden, &layer.input_layernorm, &model.state.normed, h);
+    model.rmsnorm(&mut gpu, &model.state.hidden, &layer.input_layernorm, &model.state.normed);
 
     let sa = layer.self_attn().unwrap();
     model.gptq_matvec(&mut gpu, "qproj_l0",
         &model.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
-        &model.state.q_out, h, q_dim);
+        &model.state.q_out, q_dim, &model.state.p_bf16_q);
     model.gptq_matvec(&mut gpu, "kproj_l0",
         &model.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
-        &model.state.k_out, h, kv_dim);
+        &model.state.k_out, kv_dim, &model.state.p_bf16_kv);
     model.gptq_matvec(&mut gpu, "vproj_l0",
         &model.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
-        &model.state.v_out, h, kv_dim);
+        &model.state.v_out, kv_dim, &model.state.p_bf16_kv);
 
     model.fused_split_qknorm_kvstore(&mut gpu, 0);
     model.gqa_attention(&mut gpu, 0);
     // No sigmoid_mul_gate (non-gated)
     model.gptq_matvec(&mut gpu, "oproj_l0",
         &model.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
-        &model.state.o_proj_out, nh * hd, h);
+        &model.state.o_proj_out, h, &model.state.p_bf16_o);
 
     // Post-attn: residual += o_proj_out, then norm
     model.add_rmsnorm(&mut gpu, &model.state.residual, &model.state.o_proj_out,
-        &layer.post_attn_layernorm, &model.state.normed, h);
+        &layer.post_attn_layernorm, &model.state.normed);
 
     // Check residual after attention
     gpu.flush();
@@ -520,10 +520,10 @@ fn verify_single_token_forward() {
     // MLP
     model.gptq_matvec(&mut gpu, "gate_l0",
         &model.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
-        &model.state.gate_out, h, inter);
+        &model.state.gate_out, inter, &model.state.p_bf16_gu);
     model.gptq_matvec(&mut gpu, "up_l0",
         &model.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
-        &model.state.up_out, h, inter);
+        &model.state.up_out, inter, &model.state.p_bf16_gu);
     gpu.flush();
     let gate0 = gpu.read_buffer(&model.state.gate_out, inter as u64 * 4);
     let g0: &[f32] = bytemuck::cast_slice(&gate0);
@@ -535,7 +535,7 @@ fn verify_single_token_forward() {
     model.fused_silu_gptq_down(&mut gpu,
         &model.state.gate_out, &model.state.up_out,
         &layer.down_proj_qweight, &layer.down_proj_scales,
-        &model.state.mlp_output, inter, h);
+        &model.state.mlp_output, h, &model.state.p_gptq_down);
 
     // After MLP, residual gets updated at next layer's pre-attn
     // But let's check mlp_output first

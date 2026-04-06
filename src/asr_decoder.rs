@@ -79,6 +79,7 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
     model.q_gated = false;
     model.norm_direct = true;
     model.rebuild_qknorm_shader();
+    model.rebuild_static_params(&gpu);
     log::info!("[asr-decoder] mode={}, chunked_embed={}", mode, chunked);
 
     for (i, norm) in raw_norms.layers.iter().enumerate() {
@@ -264,7 +265,8 @@ pub fn precompute_prefix_cache(
                 #[repr(C)]
                 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
                 struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
-                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                gpu.flush();
+                gpu.write_buffer(&model.state.p_scratch, 0, bytemuck::bytes_of(&EP {
                     token_id: tok, dim: model.config.hidden_size,
                     group_size: model.quant_config.group_size, _pad: 0,
                 }));
@@ -273,7 +275,7 @@ pub fn precompute_prefix_cache(
                     crate::gpu::bind(1, sc),
                     crate::gpu::bind(2, bi),
                     crate::gpu::bind(3, &model.state.hidden),
-                    crate::gpu::bind(4, &model.state.params),
+                    crate::gpu::bind(4, &model.state.p_scratch),
                 ], (model.config.hidden_size.div_ceil(256), 1, 1));
             }
         } else {
@@ -353,7 +355,8 @@ pub fn gpu_asr_decode_tokens(
                 #[repr(C)]
                 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
                 struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
-                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                gpu.flush();
+                gpu.write_buffer(&model.state.p_scratch, 0, bytemuck::bytes_of(&EP {
                     token_id: tok, dim: model.config.hidden_size,
                     group_size: model.quant_config.group_size, _pad: 0,
                 }));
@@ -361,7 +364,7 @@ pub fn gpu_asr_decode_tokens(
                     crate::gpu::bind(0, &model.weights.embed_tokens),
                     crate::gpu::bind(1, sc), crate::gpu::bind(2, bi),
                     crate::gpu::bind(3, &model.state.hidden),
-                    crate::gpu::bind(4, &model.state.params),
+                    crate::gpu::bind(4, &model.state.p_scratch),
                 ], (model.config.hidden_size.div_ceil(256), 1, 1));
             }
         } else {
@@ -416,7 +419,8 @@ pub fn gpu_asr_decode_tokens(
                 #[repr(C)]
                 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
                 struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
-                model.write_params(gpu, bytemuck::bytes_of(&EP {
+                gpu.flush();
+                gpu.write_buffer(&model.state.p_scratch, 0, bytemuck::bytes_of(&EP {
                     token_id: token, dim: model.config.hidden_size,
                     group_size: model.quant_config.group_size, _pad: 0,
                 }));
@@ -424,7 +428,7 @@ pub fn gpu_asr_decode_tokens(
                     crate::gpu::bind(0, &model.weights.embed_tokens),
                     crate::gpu::bind(1, sc), crate::gpu::bind(2, bi),
                     crate::gpu::bind(3, &model.state.hidden),
-                    crate::gpu::bind(4, &model.state.params),
+                    crate::gpu::bind(4, &model.state.p_scratch),
                 ], (model.config.hidden_size.div_ceil(256), 1, 1));
             }
             gpu.flush();

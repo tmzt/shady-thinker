@@ -5,6 +5,12 @@
 // For num_splits > 1: write (partial_out[head_dim], log_sum_exp, max) per split
 //   at output[(q_head * num_splits + split) * (head_dim + 2) + d].
 // Dispatch: (num_q_heads, num_splits, 1)
+//
+// Q_GATED is injected at build time via build_gqa_shader().
+// When Q_GATED=true, binding 5 (q_gate) must be bound; sigmoid gate is applied
+// to the attention output for num_splits==1 (the only used path, NUM_ATTN_SPLITS=1).
+
+// const Q_GATED: bool = ...;  ← injected by build_gqa_shader()
 
 struct Params {
     seq_len: u32,
@@ -17,11 +23,12 @@ struct Params {
     _pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
-@group(0) @binding(2) var<storage, read> v_cache: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(0) var<storage, read>       q:       array<f32>;
+@group(0) @binding(1) var<storage, read>       k_cache: array<f32>;
+@group(0) @binding(2) var<storage, read>       v_cache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output:  array<f32>;
+@group(0) @binding(4) var<uniform>             params:  Params;
+@group(0) @binding(5) var<storage, read>       q_gate:  array<f32>;  // [num_q_heads * head_dim], only used when Q_GATED
 
 // Shared memory: first 256 for reductions, then 256 for accumulator (head_dim <= 256).
 var<workgroup> shared_reduce: array<f32, 256>;
@@ -105,9 +112,13 @@ fn main(
 
     // --- Write output ---
     if (num_splits == 1u) {
-        // Direct output.
+        // Direct output, with optional sigmoid gate fusion.
         if (tid < head_dim) {
-            output[q_head * head_dim + tid] = shared_acc[tid] / running_sum;
+            var val = shared_acc[tid] / running_sum;
+            if (Q_GATED) {
+                val *= 1.0 / (1.0 + exp(-q_gate[q_head * head_dim + tid]));
+            }
+            output[q_head * head_dim + tid] = val;
         }
     } else {
         // Write partial results with log_sum_exp metadata.
