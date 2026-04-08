@@ -3,7 +3,7 @@ use crate::gpu::{self, GpuContext};
 use crate::lora::LoraState;
 use crate::weights::{ModelConfig, ModelWeights, QuantConfig};
 
-mod shaders {
+pub(crate) mod shaders {
     pub const GPTQ_MATVEC_4T: &str = include_str!("shaders/gptq_matvec_4t.wgsl");
     pub const FUSED_GATE_UP_SILU_4T: &str = include_str!("shaders/fused_gate_up_silu_4t.wgsl");
     pub const FUSED_SILU_GPTQ_4T: &str = include_str!("shaders/fused_silu_gptq_4t.wgsl");
@@ -41,13 +41,13 @@ mod shaders {
     pub const FUSED_SILU_GPTQ_GEMM: &str = include_str!("shaders/fused_silu_gptq_gemm.wgsl");
     pub const FUSED_SILU_GPTQ_GEMM_4T: &str = include_str!("shaders/fused_silu_gptq_gemm_4t.wgsl");
     pub const BATCHED_QKNORM_ROPE_GATED: &str = include_str!("shaders/batched_qknorm_rope_gated.wgsl");
+    pub const BATCHED_DELTANET_PREFILL:  &str = include_str!("shaders/batched_deltanet_prefill.wgsl");
 
     // Phase 2: decode op fusion shaders
     pub const FUSED_GATE_UP_GPTQ: &str = include_str!("shaders/fused_gate_up_gptq.wgsl");
     pub const FUSED_GATE_UP_GPTQ_4T: &str = include_str!("shaders/fused_gate_up_gptq_4t.wgsl");
 
-    // Sampling shaders
-    pub const SAMPLE_PENALTY_TEMP: &str = include_str!("shaders/sample_penalty_temp.wgsl");
+    // Sampling shader (combined penalty + gate + top-K in one pass)
     pub const SAMPLE_TOPK: &str = include_str!("shaders/sample_topk.wgsl");
 
     // LoRA shaders
@@ -178,6 +178,10 @@ pub struct InferenceState {
     pub p_argmax:     wgpu::Buffer,  // {n: vocab, 0, 0, 0}
     pub p_gqa_reduce: wgpu::Buffer,  // {head_dim, num_splits, num_heads, 0}
     pub p_dn:         wgpu::Buffer,  // deltanet params
+    // Static DeltaNet projection params (replaces per-dispatch p_scratch writes on the hot path):
+    pub p_dn_qkv:     wgpu::Buffer,  // {h, total_ch, gs, 0} for dn_qkv matvec
+    pub p_dn_z:       wgpu::Buffer,  // {h, dn_z_n, gs, 0}   for dn_z matvec
+    pub p_dn_down:    wgpu::Buffer,  // {dn_z_n, h, gs, 0}   for fused_silu_down
     pub p_scratch:    wgpu::Buffer,  // 64-byte scratch for rare per-call writes (chunked lm_head)
     // Per-token params (2 fields written at start of forward()):
     pub p_embed:      wgpu::Buffer,  // {token_id: u32, dim: u32}  <- token_id written per token
@@ -194,10 +198,19 @@ pub struct InferenceState {
     pub seen_bitmap: wgpu::Buffer,
     /// Top-K output from GPU sampler: array of {idx: u32, val: f32}, length TOPK_K
     pub topk_out: wgpu::Buffer,
-    /// Uniform buffer for penalty+temperature shader
+    /// Uniform buffer for combined penalty+gate+topk shader (64 bytes)
     pub penalty_uniform: wgpu::Buffer,
-    /// Uniform buffer for top-k shader
-    pub topk_uniform: wgpu::Buffer,
+    /// First byte of each token, indexed by token ID (0 = empty/special).
+    /// Used by the gate: when gate_byte != 0, tokens whose first_bytes[i] != gate_byte are masked to -inf.
+    /// Always allocated (vocab_size u32s); zeros = no gate effect when gate_byte = 0.
+    pub first_bytes_buf: wgpu::Buffer,
+    /// Per-chunk temporary buffers for lm_head (one per embed_chunk, reused across decode steps).
+    /// Avoids allocating new GPU buffers on every decode step, which fills the bind group cache.
+    pub lm_chunk_tmps: Vec<wgpu::Buffer>,
+    /// Per-chunk param buffers for lm_head (pre-initialized with {h, chunk_vocab, 0, 0}).
+    /// Eliminates the flush()+write_buffer per chunk in bf16_lm_head, allowing all chunks
+    /// to run in a single command buffer submission.
+    pub lm_chunk_params: Vec<wgpu::Buffer>,
 
     // DeltaNet state (per linear-attn layer)
     pub deltanet_qkv: wgpu::Buffer,      // [total_channels] for conv input
@@ -211,7 +224,7 @@ pub struct InferenceState {
 /// Number of attention splits for GQA (trade off parallelism vs overhead)
 const NUM_ATTN_SPLITS: u32 = 1; // 1 = no multi-split, single-pass online softmax
 /// Number of top-K candidates extracted on GPU for sampling
-const TOPK_K: u32 = 20;
+const TOPK_K: u32 = 8; // must match const K in sample_topk.wgsl
 
 /// Swappable per-sequence state: KV caches + DeltaNet recurrent state.
 /// Allocate multiple slots to run different prompts without destroying context.
@@ -240,7 +253,6 @@ pub struct Model {
     pub training_mode: bool,
     /// Simple RNG state for sampling
     rng_state: u64,
-    use_4t: bool,
     /// When true, all weights are bf16 (not GPTQ). Dispatch bf16_matvec instead of gptq_matvec.
     pub bf16_mode: bool,
     /// When true, Q projection outputs [nh * hd * 2] (Qwen3.5 SiGLU gated attention).
@@ -271,6 +283,8 @@ pub struct Model {
     linear_key_dim: u32,
     linear_value_dim: u32,
     linear_num_value_heads: u32,
+    /// Optional JSON-constrained sampler. When Some, gates token candidates at structural positions.
+    pub json_sampler: Option<crate::json_sampler::JsonSampler>,
 }
 
 /// Build the QK norm uniform buffer data for fused_split_qknorm_kvstore.
@@ -378,12 +392,6 @@ impl Model {
         let nl = config.num_hidden_layers;
         let f = 4u64;
 
-        let use_4t =
-            (h % 32 == 0) && (inter % 32 == 0) && (quant_config.group_size % 32 == 0);
-        if use_4t {
-            log::info!("Using 4-thread GPTQ variants");
-        }
-
         // Build per-layer QK norm uniform buffers
         // We need to read the raw norm weight bytes from the GPU buffers,
         // but they were uploaded from safetensors. We'll build these during
@@ -416,7 +424,7 @@ impl Model {
             4 // minimum size
         };
 
-        let state = InferenceState {
+        let mut state = InferenceState {
             hidden: gpu.create_storage_buffer("hidden", h as u64 * f),
             residual: gpu.create_storage_buffer("residual", h as u64 * f),
             normed: gpu.create_storage_buffer("normed", h as u64 * f),
@@ -549,6 +557,32 @@ impl Model {
                 gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[lnkh, lkd, lvd, total_ch, eps_bits, h, lnvh, 0u32]));
                 buf
             },
+            p_dn_qkv: {
+                let lnkh = config.linear_num_key_heads;
+                let lkd = config.linear_key_head_dim;
+                let lnvh = config.linear_num_value_heads;
+                let lvd = config.linear_value_head_dim;
+                let total_ch = lnkh * lkd + lnkh * lkd + lnvh * lvd;
+                let buf = gpu.create_buffer("p_dn_qkv", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, total_ch, quant_config.group_size, 0u32]));
+                buf
+            },
+            p_dn_z: {
+                let lnvh = config.linear_num_value_heads;
+                let lvd = config.linear_value_head_dim;
+                let dn_z_n = lnvh * lvd;
+                let buf = gpu.create_buffer("p_dn_z", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, dn_z_n, quant_config.group_size, 0u32]));
+                buf
+            },
+            p_dn_down: {
+                let lnvh = config.linear_num_value_heads;
+                let lvd = config.linear_value_head_dim;
+                let dn_z_n = lnvh * lvd;
+                let buf = gpu.create_buffer("p_dn_down", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[dn_z_n, h, quant_config.group_size, 0u32]));
+                buf
+            },
             p_scratch: gpu.create_buffer("p_scratch", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             p_embed: {
                 let buf = gpu.create_buffer("p_embed", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
@@ -574,16 +608,14 @@ impl Model {
                 gpu.create_storage_buffer("seen_bitmap", words as u64 * 4)
             },
             topk_out: gpu.create_storage_buffer("topk_out", TOPK_K as u64 * 8),
+            first_bytes_buf: gpu.create_storage_buffer("first_bytes", config.vocab_size as u64 * 4),
             penalty_uniform: gpu.create_buffer(
                 "penalty_uniform",
                 64, // PenaltyParams struct: 4*4 + 4*4 + 4 = 48 bytes, pad to 64
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             ),
-            topk_uniform: {
-                let buf = gpu.create_buffer("topk_uniform", 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-                gpu.write_buffer(&buf, 0, &config.vocab_size.to_le_bytes());
-                buf
-            },
+            lm_chunk_tmps: Vec::new(),   // populated below if embed_chunks is used
+            lm_chunk_params: Vec::new(), // populated below if embed_chunks is used
 
             // DeltaNet buffers
             deltanet_qkv: {
@@ -634,6 +666,29 @@ impl Model {
         let batched_qknorm_gated_src = build_batched_qknorm_shader_gated(&config);
         let vocab_size_for_bitmap = config.vocab_size;
 
+        // Pre-allocate persistent per-chunk buffers for lm_head.
+        // - lm_chunk_tmps: one output buffer per chunk (avoids GPU alloc per decode step)
+        // - lm_chunk_params: pre-initialized param buffers (avoids flush+write per chunk,
+        //   letting all chunks run in a single command buffer submission)
+        if !weights.embed_chunks.is_empty() {
+            let h = config.hidden_size;
+            let chunk_size = weights.embed_chunk_size;
+            let vocab = config.vocab_size;
+            state.lm_chunk_tmps = (0..weights.embed_chunks.len()).map(|i| {
+                gpu.create_storage_buffer(&format!("lm_chunk_tmp_{i}"), chunk_size as u64 * 4)
+            }).collect();
+            state.lm_chunk_params = (0..weights.embed_chunks.len()).map(|i| {
+                let chunk_start = i as u32 * chunk_size;
+                let chunk_vocab = chunk_size.min(vocab - chunk_start);
+                let buf = gpu.create_buffer(
+                    &format!("lm_chunk_params_{i}"), 16,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                );
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, chunk_vocab, 0u32, 0u32]));
+                buf
+            }).collect();
+        }
+
         Self {
             linear_num_key_heads: config.linear_num_key_heads,
             linear_key_dim: config.linear_key_head_dim,
@@ -651,7 +706,6 @@ impl Model {
             rng_state: 0x5DEECE66Du64,
             #[cfg(feature = "jit-lora")]
             lora: None,
-            use_4t,
             bf16_mode: false,
             q_gated: true, // default: Qwen3.5 gated attention
             norm_direct: false,
@@ -664,6 +718,7 @@ impl Model {
             qknorm_shader_src,
             gqa_shader_src,
             batched_qknorm_gated_src,
+            json_sampler: None,
         }
     }
 
@@ -769,19 +824,11 @@ impl Model {
             ], (n.div_ceil(32), 1, 1));
             return;
         }
-        if self.use_4t {
-            gpu.dispatch(name, shaders::GPTQ_MATVEC_4T, &[
-                gpu::bind(0, input), gpu::bind(1, qweight),
-                gpu::bind(2, scales), gpu::bind(3, output),
-                gpu::bind(4, params_buf),
-            ], (n.div_ceil(8), 1, 1));
-        } else {
-            gpu.dispatch(name, shaders::GPTQ_MATVEC, &[
-                gpu::bind(0, input), gpu::bind(1, qweight),
-                gpu::bind(2, scales), gpu::bind(3, output),
-                gpu::bind(4, params_buf),
-            ], (n.div_ceil(32), 1, 1));
-        }
+        gpu.dispatch(name, shaders::GPTQ_MATVEC_4T, &[
+            gpu::bind(0, input), gpu::bind(1, qweight),
+            gpu::bind(2, scales), gpu::bind(3, output),
+            gpu::bind(4, params_buf),
+        ], (n.div_ceil(8), 1, 1));
     }
 
     pub fn fused_silu_gptq_down(
@@ -807,19 +854,11 @@ impl Model {
             ], (n.div_ceil(32), 1, 1));
             return;
         }
-        if self.use_4t {
-            gpu.dispatch("fused_silu_gptq_4t", shaders::FUSED_SILU_GPTQ_4T, &[
-                gpu::bind(0, gate_out), gpu::bind(1, up_out),
-                gpu::bind(2, down_qw), gpu::bind(3, down_sc),
-                gpu::bind(4, output), gpu::bind(5, params_buf),
-            ], (n.div_ceil(8), 1, 1));
-        } else {
-            gpu.dispatch("fused_silu_gptq", shaders::FUSED_SILU_GPTQ, &[
-                gpu::bind(0, gate_out), gpu::bind(1, up_out),
-                gpu::bind(2, down_qw), gpu::bind(3, down_sc),
-                gpu::bind(4, output), gpu::bind(5, params_buf),
-            ], (n.div_ceil(32), 1, 1));
-        }
+        gpu.dispatch("fused_silu_gptq_4t", shaders::FUSED_SILU_GPTQ_4T, &[
+            gpu::bind(0, gate_out), gpu::bind(1, up_out),
+            gpu::bind(2, down_qw), gpu::bind(3, down_sc),
+            gpu::bind(4, output), gpu::bind(5, params_buf),
+        ], (n.div_ceil(8), 1, 1));
     }
 
     /// Fused gate+up GPTQ dispatch: both MLP projections in one pass over K input elements.
@@ -832,23 +871,13 @@ impl Model {
         gate_out: &wgpu::Buffer, up_out: &wgpu::Buffer,
         n: u32, params_buf: &wgpu::Buffer,
     ) {
-        if self.use_4t {
-            gpu.dispatch("gate_up_fused", shaders::FUSED_GATE_UP_GPTQ_4T, &[
-                gpu::bind(0, input),
-                gpu::bind(1, gate_qw), gpu::bind(2, gate_sc),
-                gpu::bind(3, up_qw),   gpu::bind(4, up_sc),
-                gpu::bind(5, gate_out), gpu::bind(6, up_out),
-                gpu::bind(7, params_buf),
-            ], (n.div_ceil(8), 1, 1));
-        } else {
-            gpu.dispatch("gate_up_fused", shaders::FUSED_GATE_UP_GPTQ, &[
-                gpu::bind(0, input),
-                gpu::bind(1, gate_qw), gpu::bind(2, gate_sc),
-                gpu::bind(3, up_qw),   gpu::bind(4, up_sc),
-                gpu::bind(5, gate_out), gpu::bind(6, up_out),
-                gpu::bind(7, params_buf),
-            ], (n.div_ceil(32), 1, 1));
-        }
+        gpu.dispatch("gate_up_fused", shaders::FUSED_GATE_UP_GPTQ_4T, &[
+            gpu::bind(0, input),
+            gpu::bind(1, gate_qw), gpu::bind(2, gate_sc),
+            gpu::bind(3, up_qw),   gpu::bind(4, up_sc),
+            gpu::bind(5, gate_out), gpu::bind(6, up_out),
+            gpu::bind(7, params_buf),
+        ], (n.div_ceil(8), 1, 1));
     }
 
     pub fn add_rmsnorm(
@@ -906,25 +935,24 @@ impl Model {
             let chunk_size = self.weights.embed_chunk_size;
             let vocab = self.config.vocab_size;
 
-            // Temp buffer for one chunk's logits (reused across chunks)
-            let max_chunk_vocab = chunk_size;
-            let chunk_logits = gpu.create_storage_buffer("lm_chunk_tmp", max_chunk_vocab as u64 * 4);
-
+            // All chunks run in a single encoder (no flush between chunks).
+            // Pre-allocated per-chunk buffers (lm_chunk_tmps, lm_chunk_params) avoid
+            // both the per-step GPU allocation and the flush()+write_buffer per chunk.
             for (ci, chunk) in self.weights.embed_chunks.iter().enumerate() {
                 let chunk_start = ci as u32 * chunk_size;
                 let chunk_vocab = chunk_size.min(vocab - chunk_start);
+                let chunk_logits = &self.state.lm_chunk_tmps[ci];
+                let chunk_params = &self.state.lm_chunk_params[ci];
 
-                gpu.flush();
-                gpu.write_buffer(&self.state.p_scratch, 0, bytemuck::cast_slice(&[h, chunk_vocab, 0u32, 0u32]));
                 gpu.dispatch("lm_head_chunked", shaders::BF16_MATVEC, &[
                     gpu::bind(0, &self.state.normed),
                     gpu::bind(1, chunk),
-                    gpu::bind(2, &chunk_logits),
-                    gpu::bind(3, &self.state.p_scratch),
+                    gpu::bind(2, chunk_logits),
+                    gpu::bind(3, chunk_params),
                 ], (chunk_vocab.div_ceil(32), 1, 1));
 
                 // GPU-side copy to the correct offset in the full logits buffer
-                gpu.copy_buffer_offset(&chunk_logits, 0,
+                gpu.copy_buffer_offset(chunk_logits, 0,
                     &self.state.logits, chunk_start as u64 * 4,
                     chunk_vocab as u64 * 4);
             }
@@ -1118,6 +1146,12 @@ impl Model {
 
     // ── Forward pass ──────────────────────────────────────────────────
 
+    /// Returns true if any layer uses linear (non-self) attention.
+    /// `prefill_gptq` only supports pure self-attn models.
+    pub fn is_hybrid_attn(&self) -> bool {
+        self.weights.layers.iter().any(|l| l.linear_attn().is_some())
+    }
+
     pub fn forward(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
         let h = self.config.hidden_size;
         let seq_len_val = self.seq_len + 1;
@@ -1142,6 +1176,22 @@ impl Model {
         self.prefill_kv_only = true;
         self.forward_layers(gpu);
         self.prefill_kv_only = false;
+    }
+
+    /// Dispatch lm_head onto the current state.normed hidden state → writes logits.
+    /// Must be called after forward_kv_only() + flush_and_wait() for the last token.
+    /// Caller must then call sample_first_decode_token() to sample from the logits.
+    pub fn dispatch_lm_head(&mut self, gpu: &mut GpuContext) {
+        let h = self.config.hidden_size;
+        if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
+        }
     }
 
     /// Forward pass with raw f32 embedding instead of token ID lookup.
@@ -1213,6 +1263,8 @@ impl Model {
                 self.gptq_matvec(gpu, "oproj",
                     &self.state.attn_output, &sa.o_proj_qweight, &sa.o_proj_scales,
                     &self.state.o_proj_out, h, p_o);
+
+
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[2]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
@@ -1229,19 +1281,15 @@ impl Model {
 
                 let lin_idx = (0..i).filter(|j| !self.weights.self_attn_layers.contains(j)).count();
 
-                // Use p_scratch for deltanet qkv/z projections (dynamic total_ch/lnvh*lvd dims)
-                gpu.flush();
-                gpu.write_buffer(&self.state.p_scratch, 0, bytemuck::cast_slice(&[h, total_ch, self.quant_config.group_size, 0u32]));
+                // Static params buffers — no flush needed, values pre-computed at model init.
                 self.gptq_matvec(gpu, "dn_qkv",
                     &self.state.normed, &la.in_proj_qkv_qweight, &la.in_proj_qkv_scales,
-                    &self.state.deltanet_qkv, total_ch, &self.state.p_scratch);
+                    &self.state.deltanet_qkv, total_ch, &self.state.p_dn_qkv);
 
-                gpu.flush();
                 let dn_z_n = lnvh * lvd;
-                gpu.write_buffer(&self.state.p_scratch, 0, bytemuck::cast_slice(&[h, dn_z_n, self.quant_config.group_size, 0u32]));
                 self.gptq_matvec(gpu, "dn_z",
                     &self.state.normed, &la.in_proj_z_qweight, &la.in_proj_z_scales,
-                    &self.state.deltanet_z, dn_z_n, &self.state.p_scratch);
+                    &self.state.deltanet_z, dn_z_n, &self.state.p_dn_z);
 
                 gpu.dispatch(
                     "deltanet",
@@ -1262,12 +1310,10 @@ impl Model {
                     (lnkh, 1, 1),
                 );
 
-                gpu.flush();
-                gpu.write_buffer(&self.state.p_scratch, 0, bytemuck::cast_slice(&[dn_z_n, h, self.quant_config.group_size, 0u32]));
                 self.fused_silu_gptq_down(gpu,
                     &self.state.deltanet_z, &self.state.deltanet_output,
                     &la.out_proj_qweight, &la.out_proj_scales,
-                    &self.state.o_proj_out, h, &self.state.p_scratch);
+                    &self.state.o_proj_out, h, &self.state.p_dn_down);
             } else {
                 gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
             }
@@ -1292,6 +1338,7 @@ impl Model {
             if self.lora.as_ref().map_or(false, |l| l.config.targets[3]) {
                 self.lora_apply_down_proj(gpu, i);
             }
+
         }
 
         // Final norm
@@ -1300,11 +1347,21 @@ impl Model {
 
         self.seq_len += 1;
 
-        // Prefill-only mode: skip lm_head + GPU→CPU readback (607KB per token).
-        // Only the final decode step needs the logit readback.
+        // Prefill-only mode: skip lm_head + GPU→CPU readback.
+        // Submit this token's layers as its own command buffer (non-blocking).
+        // Vulkan in-order queue execution guarantees each token sees the previous one's KV writes.
+        // The single device.poll() in the final read_buffer() syncs all prefill submissions.
         if self.prefill_kv_only {
+            gpu.flush();
             return 0;
         }
+
+        // Sync layers before lm_head to bound work per poll on PowerVR.
+        // Poll #1: layers (32 layers × ~5 dispatches each)
+        // Poll #2: lm_head chunks + penalty + topk (via read_buffer)
+        log::info!("[forward] seq={} polling layers...", self.seq_len);
+        gpu.flush_and_wait();
+        log::info!("[forward] seq={} layers done, dispatching lm_head", self.seq_len);
 
         // LM head
         if self.tied_embeddings {
@@ -1328,7 +1385,7 @@ impl Model {
     /// GPU-accelerated sampling:
     ///   1. Apply repetition penalty + presence penalty + temperature on GPU (1 dispatch, O(V))
     ///   2. Extract top-K candidates on GPU (1 dispatch, O(K·V) in one workgroup, no readback of full logits)
-    ///   3. CPU reads TOPK_K * 8 = 160 bytes, does softmax + top-p nucleus sampling
+    ///   3. CPU reads TOPK_K * 8 = 64 bytes, does softmax + top-p nucleus sampling
     ///
     /// Reduces GPU→CPU transfer from 607KB (full logits) to 160 bytes.
     fn sample_token_gpu(&mut self, gpu: &mut GpuContext) -> u32 {
@@ -1361,10 +1418,11 @@ impl Model {
         }
 
         // ── Upload penalty uniform ─────────────────────────────────────────
-        // PenaltyParams layout (48 bytes, padded to 64):
-        //   u32 vocab_size, f32 rep_penalty, f32 presence_penalty, f32 temperature
-        //   u32 ban0..ban3  (16 bytes)
-        //   u32 ban4, ban5, u32 n_bans, u32 _pad
+        // PenaltyParams layout (64 bytes):
+        //   u32 vocab_size, f32 rep_penalty, f32 presence_penalty, f32 temperature  (16)
+        //   u32 ban0..ban3  (16)
+        //   u32 ban4, ban5, u32 n_bans, u32 _pad  (16)
+        //   u32 gate_w0..gate_w3  (16) — 128-bit first-byte bitmap; all-ones = unconstrained
         let mut pu = [0u8; 64];
         pu[0..4].copy_from_slice(&vocab.to_le_bytes());
         pu[4..8].copy_from_slice(&rep_penalty.to_le_bytes());
@@ -1377,39 +1435,36 @@ impl Model {
         pu[32..36].copy_from_slice(&bans[4].to_le_bytes());
         pu[36..40].copy_from_slice(&bans[5].to_le_bytes());
         pu[40..44].copy_from_slice(&n_bans.to_le_bytes());
+        // gate_w0..w3: 128-bit bitmap over ASCII first bytes; all-ones = unconstrained
+        let gate_words = self.json_sampler.as_ref()
+            .map(|js| js.required_gate().as_gate_words())
+            .unwrap_or([!0u32; 4]);
+        // pu[44..48] = _pad (already zero)
+        pu[48..52].copy_from_slice(&gate_words[0].to_le_bytes());
+        pu[52..56].copy_from_slice(&gate_words[1].to_le_bytes());
+        pu[56..60].copy_from_slice(&gate_words[2].to_le_bytes());
+        pu[60..64].copy_from_slice(&gate_words[3].to_le_bytes());
         gpu.flush();
         gpu.write_buffer(&self.state.penalty_uniform, 0, &pu);
 
-        // topk_uniform was pre-initialized with vocab_size at construction — no write needed.
-
-        // ── Dispatch penalty+temperature shader ────────────────────────────
-        gpu.dispatch(
-            "sample_penalty_temp",
-            shaders::SAMPLE_PENALTY_TEMP,
-            &[
-                gpu::bind(0, &self.state.logits),
-                gpu::bind(1, &self.state.seen_bitmap),
-                gpu::bind(2, &self.state.penalty_uniform),
-            ],
-            (vocab.div_ceil(256), 1, 1),
-        );
-
-        // ── Dispatch top-K extraction shader ──────────────────────────────
-        // Single workgroup scans all vocab positions K times.
-        // Writes top-K {idx, val} to topk_out. Destroys logits in-place.
+        // ── Combined penalty + gate + top-K dispatch (single vocab pass) ──
         gpu.dispatch(
             "sample_topk",
             shaders::SAMPLE_TOPK,
             &[
                 gpu::bind(0, &self.state.logits),
-                gpu::bind(1, &self.state.topk_out),
-                gpu::bind(2, &self.state.topk_uniform),
+                gpu::bind(1, &self.state.seen_bitmap),
+                gpu::bind(2, &self.state.penalty_uniform),
+                gpu::bind(3, &self.state.first_bytes_buf),
+                gpu::bind(4, &self.state.topk_out),
             ],
             (1, 1, 1),
         );
 
-        // ── Read back only the top-K candidates (160 bytes) ───────────────
+        // ── Read back only the top-K candidates (24 bytes) ────────────────
+        log::info!("[forward] seq={} polling lm_head+topk...", self.seq_len);
         let topk_bytes = gpu.read_buffer(&self.state.topk_out, TOPK_K as u64 * 8);
+        log::info!("[forward] seq={} readback done", self.seq_len);
         // Each candidate is {idx: u32, val: f32} = 8 bytes
         let mut candidates: Vec<(u32, f32)> = (0..TOPK_K as usize)
             .map(|i| {
@@ -1421,14 +1476,33 @@ impl Model {
             .filter(|&(_, v)| v.is_finite())
             .collect();
 
+        // Log top-K for diagnostics
+        log::info!("[topk] seq={} gate={:?} candidates={:?}", self.seq_len,
+            self.json_sampler.as_ref().map(|js| format!("{:?}", js.required_gate())),
+            &candidates);
+
+        // Suppress EOS tokens until JSON is complete (CPU-side, cheap on K=8 candidates)
+        if let Some(ref js) = self.json_sampler {
+            js.suppress_eos_if_incomplete(&mut candidates);
+        }
+
         if candidates.is_empty() {
             // Fallback: return first candidate unconditionally
             let idx = u32::from_le_bytes(topk_bytes[0..4].try_into().unwrap());
             self.last_token_prob = 1.0;
             self.generated_tokens.push(idx);
             self.mark_seen(gpu, idx);
+            if let Some(ref mut js) = self.json_sampler {
+                js.advance_token(idx);
+            }
             return idx;
         }
+
+        // ── At hard-gate positions, take top-1 (greedy) to avoid sampling valid-but-wrong tokens ──
+        // e.g. at Root gate (requires '{'), greedy prevents selecting '{}_' over '{"'.
+        let at_hard_gate = self.json_sampler.as_ref()
+            .map(|js| !js.required_gate().is_any())
+            .unwrap_or(false);
 
         // ── Top-p nucleus sampling on the small candidate set ─────────────
         let max_val = candidates.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max);
@@ -1446,6 +1520,7 @@ impl Model {
             cumsum += p;
             nucleus.push((*idx, *p));
             if cumsum >= top_p { break; }
+            if at_hard_gate { break; } // greedy: stop after top-1
         }
         let nuc_sum: f32 = nucleus.iter().map(|(_, p)| p).sum();
         for (_, p) in nucleus.iter_mut() { *p /= nuc_sum; }
@@ -1470,6 +1545,9 @@ impl Model {
         self.last_token_prob = sampled_prob;
         self.generated_tokens.push(sampled);
         self.mark_seen(gpu, sampled);
+        if let Some(ref mut js) = self.json_sampler {
+            js.advance_token(sampled);
+        }
         sampled
     }
 
@@ -1998,10 +2076,27 @@ impl Model {
         token
     }
 
+    /// Zero out all DeltaNet conv history and recurrent state buffers.
+    /// Call before serial decode to ensure a clean start matching the batch prefill path.
+    pub fn clear_deltanet_state(&self, gpu: &mut GpuContext) {
+        let lnkh = self.linear_num_key_heads;
+        let lkd  = self.linear_key_dim;
+        let lnvh = self.linear_num_value_heads;
+        let lvd  = self.linear_value_dim;
+        let dn_total_ch = lnkh * lkd * 2 + lnvh * lvd;
+        let hist_zeros  = vec![0u8; 3 * dn_total_ch as usize * 4];
+        let state_zeros = vec![0u8; (lnvh * lkd * lvd) as usize * 4];
+        for lin_idx in 0..self.state.deltanet_hist.len() {
+            gpu.write_buffer(&self.state.deltanet_hist[lin_idx],  0, &hist_zeros);
+            gpu.write_buffer(&self.state.deltanet_state[lin_idx], 0, &state_zeros);
+        }
+        gpu.flush();
+    }
+
     /// Batched GPTQ prefill: process all N input tokens in one GPU submission.
     /// Only supports GPTQ INT4 weights with Q_GATED=true (Qwen3.5).
     /// Returns the first sampled decode token.
-    pub fn prefill_gptq(&mut self, gpu: &mut GpuContext, input_ids: &[u32]) -> u32 {
+    pub fn prefill_gptq(&mut self, gpu: &mut GpuContext, input_ids: &[u32]) {
         assert!(!self.bf16_mode, "prefill_gptq requires GPTQ mode (use prefill() for bf16)");
         let seq_len = input_ids.len() as u32;
         let h = self.config.hidden_size;
@@ -2018,12 +2113,18 @@ impl Model {
         let residual = gpu.create_storage_buffer("pg_residual", sl * h as u64 * f);
         // Embed token by token into residual (reuse state.hidden as scratch per token)
         for (i, &tok) in input_ids.iter().enumerate() {
+            // Non-chunked embedding path reads p_embed[0] directly — write the token id first.
+            // Must flush before each iteration: wgpu::Queue::write_buffer is staged and all
+            // pending writes are applied at submission time, so without a flush the last
+            // write would overwrite p_embed for all iterations.
+            gpu.write_buffer(&self.state.p_embed, 0, &tok.to_le_bytes());
             self.embedding(gpu, tok);
             gpu.copy_buffer_offset(
                 &self.state.hidden, 0,
                 &residual, i as u64 * h as u64 * f,
                 h as u64 * f,
             );
+            gpu.flush();
         }
         gpu.flush();
 
@@ -2035,7 +2136,7 @@ impl Model {
         let k_buf   = gpu.create_storage_buffer("pg_k",      sl * (nkv * hd) as u64 * f);
         let v_buf   = gpu.create_storage_buffer("pg_v",      sl * (nkv * hd) as u64 * f);
         let attn_out = gpu.create_storage_buffer("pg_attn",  sl * (nh * hd) as u64 * f);
-        let o_out   = gpu.create_storage_buffer("pg_o",      sl * h as u64 * f);
+        let o_out   = gpu.create_storage_buffer("pg_o",      sl * (nh * hd) as u64 * f);
         let gate_buf = gpu.create_storage_buffer("pg_gate",  sl * inter as u64 * f);
         let up_buf  = gpu.create_storage_buffer("pg_up",     sl * inter as u64 * f);
         let mlp_out = gpu.create_storage_buffer("pg_mlp",    sl * h as u64 * f);
@@ -2053,6 +2154,38 @@ impl Model {
         let pg_params = gpu.create_buffer("pg_params", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         // Clone the shader src to avoid borrow conflicts inside the layer loop
         let batched_qknorm_gated_src = self.batched_qknorm_gated_src.clone();
+
+        // ── DeltaNet scratch buffers (used only for hybrid linear-attn layers) ──
+        let lnkh = self.linear_num_key_heads;
+        let lkd  = self.linear_key_dim;
+        let lnvh = self.linear_num_value_heads;
+        let lvd  = self.linear_value_dim;
+        let dn_total_ch = lnkh * lkd * 2 + lnvh * lvd;  // total Q+K+V channels
+        let dn_z_n = lnvh * lvd;
+
+        let dn_qkv_batch = gpu.create_storage_buffer("pg_dn_qkv", sl * dn_total_ch as u64 * f);
+        let dn_z_batch   = gpu.create_storage_buffer("pg_dn_z",   sl * dn_z_n as u64 * f);
+        let dn_out_batch = gpu.create_storage_buffer("pg_dn_out", sl * dn_z_n as u64 * f);
+
+        // Separate params buffer for DeltaNet uniform (8 fields, 32 bytes)
+        let pg_dn_params = gpu.create_buffer("pg_dn_params", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+
+        // Zero all DeltaNet hist and state buffers so prefill always starts from a clean
+        // initial condition regardless of leftover state from previous generate() calls.
+        let hist_zeros  = vec![0u8; 3 * dn_total_ch as usize * 4];
+        let state_zeros = vec![0u8; (lnvh * lkd * lvd) as usize * 4];
+        for lin_idx in 0..self.state.deltanet_hist.len() {
+            gpu.write_buffer(&self.state.deltanet_hist[lin_idx],  0, &hist_zeros);
+            gpu.write_buffer(&self.state.deltanet_state[lin_idx], 0, &state_zeros);
+        }
+        gpu.flush();
+
+        #[repr(C)]
+        #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+        struct DnP {
+            num_heads: u32, key_dim: u32, value_dim: u32, total_channels: u32,
+            eps: f32, hidden_size: u32, num_value_heads: u32, seq_len: u32,
+        }
 
         for layer_idx in 0..self.config.num_hidden_layers as usize {
             let layer = &self.weights.layers[layer_idx];
@@ -2076,97 +2209,151 @@ impl Model {
                 ], (seq_len, 1, 1));
             }
 
-            let sa = layer.self_attn().expect("prefill_gptq: expected self-attn layer");
-            let q_dim = nh * hd * 2; // Q_GATED: output [nh, hd*2]
-            let kv_dim = nkv * hd;
+            let gemm_shader = shaders::GPTQ_GEMM_4T;
+            let wg_h = h.div_ceil(8);
+            let is_sa = self.weights.self_attn_layers.contains(&layer_idx);
 
-            // ── Q proj: [seq, h] → [seq, nh*hd*2] ──
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: q_dim, group_size: gs, _pad: 0 }));
-            let gemm_shader = if self.use_4t { shaders::GPTQ_GEMM_4T } else { shaders::GPTQ_GEMM };
-            let wg_n = if self.use_4t { q_dim.div_ceil(8) } else { q_dim.div_ceil(32) };
-            gpu.dispatch("pg_q", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
-                gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &q_raw),
-                gpu::bind(4, &pg_params),
-            ], (wg_n, seq_len, 1));
+            if is_sa {
+                let sa = layer.self_attn().expect("prefill_gptq: layer is_sa but no self_attn weights");
+                let q_dim = nh * hd * 2; // Q_GATED: output [nh, hd*2]
+                let kv_dim = nkv * hd;
 
-            // ── K proj ──
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
-            let wg_kv = if self.use_4t { kv_dim.div_ceil(8) } else { kv_dim.div_ceil(32) };
-            gpu.dispatch("pg_k", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &sa.k_proj_qweight),
-                gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &k_buf),
-                gpu::bind(4, &pg_params),
-            ], (wg_kv, seq_len, 1));
-
-            // ── V proj ──
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
-            gpu.dispatch("pg_v", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &sa.v_proj_qweight),
-                gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &v_buf),
-                gpu::bind(4, &pg_params),
-            ], (wg_kv, seq_len, 1));
-
-            // ── Batched Q_GATED qknorm + RoPE + KV cache write ──
-            // batched_qknorm_params[layer_idx] has header+weights pre-loaded.
-            // Write seq_len (4 bytes) at offset 16 (seq_len field in header).
-            gpu.flush();
-            gpu.write_buffer(&self.state.batched_qknorm_params[layer_idx], 16, &seq_len.to_le_bytes());
-            gpu.dispatch("pg_qknorm", &batched_qknorm_gated_src, &[
-                gpu::bind(0, &q_raw),   // [seq, nh, hd*2]
-                gpu::bind(1, &q_proj),  // [seq, nh, hd] out
-                gpu::bind(2, &q_gate),  // [seq, nh, hd] out
-                gpu::bind(3, &k_buf),   // [seq, nkv, hd] in/out
-                gpu::bind(4, &v_buf),   // [seq, nkv, hd] in
-                gpu::bind(5, &self.state.k_cache[layer_idx]),
-                gpu::bind(6, &self.state.v_cache[layer_idx]),
-                gpu::bind(7, &self.state.batched_qknorm_params[layer_idx]),
-            ], (nh + nkv, seq_len, 1));
-
-            // ── Causal attention (batched) ──
-            {
-                #[repr(C)]
-                #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-                struct AttnP { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
+                // ── Q proj: [seq, h] → [seq, nh*hd*2] ──
                 gpu.flush();
-                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&AttnP {
-                    seq_len, head_dim: hd, num_kv_heads: nkv,
-                    num_q_heads: nh, heads_per_kv: nh / nkv }));
-                gpu.dispatch("pg_attn", shaders::CAUSAL_ATTENTION_PREFILL, &[
-                    gpu::bind(0, &q_proj), gpu::bind(1, &k_buf),
-                    gpu::bind(2, &v_buf),  gpu::bind(3, &attn_out),
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: q_dim, group_size: gs, _pad: 0 }));
+                let wg_n = q_dim.div_ceil(8);
+                gpu.dispatch("pg_q", gemm_shader, &[
+                    gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
+                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &q_raw),
                     gpu::bind(4, &pg_params),
-                ], (nh, seq_len, 1));
-            }
+                ], (wg_n, seq_len, 1));
 
-            // ── Sigmoid gate on attention output ──
-            // causal_attention_prefill doesn't fuse Q_GATED, so apply it here.
-            {
-                let n = seq_len * nh * hd;
+                // ── K proj ──
                 gpu.flush();
-                gpu.write_buffer(&pg_params, 0, &n.to_le_bytes());
-                // sigmoid_mul.wgsl: output[i] = x[i] / (1 + exp(-gate[i]))
-                // We need a separate write target — use o_out as temp
-                gpu.dispatch("pg_siggate", shaders::SIGMOID_MUL, &[
-                    gpu::bind(0, &attn_out), gpu::bind(1, &q_gate),
-                    gpu::bind(2, &o_out),    gpu::bind(3, &pg_params),
-                ], (n.div_ceil(256), 1, 1));
-                // o_out now holds gated attention output; use it as input to O projection
-            }
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
+                let wg_kv = kv_dim.div_ceil(8);
+                gpu.dispatch("pg_k", gemm_shader, &[
+                    gpu::bind(0, &normed), gpu::bind(1, &sa.k_proj_qweight),
+                    gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &k_buf),
+                    gpu::bind(4, &pg_params),
+                ], (wg_kv, seq_len, 1));
 
-            // ── O projection: [seq, nh*hd] → [seq, h] ──
-            let o_h_dim = nh * hd;
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: o_h_dim, n: h, group_size: gs, _pad: 0 }));
-            let wg_h = if self.use_4t { h.div_ceil(8) } else { h.div_ceil(32) };
-            gpu.dispatch("pg_o", gemm_shader, &[
-                gpu::bind(0, &o_out), gpu::bind(1, &sa.o_proj_qweight),
-                gpu::bind(2, &sa.o_proj_scales), gpu::bind(3, &mlp_out),
-                gpu::bind(4, &pg_params),
-            ], (wg_h, seq_len, 1));
+                // ── V proj ──
+                gpu.flush();
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
+                gpu.dispatch("pg_v", gemm_shader, &[
+                    gpu::bind(0, &normed), gpu::bind(1, &sa.v_proj_qweight),
+                    gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &v_buf),
+                    gpu::bind(4, &pg_params),
+                ], (wg_kv, seq_len, 1));
+
+                // ── Batched Q_GATED qknorm + RoPE + KV cache write ──
+                // batched_qknorm_params[layer_idx] has header+weights pre-loaded.
+                // Write seq_len (4 bytes) at offset 16 (seq_len field in header).
+                gpu.flush();
+                gpu.write_buffer(&self.state.batched_qknorm_params[layer_idx], 16, &seq_len.to_le_bytes());
+                gpu.dispatch("pg_qknorm", &batched_qknorm_gated_src, &[
+                    gpu::bind(0, &q_raw),   // [seq, nh, hd*2]
+                    gpu::bind(1, &q_proj),  // [seq, nh, hd] out
+                    gpu::bind(2, &q_gate),  // [seq, nh, hd] out
+                    gpu::bind(3, &k_buf),   // [seq, nkv, hd] in/out
+                    gpu::bind(4, &v_buf),   // [seq, nkv, hd] in
+                    gpu::bind(5, &self.state.k_cache[layer_idx]),
+                    gpu::bind(6, &self.state.v_cache[layer_idx]),
+                    gpu::bind(7, &self.state.batched_qknorm_params[layer_idx]),
+                ], (nh + nkv, seq_len, 1));
+
+                // ── Causal attention (batched) ──
+                {
+                    #[repr(C)]
+                    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+                    struct AttnP { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&AttnP {
+                        seq_len, head_dim: hd, num_kv_heads: nkv,
+                        num_q_heads: nh, heads_per_kv: nh / nkv }));
+                    gpu.dispatch("pg_attn", shaders::CAUSAL_ATTENTION_PREFILL, &[
+                        gpu::bind(0, &q_proj), gpu::bind(1, &k_buf),
+                        gpu::bind(2, &v_buf),  gpu::bind(3, &attn_out),
+                        gpu::bind(4, &pg_params),
+                    ], (nh, seq_len, 1));
+                }
+
+                // ── Sigmoid gate on attention output ──
+                {
+                    let n = seq_len * nh * hd;
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, &n.to_le_bytes());
+                    gpu.dispatch("pg_siggate", shaders::SIGMOID_MUL, &[
+                        gpu::bind(0, &attn_out), gpu::bind(1, &q_gate),
+                        gpu::bind(2, &o_out),    gpu::bind(3, &pg_params),
+                    ], (n.div_ceil(256), 1, 1));
+                }
+
+                // ── O projection: [seq, nh*hd] → [seq, h] → mlp_out ──
+                let o_h_dim = nh * hd;
+                gpu.flush();
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: o_h_dim, n: h, group_size: gs, _pad: 0 }));
+                gpu.dispatch("pg_o", gemm_shader, &[
+                    gpu::bind(0, &o_out), gpu::bind(1, &sa.o_proj_qweight),
+                    gpu::bind(2, &sa.o_proj_scales), gpu::bind(3, &mlp_out),
+                    gpu::bind(4, &pg_params),
+                ], (wg_h, seq_len, 1));
+
+            } else if let Some(la) = layer.linear_attn() {
+                // ── DeltaNet batched prefill ──
+                let lin_idx = (0..layer_idx)
+                    .filter(|j| !self.weights.self_attn_layers.contains(j))
+                    .count();
+
+                // QKV projection: normed[seq, h] → dn_qkv_batch[seq, total_ch]
+                gpu.flush();
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: dn_total_ch, group_size: gs, _pad: 0 }));
+                gpu.dispatch("pg_dn_qkv", gemm_shader, &[
+                    gpu::bind(0, &normed), gpu::bind(1, &la.in_proj_qkv_qweight),
+                    gpu::bind(2, &la.in_proj_qkv_scales), gpu::bind(3, &dn_qkv_batch),
+                    gpu::bind(4, &pg_params),
+                ], (dn_total_ch.div_ceil(8), seq_len, 1));
+
+                // Z gate projection: normed[seq, h] → dn_z_batch[seq, dn_z_n]
+                gpu.flush();
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: dn_z_n, group_size: gs, _pad: 0 }));
+                gpu.dispatch("pg_dn_z", gemm_shader, &[
+                    gpu::bind(0, &normed), gpu::bind(1, &la.in_proj_z_qweight),
+                    gpu::bind(2, &la.in_proj_z_scales), gpu::bind(3, &dn_z_batch),
+                    gpu::bind(4, &pg_params),
+                ], (dn_z_n.div_ceil(8), seq_len, 1));
+
+                // DeltaNet recurrence + RMSNorm over all positions (serial inside shader)
+                gpu.flush();
+                gpu.write_buffer(&pg_dn_params, 0, bytemuck::bytes_of(&DnP {
+                    num_heads: lnkh, key_dim: lkd, value_dim: lvd,
+                    total_channels: dn_total_ch, eps: self.config.rms_norm_eps,
+                    hidden_size: h, num_value_heads: lnvh, seq_len,
+                }));
+                gpu.dispatch("pg_dn_recur", shaders::BATCHED_DELTANET_PREFILL, &[
+                    gpu::bind(0, &dn_qkv_batch),
+                    gpu::bind(1, &self.state.deltanet_hist[lin_idx]),
+                    gpu::bind(2, &la.conv1d_weight),
+                    gpu::bind(3, &self.state.deltanet_state[lin_idx]),
+                    gpu::bind(4, &dn_out_batch),
+                    gpu::bind(5, &normed),   // hidden_batch [seq, h]
+                    gpu::bind(6, &la.ab_weight),
+                    gpu::bind(7, &la.a_log),
+                    gpu::bind(8, &la.dt_bias),
+                    gpu::bind(9, &la.norm_weight),
+                    gpu::bind(10, &pg_dn_params),
+                ], (lnkh, 1, 1));
+
+                // Out projection: silu(dn_z_batch) * dn_out_batch → mlp_out[seq, h]
+                gpu.flush();
+                gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: dn_z_n, n: h, group_size: gs, _pad: 0 }));
+                gpu.dispatch("pg_dn_out", shaders::FUSED_SILU_GPTQ_GEMM_4T, &[
+                    gpu::bind(0, &dn_z_batch), gpu::bind(1, &dn_out_batch),
+                    gpu::bind(2, &la.out_proj_qweight), gpu::bind(3, &la.out_proj_scales),
+                    gpu::bind(4, &mlp_out), gpu::bind(5, &pg_params),
+                ], (wg_h, seq_len, 1));
+            }
 
             // ── Post-attention add+norm: residual += o_proj_out ──
             gpu.flush();
@@ -2179,7 +2366,7 @@ impl Model {
             ], (seq_len, 1, 1));
 
             // ── MLP: gate + up (fused) ──
-            let gemm_gate_wg = if self.use_4t { inter.div_ceil(8) } else { inter.div_ceil(32) };
+            let gemm_gate_wg = inter.div_ceil(8);
             // The fused gate+up shader only supports seq=1 (no batch dim).
             // For batched prefill, fall back to two separate GPTQ GEMMs for gate and up.
             gpu.flush();
@@ -2199,7 +2386,7 @@ impl Model {
             ], (gemm_gate_wg, seq_len, 1));
 
             // ── Fused SiLU(gate) × up × down: [seq, inter] → [seq, h] ──
-            let fused_down_shader = if self.use_4t { shaders::FUSED_SILU_GPTQ_GEMM_4T } else { shaders::FUSED_SILU_GPTQ_GEMM };
+            let fused_down_shader = shaders::FUSED_SILU_GPTQ_GEMM_4T;
             gpu.flush();
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: inter, n: h, group_size: gs, _pad: 0 }));
             gpu.dispatch("pg_down", fused_down_shader, &[
@@ -2211,6 +2398,7 @@ impl Model {
             if (layer_idx + 1) % 7 == 0 {
                 log::info!("[prefill_gptq] layer {}/{}", layer_idx + 1, self.config.num_hidden_layers);
             }
+
         }
 
         // ── Final norm ──
@@ -2248,12 +2436,17 @@ impl Model {
         }
 
         self.seq_len = seq_len;
+        log::info!("[prefill_gptq] done, seq_len={}", seq_len);
+        // Caller must call sample_first_decode_token() to obtain the first decode token.
+        // This allows feature-gated think injection before sampling.
+    }
 
-        // ── Sample first decode token ──
+    /// Sample the first decode token from the current lm_head logit state.
+    /// Must be called after prefill_gptq() / dispatch_lm_head() and any optional think injection.
+    /// sample_token_gpu() already pushes the token and marks it seen.
+    pub fn sample_first_decode_token(&mut self, gpu: &mut GpuContext) -> u32 {
         let token = self.sample_token_gpu(gpu);
-        self.generated_tokens.push(token);
-        self.mark_seen(gpu, token);
-        log::info!("[prefill_gptq] done, seq_len={}, first_token={}", seq_len, token);
+        log::info!("[prefill_gptq] first_decode_token={}", token);
         token
     }
 

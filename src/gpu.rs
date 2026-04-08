@@ -14,6 +14,9 @@ pub struct GpuContext {
     max_storage_binding: u64,
     pipeline_cache: Option<wgpu::PipelineCache>,
     has_pipeline_cache_feature: bool,
+    /// Pre-allocated probe buffers for Poll-mode flush_and_wait (avoids per-call allocation).
+    flush_probe_src: Option<wgpu::Buffer>,
+    flush_probe_dst: Option<wgpu::Buffer>,
 }
 
 impl GpuContext {
@@ -26,7 +29,7 @@ impl GpuContext {
     /// share it with both the UI renderer and the compute pipeline.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let limit = device.limits().max_storage_buffer_binding_size;
-        Self {
+        let mut ctx = Self {
             device,
             queue,
             pipelines: HashMap::new(),
@@ -36,7 +39,11 @@ impl GpuContext {
             max_storage_binding: limit,
             pipeline_cache: None,
             has_pipeline_cache_feature: false,
-        }
+            flush_probe_src: None,
+            flush_probe_dst: None,
+        };
+        ctx.init_flush_probe();
+        ctx
     }
 
     pub fn max_storage_binding_size(&self) -> u64 {
@@ -95,7 +102,7 @@ impl GpuContext {
 
         let has_pc = pipeline_cache_feature.contains(wgpu::Features::PIPELINE_CACHE);
         let max_storage_binding = device.limits().max_storage_buffer_binding_size;
-        Self {
+        let mut ctx = Self {
             device,
             queue,
             pipelines: HashMap::new(),
@@ -105,11 +112,27 @@ impl GpuContext {
             max_storage_binding,
             pipeline_cache: None,
             has_pipeline_cache_feature: has_pc,
-        }
+            flush_probe_src: None,
+            flush_probe_dst: None,
+        };
+        ctx.init_flush_probe();
+        ctx
     }
 
     pub fn supports_pipeline_cache(&self) -> bool {
         self.has_pipeline_cache_feature
+    }
+
+    fn init_flush_probe(&mut self) {
+        let src = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("flush_probe_src"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dst = self.create_readback_buffer("flush_probe_dst", 4);
+        self.flush_probe_src = Some(src);
+        self.flush_probe_dst = Some(dst);
     }
 
     /// Load a Vulkan pipeline cache from raw bytes (previously returned by `get_pipeline_cache_data`).
@@ -178,9 +201,11 @@ impl GpuContext {
             let offset = (i * chunk_size) as u64;
             self.queue.write_buffer(&buffer, offset, chunk);
         }
-        // Flush and wait for completion
+        // Submit staging writes without blocking (no device.poll).
+        // Vulkan in-order queue guarantees these copies complete before any
+        // subsequent compute dispatches that read from this buffer.
+        // This avoids exhausting PowerVR's limited fence/poll resources during model loading.
         self.queue.submit(std::iter::empty());
-        self.device.poll(wgpu::PollType::wait_indefinitely());
         buffer
     }
 
@@ -309,6 +334,42 @@ impl GpuContext {
         }
     }
 
+    /// Flush and block until the GPU has finished all submitted work.
+    /// Uses Poll-mode loop with a cached COPY_SRC → MAP_READ probe to avoid
+    /// the PowerVR Vulkan driver hang in vkWaitForFences(wait_indefinitely).
+    pub fn flush_and_wait(&mut self) {
+        self.flush();
+        // Submit a copy of the cached probe_src → probe_dst. Vulkan in-order queue
+        // guarantees this completes after all prior submitted work. map_async on
+        // probe_dst fires only after this fence — i.e., after all prior work is done.
+        let probe_src = self.flush_probe_src.as_ref().expect("flush_probe_src not init");
+        let probe_dst = self.flush_probe_dst.as_ref().expect("flush_probe_dst not init");
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("flush_probe"),
+        });
+        enc.copy_buffer_to_buffer(probe_src, 0, probe_dst, 0, 4);
+        self.queue.submit(std::iter::once(enc.finish()));
+
+        let slice = probe_dst.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            match rx.try_recv() {
+                Ok(_) => { probe_dst.unmap(); return; }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!("[gpu] flush_and_wait: timed out after 30s — GPU may be hung");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
     /// Copy buffer contents (batched into current encoder).
     pub fn copy_buffer(&mut self, src: &wgpu::Buffer, dst: &wgpu::Buffer, size: u64) {
         self.ensure_encoder();
@@ -324,30 +385,13 @@ impl GpuContext {
     }
 
     /// Read back a buffer to CPU. Flushes pending work first.
+    /// Uses Poll-mode loop to avoid PowerVR hang in vkWaitForFences.
     pub fn read_buffer(&mut self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
-        // Flush any pending dispatches
-        self.flush();
-
-        let staging = self.create_readback_buffer("readback", size);
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().unwrap().unwrap();
-
-        let data = slice.get_mapped_range().to_vec();
-        staging.unmap();
-        data
+        self.try_read_buffer_offset(buffer, 0, size, std::time::Duration::from_secs(30))
+            .unwrap_or_else(|| {
+                log::warn!("[gpu] read_buffer timed out — returning zeros ({} bytes)", size);
+                vec![0u8; size as usize]
+            })
     }
 
     /// Read a sub-range of a buffer to CPU.
@@ -367,6 +411,52 @@ impl GpuContext {
         let data = slice.get_mapped_range().to_vec();
         staging.unmap();
         data
+    }
+
+    /// Read a sub-range of a buffer with a timeout. Returns None if the GPU
+    /// does not respond within `timeout`. Needed on PowerVR where
+    /// vkWaitForFences hangs after heavy prefill workloads.
+    pub fn try_read_buffer_offset(
+        &mut self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        timeout: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        self.flush();
+        let staging = self.create_readback_buffer("readback_timed", size);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback_timed"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    let data = slice.get_mapped_range().to_vec();
+                    staging.unmap();
+                    return Some(data);
+                }
+                Ok(Err(e)) => {
+                    log::warn!("[gpu] readback mapping failed: {:?}", e);
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::warn!("[gpu] readback timed out after {:.1}s", timeout.as_secs_f32());
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            }
+        }
     }
 
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {

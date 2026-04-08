@@ -1,5 +1,8 @@
 // Causal GQA attention for prefill (batched Q/K/V, no KV cache).
+// Uses flash-attention online softmax so it correctly handles any sequence length.
+//
 // Each workgroup handles one Q head at one query position.
+// Each thread tid handles head_dim index tid (supports head_dim ≤ 256).
 //
 // Input: Q[seq_len, num_q_heads, head_dim], K[seq_len, num_kv_heads, head_dim],
 //        V[seq_len, num_kv_heads, head_dim]
@@ -21,8 +24,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-var<workgroup> wg_score: array<f32, 256>;
-var<workgroup> wg_reduce: array<f32, 256>;
+// Tile of K-position scores for the current tile (shared across threads).
+// 256 scores = one tile of K positions processed per round.
+var<workgroup> wg_tile_scores: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -39,72 +43,58 @@ fn main(
     if (q_head >= params.num_q_heads || q_pos >= seq_len) { return; }
 
     let q_base = q_pos * params.num_q_heads * head_dim + q_head * head_dim;
+    let causal_len = q_pos + 1u;  // attend to positions 0..q_pos (inclusive)
     let scale = 1.0 / sqrt(f32(head_dim));
-    let causal_len = q_pos + 1u;
-
-    // Phase 1: compute all attention scores and find max
-    var local_max: f32 = -1e30;
-    var j = tid;
-    while (j < causal_len) {
-        let k_base = j * params.num_kv_heads * head_dim + kv_head * head_dim;
-        var dot: f32 = 0.0;
-        for (var d = 0u; d < head_dim; d += 1u) {
-            dot += q_proj[q_base + d] * k_proj[k_base + d];
-        }
-        let s = dot * scale;
-        wg_score[j] = s;
-        local_max = max(local_max, s);
-        j += 256u;
-    }
-
-    // Max reduction
-    wg_reduce[tid] = local_max;
-    workgroupBarrier();
-    var stride = 128u;
-    while (stride > 0u) {
-        if (tid < stride) {
-            wg_reduce[tid] = max(wg_reduce[tid], wg_reduce[tid + stride]);
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    let max_score = wg_reduce[0];
-    workgroupBarrier();
-
-    // Phase 2: exp(score - max) and sum
-    var local_sum: f32 = 0.0;
-    j = tid;
-    while (j < causal_len) {
-        let e = exp(wg_score[j] - max_score);
-        wg_score[j] = e;
-        local_sum += e;
-        j += 256u;
-    }
-
-    wg_reduce[tid] = local_sum;
-    workgroupBarrier();
-    stride = 128u;
-    while (stride > 0u) {
-        if (tid < stride) {
-            wg_reduce[tid] = wg_reduce[tid] + wg_reduce[tid + stride];
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    let sum_exp = wg_reduce[0];
-    workgroupBarrier();
-
-    // Phase 3: weighted V sum
     let out_base = q_pos * params.num_q_heads * head_dim + q_head * head_dim;
-    var d = tid;
-    while (d < head_dim) {
-        var weighted_sum: f32 = 0.0;
-        for (var jj = 0u; jj < causal_len; jj += 1u) {
-            let prob = wg_score[jj] / sum_exp;
-            let v_base = jj * params.num_kv_heads * head_dim + kv_head * head_dim;
-            weighted_sum += prob * v_proj[v_base + d];
+
+    // ── Online (flash-attention) softmax state ──
+    // Each thread maintains its own running softmax state.
+    // Thread tid handles head_dim index = tid (valid when tid < head_dim).
+    var m: f32 = -1e30;  // running max
+    var l: f32 = 0.0;    // running sum of exp(score - m)
+    var o: f32 = 0.0;    // running weighted V sum for dimension tid
+
+    let num_tiles = (causal_len + 255u) / 256u;
+
+    for (var tile = 0u; tile < num_tiles; tile++) {
+        // ── Step 1: each thread computes the Q·K score for K position (tile*256 + tid) ──
+        let k_pos = tile * 256u + tid;
+        var score: f32 = -1e30;  // sentinal for out-of-range positions
+        if (k_pos < causal_len) {
+            let k_base = k_pos * params.num_kv_heads * head_dim + kv_head * head_dim;
+            var dot: f32 = 0.0;
+            for (var d = 0u; d < head_dim; d += 1u) {
+                dot += q_proj[q_base + d] * k_proj[k_base + d];
+            }
+            score = dot * scale;
         }
-        output[out_base + d] = weighted_sum;
-        d += 256u;
+        wg_tile_scores[tid] = score;
+        workgroupBarrier();  // all scores for this tile are ready
+
+        // ── Step 2: update online softmax state using this tile's scores ──
+        // Only threads with tid < head_dim update the V accumulator.
+        // Threads with tid >= head_dim only contributed to score computation above.
+        if (tid < head_dim) {
+            let tile_kv_start = tile * 256u;
+            let tile_end = min(256u, causal_len - tile_kv_start);
+            for (var kk = 0u; kk < tile_end; kk += 1u) {
+                let s = wg_tile_scores[kk];
+                let m_new = max(m, s);
+                let corr = exp(m - m_new);  // correction for previous accumulation
+                let e_s  = exp(s - m_new);
+
+                let kk_pos = tile_kv_start + kk;
+                let v_base = kk_pos * params.num_kv_heads * head_dim + kv_head * head_dim;
+                o = o * corr + e_s * v_proj[v_base + tid];
+                l = l * corr + e_s;
+                m = m_new;
+            }
+        }
+        workgroupBarrier();  // ensure all threads finish consuming tile scores before next tile
+    }
+
+    // ── Write normalized output ──
+    if (tid < head_dim) {
+        output[out_base + tid] = select(0.0, o / l, l > 0.0);
     }
 }

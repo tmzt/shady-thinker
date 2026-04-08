@@ -359,10 +359,12 @@ fn detect_model_prefix(tensor_map: &HashMap<String, wgpu::Buffer>, oversized_raw
     }
 }
 
-/// Detect whether a layer is self-attention or DeltaNet linear attention
+/// Detect whether a layer is self-attention or DeltaNet linear attention.
+/// Checks both GPTQ-quantized (.qweight) and unquantized BF16 (.weight) variants.
 fn is_self_attn_layer(tensor_map: &HashMap<String, wgpu::Buffer>, prefix: &str, layer_idx: u32) -> bool {
-    let key = format!("{prefix}.{layer_idx}.self_attn.q_proj.qweight");
-    tensor_map.contains_key(&key)
+    let qkey = format!("{prefix}.{layer_idx}.self_attn.q_proj.qweight");
+    let wkey = format!("{prefix}.{layer_idx}.self_attn.q_proj.weight");
+    tensor_map.contains_key(&qkey) || tensor_map.contains_key(&wkey)
 }
 
 /// Dequantize GPTQ INT4 symmetric weights to BF16 bytes.
