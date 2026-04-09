@@ -97,6 +97,42 @@ impl JsonSampler {
         self.sm.min_keys = n;
     }
 
+    /// Check if a candidate token is valid by simulating its full byte sequence
+    /// through the schema FST. Returns true if the FST is still active after
+    /// all bytes of the token are processed.
+    pub fn is_token_schema_valid(&self, token_id: u32) -> bool {
+        let schema = match &self.schema {
+            Some(s) => s,
+            None => return true, // no schema = all tokens valid
+        };
+        if !schema.is_active() { return true; } // schema exhausted = unconstrained
+
+        let bytes = match self.token_bytes.get(token_id as usize) {
+            Some(b) if !b.is_empty() => b,
+            _ => return true, // unknown/empty token = allow
+        };
+
+        // Clone the FST state and simulate
+        let mut sim = schema.clone();
+        for &b in bytes {
+            sim.advance(b);
+            if !sim.is_active() { return false; }
+        }
+        true
+    }
+
+    /// Filter top-K candidates by schema validity. Removes tokens that would
+    /// lead to a dead schema state. Called CPU-side on the small candidate set.
+    pub fn filter_by_schema(&self, candidates: &mut Vec<(u32, f32)>) {
+        if self.schema.is_none() { return; }
+        let before = candidates.len();
+        candidates.retain(|(token_id, _)| self.is_token_schema_valid(*token_id));
+        if candidates.len() < before {
+            log::debug!("[json-sampler] schema filtered {}/{} candidates",
+                before - candidates.len(), before);
+        }
+    }
+
     /// Constraint on the first byte of the next token.
     pub fn required_gate(&self) -> Constraint {
         // Schema FST takes priority when active

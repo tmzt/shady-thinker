@@ -1481,8 +1481,9 @@ impl Model {
             self.json_sampler.as_ref().map(|js| format!("{:?}", js.required_gate())),
             &candidates);
 
-        // Suppress EOS tokens until JSON is complete (CPU-side, cheap on K=8 candidates)
+        // CPU-side schema validation: filter candidates by full token byte sequence
         if let Some(ref js) = self.json_sampler {
+            js.filter_by_schema(&mut candidates);
             js.suppress_eos_if_incomplete(&mut candidates);
         }
 

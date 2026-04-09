@@ -33,6 +33,7 @@ fn template(prefix: &str, wild1: &[u8], mid: &str, wild2: &[u8], suffix: &str) -
 }
 
 /// Schema FST — tracks position in the template set.
+#[derive(Clone)]
 pub struct SchemaFST {
     templates: Vec<Vec<u8>>,
     pos: usize,
