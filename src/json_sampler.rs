@@ -71,6 +71,11 @@ impl JsonSampler {
         Self { sm: JsonSM::new(), token_bytes, eos_ids }
     }
 
+    /// Set minimum number of key-value pairs before allowing } at the top level.
+    pub fn set_min_keys(&mut self, n: u32) {
+        self.sm.min_keys = n;
+    }
+
     /// Constraint on the first byte of the next token.
     /// `AnyCharacter` means unconstrained; `JsonBitmap` is a hard structural gate.
     pub fn required_gate(&self) -> Constraint {
@@ -169,11 +174,15 @@ struct JsonSM {
     stack: Vec<Container>,
     /// True if the previous byte was `\` inside a string
     escape: bool,
+    /// Number of key-value pairs completed at the top-level object.
+    top_kv_count: u32,
+    /// Minimum key-value pairs before allowing } at the top level.
+    min_keys: u32,
 }
 
 impl JsonSM {
     fn new() -> Self {
-        Self { state: State::Root, stack: Vec::new(), escape: false }
+        Self { state: State::Root, stack: Vec::new(), escape: false, top_kv_count: 0, min_keys: 0 }
     }
 
     fn required_gate(&self) -> Constraint {
@@ -260,6 +269,13 @@ impl JsonSM {
 
             State::AfterValue => {
                 if ws { return; }
+                // Track completed kv pairs at the top-level object
+                if self.stack.len() == 1 && matches!(self.stack.last(), Some(Container::Object)) {
+                    // We just finished a value in the top-level object
+                    if b == b',' || b == b'}' {
+                        self.top_kv_count += 1;
+                    }
+                }
                 match b {
                     b',' => {
                         match self.stack.last() {
@@ -268,7 +284,15 @@ impl JsonSM {
                             None                    => {} // trailing comma at top — tolerate
                         }
                     }
-                    b'}' | b']' => { self.pop(); }
+                    b'}' | b']' => {
+                        // Block premature close if min_keys not met at top level
+                        if b == b'}' && self.stack.len() == 1 && self.top_kv_count < self.min_keys {
+                            // Force continuation — treat } as , instead
+                            self.state = State::ObjectKey;
+                            return;
+                        }
+                        self.pop();
+                    }
                     _ => {}
                 }
             }
