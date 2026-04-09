@@ -134,6 +134,8 @@ impl JsonSampler {
     }
 
     /// Constraint on the first byte of the next token.
+    /// When schema is active and constraining, returns a bitmap that also
+    /// excludes multi-byte tokens that would bypass the gate.
     pub fn required_gate(&self) -> Constraint {
         // Schema FST takes priority when active
         if let Some(ref schema) = self.schema {
@@ -145,6 +147,32 @@ impl JsonSampler {
             }
         }
         self.sm.required_gate()
+    }
+
+    /// Build a token-level mask for the GPU: true = allowed, false = masked.
+    /// At schema-constrained positions, simulates each token's full byte
+    /// sequence and rejects tokens that lead to dead schema states.
+    /// Returns None if unconstrained (all tokens allowed).
+    pub fn token_mask(&self) -> Option<Vec<bool>> {
+        let schema = self.schema.as_ref()?;
+        if !schema.is_active() { return None; }
+        let valid_bytes = schema.valid_next_bytes()?; // None = unconstrained
+
+        let mut mask = vec![false; self.token_bytes.len()];
+        for (i, bytes) in self.token_bytes.iter().enumerate() {
+            if bytes.is_empty() { continue; }
+            // First byte must be in valid set
+            if !valid_bytes.contains(&bytes[0]) { continue; }
+            // Simulate full token through schema
+            let mut sim = schema.clone();
+            let mut ok = true;
+            for &b in bytes {
+                sim.advance(b);
+                if !sim.is_active() { ok = false; break; }
+            }
+            mask[i] = ok;
+        }
+        Some(mask)
     }
 
     /// Returns true when the top-level JSON object is fully closed.
