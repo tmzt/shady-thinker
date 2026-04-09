@@ -60,15 +60,36 @@ impl Constraint {
 ///   - After key string       → `:`
 ///
 /// All other positions (inside strings/scalars, after values, etc.) are free.
+/// A tool schema: after the tool name is determined, these keys are required.
+#[derive(Clone, Debug)]
+pub struct ToolSchema {
+    pub name: &'static str,
+    pub required_keys: &'static [&'static str],
+}
+
+/// Known tool schemas for the routing agent.
+pub const TOOL_SCHEMAS: &[ToolSchema] = &[
+    ToolSchema { name: "dispatch_task", required_keys: &["project", "prompt"] },
+    ToolSchema { name: "list_entities", required_keys: &["type"] },
+    ToolSchema { name: "find_entity", required_keys: &["name", "type"] },
+    ToolSchema { name: "escalate_to_oracle", required_keys: &["query"] },
+];
+
 pub struct JsonSampler {
     sm: JsonSM,
+    schema: Option<crate::json_schema::SchemaFST>,
     token_bytes: Vec<Vec<u8>>,
     eos_ids: Vec<u32>,
 }
 
 impl JsonSampler {
     pub fn new(token_bytes: Vec<Vec<u8>>, eos_ids: Vec<u32>) -> Self {
-        Self { sm: JsonSM::new(), token_bytes, eos_ids }
+        Self { sm: JsonSM::new(), schema: None, token_bytes, eos_ids }
+    }
+
+    /// Enable schema-guided decoding with tool definitions.
+    pub fn enable_schema(&mut self) {
+        self.schema = Some(crate::json_schema::SchemaFST::new());
     }
 
     /// Set minimum number of key-value pairs before allowing } at the top level.
@@ -77,8 +98,16 @@ impl JsonSampler {
     }
 
     /// Constraint on the first byte of the next token.
-    /// `AnyCharacter` means unconstrained; `JsonBitmap` is a hard structural gate.
     pub fn required_gate(&self) -> Constraint {
+        // Schema FST takes priority when active
+        if let Some(ref schema) = self.schema {
+            if schema.is_active() {
+                let sc = schema.constraint();
+                if !sc.is_any() {
+                    return sc;
+                }
+            }
+        }
         self.sm.required_gate()
     }
 
@@ -91,6 +120,9 @@ impl JsonSampler {
     pub fn advance_token(&mut self, token_id: u32) {
         if let Some(bytes) = self.token_bytes.get(token_id as usize) {
             for &b in bytes.iter() {
+                if let Some(ref mut schema) = self.schema {
+                    schema.advance(b);
+                }
                 self.sm.advance(b);
             }
         }

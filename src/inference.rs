@@ -219,7 +219,8 @@ impl InferenceSession {
         let fb_bytes: Vec<u8> = fb.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.gpu.write_buffer(&self.model.state.first_bytes_buf, 0, &fb_bytes);
         let mut sampler = crate::json_sampler::JsonSampler::new(token_bytes, eos_ids);
-        sampler.set_min_keys(2); // Require at least tool + one field before allowing }
+        sampler.set_min_keys(2);
+        sampler.enable_schema(); // Schema-guided decoding for tool calls
         self.model.json_sampler = Some(sampler);
     }
 

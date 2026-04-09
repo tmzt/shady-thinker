@@ -8,6 +8,7 @@ pub mod asr_pipeline;
 pub mod gpu;
 pub mod inference;
 pub mod json_sampler;
+pub mod json_schema;
 #[cfg(feature = "jit-lora")]
 pub mod lora;
 pub mod model;
