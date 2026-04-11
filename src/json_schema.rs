@@ -17,6 +17,7 @@ pub fn build_templates() -> Vec<Vec<u8>> {
     vec![
         template(r#"{"tool": "dispatch_task", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "submit_project_ticket", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
+        template(r#"{"tool": "create_coder_project", "name": ""#, &[WILD], r#"", "git_url": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "find_entity", "name": ""#, &[WILD], r#"", "type": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "escalate_to_oracle", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
