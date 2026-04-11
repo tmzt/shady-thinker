@@ -17,7 +17,7 @@ pub fn build_templates() -> Vec<Vec<u8>> {
     vec![
         template(r#"{"tool": "dispatch_task", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "submit_project_ticket", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "create_coder_project", "name": ""#, &[WILD], r#"", "git_url": ""#, &[WILD], r#""}"#),
+        template(r#"{"tool": "create_coder_project", "name": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "find_entity", "name": ""#, &[WILD], r#"", "type": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "escalate_to_oracle", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
@@ -52,27 +52,43 @@ impl SchemaFST {
         Self { templates, pos: 0, alive, in_wild: false }
     }
 
+    /// Allowed bytes inside WILD (value) sections: ASCII alphanumeric + common special chars + closing quote.
+    fn wild_allowed() -> &'static [u8] {
+        // a-z A-Z 0-9 - _ . / : ~ + = , ; @ ! ? # % & * ( ) [ ] { } ' < > space " (closing quote)
+        static ALLOWED: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./:~+=,;@!?#%&*()[]{}' <>\"";
+        ALLOWED
+    }
+
     /// Which bytes are valid at the current position.
-    /// Returns None if unconstrained (all templates dead or in wild).
+    /// In wild sections, returns constrained ASCII set (not unconstrained).
     pub fn valid_next_bytes(&self) -> Option<Vec<u8>> {
         if self.in_wild {
-            return None; // free value — any byte
+            return Some(Self::wild_allowed().to_vec());
         }
 
         let mut valid = Vec::new();
+        let mut has_wild = false;
         for (i, tmpl) in self.templates.iter().enumerate() {
             if !self.alive[i] { continue; }
             if self.pos >= tmpl.len() { continue; }
             let b = tmpl[self.pos];
             if b == WILD {
-                return None; // at least one template has a wildcard here
+                has_wild = true;
+                continue;
             }
             if !valid.contains(&b) {
                 valid.push(b);
             }
         }
 
-        if valid.is_empty() {
+        if has_wild {
+            // At least one template enters wild here — allow wild chars + any literal continuations
+            let mut merged = Self::wild_allowed().to_vec();
+            for b in &valid {
+                if !merged.contains(b) { merged.push(*b); }
+            }
+            Some(merged)
+        } else if valid.is_empty() {
             None // all dead
         } else {
             Some(valid)
@@ -82,12 +98,15 @@ impl SchemaFST {
     /// Convert to a Constraint for the GPU gate.
     pub fn constraint(&self) -> crate::json_sampler::Constraint {
         match self.valid_next_bytes() {
-            None => crate::json_sampler::Constraint::AnyCharacter,
+            None => crate::json_sampler::Constraint::AnyCharacter, // all templates dead
+            Some(bytes) if bytes.len() > 100 => crate::json_sampler::Constraint::AnyCharacter, // effectively unconstrained
             Some(bytes) => {
                 let mut w = [0u32; 4];
                 for b in bytes {
-                    let bit = 1u32 << (b & 31);
-                    w[(b >> 5) as usize] |= bit;
+                    if b < 128 {
+                        let bit = 1u32 << (b & 31);
+                        w[(b >> 5) as usize] |= bit;
+                    }
                 }
                 crate::json_sampler::Constraint::JsonBitmap(w)
             }
@@ -125,9 +144,16 @@ impl SchemaFST {
         for (i, tmpl) in self.templates.iter().enumerate() {
             if !self.alive[i] { continue; }
             if self.pos < tmpl.len() && tmpl[self.pos] == WILD {
-                // Enter wild mode — this byte is the start of a free value
-                self.in_wild = true;
-                // Don't advance pos — stay at WILD until closing quote
+                if b == b'"' {
+                    // Empty value ("") — closing quote immediately
+                    // Skip past WILD and match the closing quote
+                    self.pos += 1;
+                    self.advance_templates(b);
+                } else {
+                    // Enter wild mode — this byte is the start of a free value
+                    self.in_wild = true;
+                    // Don't advance pos — stay at WILD until closing quote
+                }
                 return;
             }
         }
@@ -178,6 +204,41 @@ mod tests {
         // After "d", only "ispatch_task" should be alive
         let valid = fst.valid_next_bytes().unwrap();
         assert_eq!(valid, vec![b'i']); // only dispatch_task continues with 'i'
+    }
+
+    #[test]
+    fn test_create_coder_project_full() {
+        let mut fst = SchemaFST::new();
+        let full = br#"{"tool": "create_coder_project", "name": "test-proj"}"#;
+        for (i, &b) in full.iter().enumerate() {
+            let active = fst.is_active();
+            let valid = fst.valid_next_bytes();
+            eprintln!("pos={} byte={:?} active={} valid={:?} in_wild={}",
+                i, b as char, active, valid.as_ref().map(|v| v.len()), fst.in_wild);
+            assert!(active, "FST died at pos {} byte {:?}", i, b as char);
+            if let Some(ref v) = valid {
+                assert!(v.contains(&b), "byte {:?} not in valid {:?} at pos {}", b as char, v, i);
+            }
+            fst.advance(b);
+        }
+        eprintln!("final: active={} done={} pos={}", fst.is_active(), fst.is_done(), fst.pos);
+        // FST should be active and done (or close to done)
+    }
+
+    #[test]
+    fn test_create_coder_project_constrains_after_tool() {
+        let mut fst = SchemaFST::new();
+        // After the tool name, the next bytes should be constrained to `, "name": "`
+        let prefix = br#"{"tool": "create_coder_project""#;
+        for &b in prefix {
+            fst.advance(b);
+        }
+        assert!(fst.is_active(), "FST should be active after tool name");
+        let valid = fst.valid_next_bytes();
+        assert!(valid.is_some(), "should be constrained after tool name close quote");
+        let v = valid.unwrap();
+        assert!(v.contains(&b','), "comma should be valid, got: {:?}", v);
+        assert!(!v.contains(&b'}'), "close brace should NOT be valid");
     }
 
     #[test]
