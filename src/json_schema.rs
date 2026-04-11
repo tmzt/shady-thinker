@@ -20,6 +20,7 @@ pub fn build_templates() -> Vec<Vec<u8>> {
         template(r#"{"tool": "create_coder_project", "name": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "plan_coder_task", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "refine_coder_plan", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
+        template(r#"{"tool": "execute_coder_plan", "project": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "find_entity", "name": ""#, &[WILD], r#"", "type": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "escalate_to_oracle", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
