@@ -105,7 +105,15 @@ impl JsonSampler {
             Some(s) => s,
             None => return true, // no schema = all tokens valid
         };
-        if !schema.is_active() { return true; } // schema exhausted = unconstrained
+        if !schema.is_active() {
+            // Schema exhausted — only allow tokens that help close the JSON
+            let bytes = match self.token_bytes.get(token_id as usize) {
+                Some(b) if !b.is_empty() => b,
+                _ => return false,
+            };
+            // Allow tokens starting with } " or newline
+            return matches!(bytes[0], b'}' | b'"' | b'\n' | b' ');
+        }
 
         let bytes = match self.token_bytes.get(token_id as usize) {
             Some(b) if !b.is_empty() => b,
@@ -144,6 +152,9 @@ impl JsonSampler {
                 if !sc.is_any() {
                     return sc;
                 }
+            } else if !self.sm.is_complete() {
+                // Schema exhausted but JSON not closed — force closing
+                return schema.constraint(); // returns } " \n only
             }
         }
         self.sm.required_gate()
@@ -155,7 +166,7 @@ impl JsonSampler {
     /// Returns None if unconstrained (all tokens allowed).
     pub fn token_mask(&self) -> Option<Vec<bool>> {
         let schema = self.schema.as_ref()?;
-        if !schema.is_active() { return None; }
+        // Don't return None (unconstrained) when schema is dead — keep constraining
         let valid_bytes = schema.valid_next_bytes()?; // None = unconstrained
 
         let mut mask = vec![false; self.token_bytes.len()];
