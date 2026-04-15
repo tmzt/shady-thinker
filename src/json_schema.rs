@@ -24,6 +24,7 @@ pub fn build_templates() -> Vec<Vec<u8>> {
         template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "find_entity", "name": ""#, &[WILD], r#"", "type": ""#, &[WILD], r#""}"#),
         template(r#"{"tool": "escalate_to_oracle", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
+        // NOTE: context_entities removed — just "query" field for now
     ]
 }
 
@@ -55,10 +56,11 @@ impl SchemaFST {
         Self { templates, pos: 0, alive, in_wild: false }
     }
 
-    /// Allowed bytes inside WILD (value) sections: ASCII alphanumeric + common special chars + closing quote.
+    /// Allowed bytes inside WILD (value) sections: ASCII alphanumeric + safe special chars + closing quote.
+    /// Deliberately excludes { } [ ] < > to prevent the model from generating nested structures.
     fn wild_allowed() -> &'static [u8] {
-        // a-z A-Z 0-9 - _ . / : ~ + = , ; @ ! ? # % & * ( ) [ ] { } ' < > space " (closing quote)
-        static ALLOWED: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./:~+=,;@!?#%&*()[]{}' <>\"";
+        // a-z A-Z 0-9 - _ . / : ~ + = , ; @ ! ? # % & * ( ) ' space " (closing quote)
+        static ALLOWED: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./:~+=,;@!?#%&*() '\"";
         ALLOWED
     }
 
@@ -99,10 +101,19 @@ impl SchemaFST {
     }
 
     /// Convert to a Constraint for the GPU gate.
+    /// Never returns AnyCharacter — when all templates die, returns a bitmap
+    /// that only allows `}` and `"` (to close the JSON gracefully).
     pub fn constraint(&self) -> crate::json_sampler::Constraint {
         match self.valid_next_bytes() {
-            None => crate::json_sampler::Constraint::AnyCharacter, // all templates dead
-            Some(bytes) if bytes.len() > 100 => crate::json_sampler::Constraint::AnyCharacter, // effectively unconstrained
+            None => {
+                // All templates dead — allow only closing chars to end gracefully
+                let mut w = [0u32; 4];
+                for b in [b'}', b'"', b'\n'] {
+                    let bit = 1u32 << (b & 31);
+                    w[(b >> 5) as usize] |= bit;
+                }
+                crate::json_sampler::Constraint::JsonBitmap(w)
+            }
             Some(bytes) => {
                 let mut w = [0u32; 4];
                 for b in bytes {
