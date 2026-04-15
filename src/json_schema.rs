@@ -106,13 +106,8 @@ impl SchemaFST {
     pub fn constraint(&self) -> crate::json_sampler::Constraint {
         match self.valid_next_bytes() {
             None => {
-                // All templates dead — allow only closing chars to end gracefully
-                let mut w = [0u32; 4];
-                for b in [b'}', b'"', b'\n'] {
-                    let bit = 1u32 << (b & 31);
-                    w[(b >> 5) as usize] |= bit;
-                }
-                crate::json_sampler::Constraint::JsonBitmap(w)
+                // All templates dead — only allow } to close the JSON
+                crate::json_sampler::Constraint::byte(b'}')
             }
             Some(bytes) => {
                 let mut w = [0u32; 4];

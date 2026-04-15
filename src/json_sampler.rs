@@ -106,13 +106,12 @@ impl JsonSampler {
             None => return true, // no schema = all tokens valid
         };
         if !schema.is_active() {
-            // Schema exhausted — only allow tokens that help close the JSON
+            // Schema exhausted — only allow } to close the JSON
             let bytes = match self.token_bytes.get(token_id as usize) {
                 Some(b) if !b.is_empty() => b,
                 _ => return false,
             };
-            // Allow tokens starting with } " or newline
-            return matches!(bytes[0], b'}' | b'"' | b'\n' | b' ');
+            return bytes[0] == b'}';
         }
 
         let bytes = match self.token_bytes.get(token_id as usize) {
@@ -153,8 +152,8 @@ impl JsonSampler {
                     return sc;
                 }
             } else if !self.sm.is_complete() {
-                // Schema exhausted but JSON not closed — force closing
-                return schema.constraint(); // returns } " \n only
+                // Schema exhausted but JSON not closed — force }
+                return Constraint::byte(b'}');
             }
         }
         self.sm.required_gate()
