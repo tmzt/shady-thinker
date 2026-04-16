@@ -1458,9 +1458,12 @@ impl Model {
         let mask_words = self.json_sampler.as_ref()
             .and_then(|js| js.token_mask_words());
         if let Some(ref words) = mask_words {
+            let set_bits: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+            log::debug!("[sample] token_mask: {}/{} tokens allowed", set_bits, vocab);
             let mask_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             gpu.write_buffer(&self.state.token_mask_buf, 0, &mask_bytes);
         } else {
+            log::debug!("[sample] token_mask: unconstrained (all-ones)");
             // Unconstrained: all-ones (every token allowed)
             let num_words = vocab.div_ceil(32) as usize;
             let all_ones: Vec<u8> = vec![0xFFu8; num_words * 4];
@@ -1504,6 +1507,13 @@ impl Model {
 
         // CPU-side schema validation: filter candidates by full token byte sequence
         if let Some(ref js) = self.json_sampler {
+            // JSON complete → force EOS to stop generation
+            if js.is_complete() {
+                let eos = js.first_eos_id().unwrap_or(0);
+                log::info!("[json-sampler] JSON complete at seq={}, forcing EOS token {}", self.seq_len, eos);
+                self.generated_tokens.push(eos);
+                return eos;
+            }
             js.filter_by_schema(&mut candidates);
             js.suppress_eos_if_incomplete(&mut candidates);
         }

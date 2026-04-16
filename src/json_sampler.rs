@@ -219,6 +219,12 @@ impl JsonSampler {
         self.sm.is_complete()
     }
 
+    /// First EOS token ID (for forcing stop after JSON completion).
+    pub fn first_eos_id(&self) -> Option<u32> {
+        self.eos_ids.first().copied()
+    }
+
+
     /// Advance state by one sampled token.
     pub fn advance_token(&mut self, token_id: u32) {
         if let Some(bytes) = self.token_bytes.get(token_id as usize) {
@@ -247,9 +253,12 @@ impl JsonSampler {
         }
     }
 
-    /// Reset for a new generation.
+    /// Reset for a new generation — fresh state machine + fresh schema FST.
     pub fn reset(&mut self) {
         self.sm = JsonSM::new();
+        if self.schema.is_some() {
+            self.schema = Some(crate::json_schema::SchemaFST::new());
+        }
     }
 }
 

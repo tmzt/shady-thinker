@@ -617,6 +617,11 @@ impl InferenceSession {
         let prefill_start = std::time::Instant::now();
 
         // Think injection
+        // Reset JSON sampler for new generation (schema FST + state machine)
+        if let Some(ref mut js) = self.model.json_sampler {
+            js.reset();
+        }
+
         let mut generated = Vec::new();
         let bf16 = self.model.bf16_mode;
         let hybrid = self.model.is_hybrid_attn();
