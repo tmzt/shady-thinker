@@ -165,8 +165,22 @@ impl JsonSampler {
     /// Returns None if unconstrained (all tokens allowed).
     pub fn token_mask(&self) -> Option<Vec<bool>> {
         let schema = self.schema.as_ref()?;
-        // Don't return None (unconstrained) when schema is dead — keep constraining
-        let valid_bytes = schema.valid_next_bytes()?; // None = unconstrained
+
+        if !schema.is_active() {
+            // Schema exhausted — only allow tokens whose first byte is }
+            let mut mask = vec![false; self.token_bytes.len()];
+            for (i, bytes) in self.token_bytes.iter().enumerate() {
+                if !bytes.is_empty() && bytes[0] == b'}' {
+                    mask[i] = true;
+                }
+            }
+            return Some(mask);
+        }
+
+        let valid_bytes = match schema.valid_next_bytes() {
+            Some(v) => v,
+            None => return None, // truly unconstrained
+        };
 
         let mut mask = vec![false; self.token_bytes.len()];
         for (i, bytes) in self.token_bytes.iter().enumerate() {
@@ -183,6 +197,21 @@ impl JsonSampler {
             mask[i] = ok;
         }
         Some(mask)
+    }
+
+    /// Build a packed u32 bitfield token mask for GPU upload.
+    /// Bit N of word[N/32] is set if token N is allowed.
+    /// Returns None if unconstrained (caller should upload all-ones).
+    pub fn token_mask_words(&self) -> Option<Vec<u32>> {
+        let mask = self.token_mask()?;
+        let num_words = mask.len().div_ceil(32);
+        let mut words = vec![0u32; num_words];
+        for (i, &allowed) in mask.iter().enumerate() {
+            if allowed {
+                words[i / 32] |= 1u32 << (i % 32);
+            }
+        }
+        Some(words)
     }
 
     /// Returns true when the top-level JSON object is fully closed.
@@ -438,6 +467,8 @@ mod tests {
         sm.is_complete()
     }
 
+    // ── State machine gate tests ─────────────────────────────────────
+
     #[test]
     fn test_initial_gate() {
         assert_eq!(gate(""), Some(b'{'));
@@ -485,19 +516,16 @@ mod tests {
 
     #[test]
     fn test_nested_object() {
-        // After inner object closes, back to outer AfterValue
         assert_eq!(gate(r#"{"a": {"b": 1},"#), Some(b'"'));
     }
 
     #[test]
     fn test_array_value() {
-        // Inside an array value — free
         assert_eq!(gate(r#"{"a": ["#), None);
     }
 
     #[test]
     fn test_escape_in_key() {
-        // Escaped quote inside key should not end the key
         assert_eq!(gate(r#"{"ke\"y""#), Some(b':'));
     }
 
@@ -509,5 +537,223 @@ mod tests {
     #[test]
     fn test_bool_value() {
         assert!(complete(r#"{"ok": true}"#));
+    }
+
+    // ── JsonSampler + schema integration tests ────────────────────────
+
+    /// Build a sampler with a mock vocabulary for testing.
+    /// Tokens: individual ASCII bytes 0-127, plus some multi-byte tokens.
+    fn test_sampler() -> JsonSampler {
+        let mut token_bytes: Vec<Vec<u8>> = Vec::new();
+        // Tokens 0-127: single ASCII bytes
+        for b in 0u8..128 {
+            token_bytes.push(vec![b]);
+        }
+        // Token 128: '"}' (closing quote + close brace — common BPE merge)
+        token_bytes.push(b"\"}" .to_vec());
+        // Token 129: ', "' (comma + space + quote — field separator)
+        token_bytes.push(b", \"".to_vec());
+        // Token 130: 'tool' (subword)
+        token_bytes.push(b"tool".to_vec());
+        // Token 131: '": "' (colon + space + quote)
+        token_bytes.push(b"\": \"".to_vec());
+        // Token 132: 'dispatch_task' (full tool name)
+        token_bytes.push(b"dispatch_task".to_vec());
+        // Token 133: 'list_entities' (full tool name)
+        token_bytes.push(b"list_entities".to_vec());
+        // Token 134: '{"tool": "' (common prefix)
+        token_bytes.push(b"{\"tool\": \"".to_vec());
+        // Token 135: garbage multi-byte that starts with }
+        token_bytes.push(b"}garbage".to_vec());
+        // Token 136: EOS
+        token_bytes.push(vec![]);
+
+        let eos_ids = vec![136];
+        let mut sampler = JsonSampler::new(token_bytes, eos_ids);
+        sampler.enable_schema();
+        sampler
+    }
+
+    #[test]
+    fn token_mask_at_start() {
+        let sampler = test_sampler();
+        let mask = sampler.token_mask().expect("should be constrained at start");
+        // Only token for '{' (token 123) and token 134 '{"tool": "' should be valid
+        assert!(mask[b'{' as usize], "{{ token should be allowed");
+        assert!(mask[134], "common prefix token should be allowed");
+        assert!(!mask[b'"' as usize], "quote should not be allowed at start");
+        assert!(!mask[b'a' as usize], "letter should not be allowed at start");
+    }
+
+    #[test]
+    fn token_mask_during_tool_name() {
+        let mut sampler = test_sampler();
+        // Advance through {"tool": "
+        for &b in br#"{"tool": ""# {
+            sampler.advance_bytes(&[b]);
+            // Also advance the schema
+            if let Some(ref mut schema) = sampler.schema {
+                // Already advanced by advance_bytes... wait, advance_bytes only advances sm
+            }
+        }
+        // Actually, use advance_token for proper schema advancement
+        // Reset and use individual byte tokens
+        let mut sampler = test_sampler();
+        for &b in br#"{"tool": ""# {
+            sampler.advance_token(b as u32); // single-byte tokens 0-127
+        }
+        let mask = sampler.token_mask().expect("should be constrained in tool name");
+        // Tool names start with d, s, c, p, r, e, l, f
+        assert!(mask[b'd' as usize], "d should be valid (dispatch_task)");
+        assert!(mask[b'l' as usize], "l should be valid (list_entities)");
+        assert!(mask[b'e' as usize], "e should be valid (escalate/execute)");
+        assert!(!mask[b'z' as usize], "z should not be valid — no tool starts with z");
+        // Multi-byte tool name tokens should also be valid
+        assert!(mask[132], "dispatch_task token should be valid");
+        assert!(mask[133], "list_entities token should be valid");
+    }
+
+    #[test]
+    fn token_mask_dead_schema_only_close_brace() {
+        let mut sampler = test_sampler();
+        // Feed a sequence that kills all templates
+        for &b in br#"{"tool": "ZZZZ"# {
+            sampler.advance_token(b as u32);
+        }
+        let mask = sampler.token_mask().expect("dead schema should still return mask");
+        // Only } token (125) should be valid
+        assert!(mask[b'}' as usize], "}} must be allowed when schema is dead");
+        assert!(!mask[b'"' as usize], "quote must not be allowed");
+        assert!(!mask[b'a' as usize], "letters must not be allowed");
+        // Token 128 '"}' starts with " — should NOT be valid
+        assert!(!mask[128], "multi-byte starting with quote should be blocked");
+        // Token 135 '}garbage' starts with } — should be valid (first byte check)
+        // Actually for dead schema, we only check first byte == }
+        assert!(mask[135], "token starting with }} should be allowed");
+    }
+
+    #[test]
+    fn token_mask_words_packing() {
+        let sampler = test_sampler();
+        let words = sampler.token_mask_words().expect("should return packed words");
+        let mask = sampler.token_mask().unwrap();
+        // Verify bit packing matches boolean mask
+        for (i, &allowed) in mask.iter().enumerate() {
+            let word = words[i / 32];
+            let bit = (word >> (i % 32)) & 1;
+            assert_eq!(bit == 1, allowed,
+                "bit packing mismatch at token {}: word={:#010x} bit={} expected={}",
+                i, word, bit, allowed);
+        }
+    }
+
+    #[test]
+    fn token_mask_unconstrained_returns_none() {
+        // Without schema, token_mask should return None
+        let token_bytes: Vec<Vec<u8>> = (0u8..128).map(|b| vec![b]).collect();
+        let sampler = JsonSampler::new(token_bytes, vec![]);
+        assert!(sampler.token_mask().is_none(), "no schema = unconstrained = None");
+    }
+
+    #[test]
+    fn filter_by_schema_removes_invalid() {
+        let mut sampler = test_sampler();
+        // At start, only { is valid
+        let mut candidates = vec![
+            (b'{' as u32, 5.0),  // valid
+            (b'"' as u32, 3.0),  // invalid at root
+            (b'a' as u32, 1.0),  // invalid at root
+            (134, 4.0),          // {"tool": " — valid
+        ];
+        sampler.filter_by_schema(&mut candidates);
+        let ids: Vec<u32> = candidates.iter().map(|&(id, _)| id).collect();
+        assert!(ids.contains(&(b'{' as u32)), "{{ should survive");
+        assert!(ids.contains(&134), "prefix token should survive");
+        assert!(!ids.contains(&(b'"' as u32)), "quote should be filtered");
+        assert!(!ids.contains(&(b'a' as u32)), "letter should be filtered");
+    }
+
+    #[test]
+    fn suppress_eos_while_incomplete() {
+        let sampler = test_sampler();
+        assert!(!sampler.is_complete());
+        let mut candidates = vec![(136, 10.0), (b'{' as u32, 5.0)];
+        sampler.suppress_eos_if_incomplete(&mut candidates);
+        assert_eq!(candidates.len(), 1, "EOS should be removed");
+        assert_eq!(candidates[0].0, b'{' as u32);
+    }
+
+    #[test]
+    fn suppress_eos_allows_after_complete() {
+        let mut sampler = test_sampler();
+        // Drive through a complete JSON object using the SM only
+        for &b in br#"{"tool": "list_entities", "type": "project"}"# {
+            sampler.advance_token(b as u32);
+        }
+        assert!(sampler.is_complete());
+        let mut candidates = vec![(136, 10.0), (b'x' as u32, 5.0)];
+        sampler.suppress_eos_if_incomplete(&mut candidates);
+        assert_eq!(candidates.len(), 2, "EOS should be kept after completion");
+    }
+
+    #[test]
+    fn required_gate_schema_overrides_sm() {
+        let mut sampler = test_sampler();
+        // Advance past { — SM gate says " (ObjectKey), schema also constrains
+        sampler.advance_token(b'{' as u32);
+        let gate = sampler.required_gate();
+        // Schema should provide a tighter constraint than just "
+        assert!(gate.allows(b'"'), "quote must be allowed for key start");
+        assert!(!gate.allows(b'}'), "close brace should not be allowed by schema");
+    }
+
+    #[test]
+    fn required_gate_dead_schema_forces_close() {
+        let mut sampler = test_sampler();
+        for &b in br#"{"tool": "ZZZZ"# {
+            sampler.advance_token(b as u32);
+        }
+        let gate = sampler.required_gate();
+        assert!(gate.allows(b'}'), "dead schema must allow }}");
+        assert!(!gate.allows(b'"'), "dead schema must block other chars");
+    }
+
+    #[test]
+    fn advance_token_multi_byte() {
+        let mut sampler = test_sampler();
+        // Use the multi-byte prefix token: {"tool": " (token 134)
+        sampler.advance_token(134);
+        // Schema should now be inside the tool name value
+        let mask = sampler.token_mask().expect("should be constrained");
+        assert!(mask[b'd' as usize], "d should be valid after prefix");
+        assert!(mask[132], "dispatch_task token should be valid");
+    }
+
+    #[test]
+    fn full_sequence_list_entities_via_tokens() {
+        let mut sampler = test_sampler();
+        // {"tool": "list_entities", "type": "project"}
+        // Token 134 = {"tool": "
+        sampler.advance_token(134);
+        // Token 133 = list_entities
+        sampler.advance_token(133);
+        // Remaining: ", "type": "project"}
+        for &b in br#"", "type": "project"}"# {
+            sampler.advance_token(b as u32);
+        }
+        assert!(sampler.is_complete(), "full list_entities should be complete");
+    }
+
+    #[test]
+    fn min_keys_blocks_early_close() {
+        let mut sampler = JsonSampler::new(
+            (0u8..128).map(|b| vec![b]).collect(), vec![]);
+        sampler.set_min_keys(2);
+        // One key-value pair: {"tool": "x"
+        for &b in br#"{"tool": "x""# {
+            sampler.advance_bytes(&[b]);
+        }
+        // SM should not consider this complete even if } comes next
+        assert!(!sampler.is_complete());
     }
 }

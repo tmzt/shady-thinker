@@ -204,6 +204,10 @@ pub struct InferenceState {
     /// Used by the gate: when gate_byte != 0, tokens whose first_bytes[i] != gate_byte are masked to -inf.
     /// Always allocated (vocab_size u32s); zeros = no gate effect when gate_byte = 0.
     pub first_bytes_buf: wgpu::Buffer,
+    /// Per-token schema mask (packed bitfield, vocab_size/32 u32s).
+    /// Bit N of word[N/32] set = token N allowed. All-ones = unconstrained.
+    /// Uploaded each sampling step when JSON schema mode is active.
+    pub token_mask_buf: wgpu::Buffer,
     /// Per-chunk temporary buffers for lm_head (one per embed_chunk, reused across decode steps).
     /// Avoids allocating new GPU buffers on every decode step, which fills the bind group cache.
     pub lm_chunk_tmps: Vec<wgpu::Buffer>,
@@ -609,6 +613,7 @@ impl Model {
             },
             topk_out: gpu.create_storage_buffer("topk_out", TOPK_K as u64 * 8),
             first_bytes_buf: gpu.create_storage_buffer("first_bytes", config.vocab_size as u64 * 4),
+            token_mask_buf: gpu.create_storage_buffer("token_mask", config.vocab_size.div_ceil(32) as u64 * 4),
             penalty_uniform: gpu.create_buffer(
                 "penalty_uniform",
                 64, // PenaltyParams struct: 4*4 + 4*4 + 4 = 48 bytes, pad to 64
@@ -1447,6 +1452,21 @@ impl Model {
         gpu.flush();
         gpu.write_buffer(&self.state.penalty_uniform, 0, &pu);
 
+        // ── Upload per-token schema mask (packed bitfield) ────────────────
+        // When schema is active, each bit says whether the token is valid
+        // given the current FST state. When unconstrained, all bits set.
+        let mask_words = self.json_sampler.as_ref()
+            .and_then(|js| js.token_mask_words());
+        if let Some(ref words) = mask_words {
+            let mask_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            gpu.write_buffer(&self.state.token_mask_buf, 0, &mask_bytes);
+        } else {
+            // Unconstrained: all-ones (every token allowed)
+            let num_words = vocab.div_ceil(32) as usize;
+            let all_ones: Vec<u8> = vec![0xFFu8; num_words * 4];
+            gpu.write_buffer(&self.state.token_mask_buf, 0, &all_ones);
+        }
+
         // ── Combined penalty + gate + top-K dispatch (single vocab pass) ──
         gpu.dispatch(
             "sample_topk",
@@ -1457,6 +1477,7 @@ impl Model {
                 gpu::bind(2, &self.state.penalty_uniform),
                 gpu::bind(3, &self.state.first_bytes_buf),
                 gpu::bind(4, &self.state.topk_out),
+                gpu::bind(5, &self.state.token_mask_buf),
             ],
             (1, 1, 1),
         );

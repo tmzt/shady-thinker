@@ -37,6 +37,7 @@ struct Params {
 @group(0) @binding(2) var<uniform>             p:           Params;
 @group(0) @binding(3) var<storage, read>       first_bytes: array<u32>;
 @group(0) @binding(4) var<storage, read_write> topk_out:    array<Candidate>;
+@group(0) @binding(5) var<storage, read>       token_mask:  array<u32>;
 
 // 256 * 8 * 8 bytes = 16 KB
 var<workgroup> wg: array<Candidate, 2048u>;
@@ -97,6 +98,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 if (gate_word & bit_mask) == 0u { v = NEG_INF; }
             }
         }
+
+        // Token-level schema mask: packed bitfield, bit N = token N allowed.
+        // Applied after first-byte gate for full byte-sequence validation.
+        let mask_word = token_mask[pos >> 5u];
+        let mask_bit = 1u << (pos & 31u);
+        if (mask_word & mask_bit) == 0u { v = NEG_INF; }
 
         v /= p.temperature;
         logits[pos] = v;
