@@ -1628,8 +1628,15 @@ impl Model {
     /// Greedy argmax decode — no sampling, no penalties. For ASR.
     pub fn forward_argmax(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
         let h = self.config.hidden_size;
+        gpu.write_buffer(&self.state.p_embed, 0, &token_id.to_le_bytes());
         self.embedding(gpu, token_id);
         gpu.flush();
+        if self.seq_len == 0 {
+            let dbg = gpu.read_buffer(&self.state.hidden, h as u64 * 4);
+            let dv: &[f32] = bytemuck::cast_slice(&dbg);
+            let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+            log::info!("[gpu-decoder] embed tok={token_id}: norm={norm:.4} first4={:?}", &dv[..4]);
+        }
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.forward_layers_argmax(gpu)
     }
@@ -1689,12 +1696,13 @@ impl Model {
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed);
 
-            if self.generated_tokens.is_empty() && i < 3 {
+            // Dump at seq_len=26 (last prefill position, matches C dump at pos 25)
+            if self.seq_len == 0 && i < 3 {
                 gpu.flush();
                 let dbg = gpu.read_buffer(&self.state.residual, h as u64 * 4);
                 let dv: &[f32] = bytemuck::cast_slice(&dbg);
                 let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[gpu-decoder] L{i} after attn+res: norm={norm:.4} first4={:?}", &dv[..4]);
+                log::info!("[gpu-decoder] L{i} after attn+res (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
             }
 
             let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
@@ -1709,13 +1717,12 @@ impl Model {
                 &layer.down_proj_qweight, &layer.down_proj_scales,
                 &self.state.mlp_output, h, p_down);
 
-            // Debug: dump after ffn+residual for first few layers of first token
-            if self.generated_tokens.is_empty() && i < 3 {
+            if self.seq_len == 0 && i < 3 {
                 gpu.flush();
                 let dbg = gpu.read_buffer(&self.state.mlp_output, h as u64 * 4);
                 let dv: &[f32] = bytemuck::cast_slice(&dbg);
                 let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[gpu-decoder] L{i} mlp_out: norm={norm:.4} first4={:?}", &dv[..4]);
+                log::info!("[gpu-decoder] L{i} mlp_out (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
             }
         }
 
