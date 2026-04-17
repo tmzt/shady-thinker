@@ -1781,18 +1781,26 @@ impl Model {
                     let dv: &[f32] = bytemuck::cast_slice(&dbg);
                     let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let has_nan = dv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after qproj: norm={norm:.4} nan={has_nan} q_dim={q_dim}");
+                    log::info!("[model] L0 after qproj: q_norm={norm:.4} nan={has_nan} q_dim={q_dim}");
+                    let kdbg = gpu.read_buffer(&self.state.k_out, kv_dim as u64 * 4);
+                    let kv: &[f32] = bytemuck::cast_slice(&kdbg);
+                    let knorm: f32 = kv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let knan = kv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after kproj: k_norm={knorm:.4} nan={knan} kv_dim={kv_dim}");
                 }
 
                 self.fused_split_qknorm_kvstore(gpu, i);
 
                 if self.generated_tokens.is_empty() && i == 0 {
                     gpu.flush();
-                    let dbg = gpu.read_buffer(&self.state.q_out, q_dim as u64 * 4);
-                    let dv: &[f32] = bytemuck::cast_slice(&dbg);
-                    let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                    let has_nan = dv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after qknorm: norm={norm:.4} nan={has_nan}");
+                    // Check K cache at current position
+                    let kc_size = (nkv * hd) as u64 * 4;
+                    let kc_off = self.seq_len as u64 * kc_size;
+                    let kdbg = gpu.read_buffer_offset(&self.state.k_cache[0], kc_off, kc_size);
+                    let kv: &[f32] = bytemuck::cast_slice(&kdbg);
+                    let knorm: f32 = kv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let knan = kv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after qknorm+kvstore: k_cache norm={knorm:.4} nan={knan} seq_len={}", self.seq_len);
                 }
 
                 self.gqa_attention(gpu, i); // sigmoid gate fused in when q_gated

@@ -106,6 +106,21 @@ const PREFIX_TAIL: &[u32] = &[TOKEN_IM_END, 198, TOKEN_IM_START, 872, 198, TOKEN
 /// <|audio_end|><|im_end|>\n<|im_start|>assistant\n
 const SUFFIX_BASE: &[u32] = &[TOKEN_AUDIO_END, TOKEN_IM_END, 198, TOKEN_IM_START, 77091, 198];
 
+/// Zero the KV cache buffers. Required before first use since GPU buffers contain undefined data.
+fn clear_kv_cache(gpu: &mut GpuContext, model: &Model) {
+    let nl = model.config.num_hidden_layers as usize;
+    let nkv = model.config.num_key_value_heads;
+    let hd = model.config.head_dim;
+    let max_seq = 256u32; // matches load_model_on_gpu max_seq_len
+    let cache_size = (max_seq * nkv * hd) as usize * 4;
+    let zeros = vec![0u8; cache_size];
+    for i in 0..nl {
+        gpu.write_buffer(&model.state.k_cache[i], 0, &zeros);
+        gpu.write_buffer(&model.state.v_cache[i], 0, &zeros);
+    }
+    gpu.flush();
+}
+
 /// Forward one token through the decoder. Handles MLX INT4 embedding + forward.
 /// `embed_scales_biases`: needed for MLX INT4 embedding lookup (from prefix cache or model weights).
 fn forward_token(
@@ -162,6 +177,7 @@ pub fn gpu_asr_decode(
     // Reset model state for fresh decode
     model.seq_len = 0;
     model.generated_tokens.clear();
+    clear_kv_cache(gpu, model);
 
     let t0 = std::time::Instant::now();
 
@@ -330,6 +346,7 @@ pub fn precompute_prefix_cache(
     // Run prefix through model to populate KV cache
     model.seq_len = 0;
     model.generated_tokens.clear();
+    clear_kv_cache(gpu, model);
     if model.bf16_mode {
         model.prefill(gpu, &prefix_embeds, prefix_len);
     } else if model.mlx_int4_mode {
