@@ -55,9 +55,18 @@ struct EncoderLayer {
     ffn_norm_b: wgpu::Buffer,
 }
 
+/// Conv stem weights (CPU f32).
+struct ConvStem {
+    conv1_w: Vec<f32>, conv1_b: Vec<f32>, // [480,1,3,3], [480]
+    conv2_w: Vec<f32>, conv2_b: Vec<f32>, // [480,480,3,3], [480]
+    conv3_w: Vec<f32>, conv3_b: Vec<f32>, // [480,480,3,3], [480]
+    conv_out_w: Vec<f32>,                  // [d_model, 7680]
+}
+
 /// GPU ASR encoder.
 pub struct AsrEncoder {
     gpu: GpuContext,
+    stem: ConvStem,
     layers: Vec<EncoderLayer>,
     // Final layer norm
     ln_post_w: wgpu::Buffer,
@@ -81,8 +90,7 @@ impl AsrEncoder {
     pub fn load(gpu: GpuContext, model_dir: &Path) -> Self {
         log::info!("[asr-encoder] loading weights from {:?}", model_dir);
 
-        let config_path = model_dir.join("config.json");
-        let config = Self::parse_config(&config_path);
+        let config = Self::parse_config(model_dir);
         log::info!("[asr-encoder] config: {:?}", config);
 
         // Find and mmap all safetensors shards
@@ -113,6 +121,26 @@ impl AsrEncoder {
                 out.extend_from_slice(&f.to_le_bytes());
             }
             out
+        };
+
+        // bf16 bytes → f32 values (for CPU-side conv stem weights)
+        let bf16_to_f32_vec = |data: &[u8]| -> Vec<f32> {
+            let n = data.len() / 2;
+            (0..n).map(|i| {
+                let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                f32::from_bits((bits as u32) << 16)
+            }).collect()
+        };
+
+        // Load conv stem weights (CPU f32)
+        let stem = ConvStem {
+            conv1_w: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d1.weight")),
+            conv1_b: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d1.bias")),
+            conv2_w: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d2.weight")),
+            conv2_b: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d2.bias")),
+            conv3_w: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d3.weight")),
+            conv3_b: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv2d3.bias")),
+            conv_out_w: bf16_to_f32_vec(get_tensor("thinker.audio_tower.conv_out.weight")),
         };
 
         // Upload raw bf16 packed as u32 (shader unpacks per-multiply)
@@ -163,7 +191,7 @@ impl AsrEncoder {
 
         log::info!("[asr-encoder] loaded {} layers onto GPU", layers.len());
 
-        Self { gpu, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config }
+        Self { gpu, stem, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config }
     }
 
     fn load_shards(model_dir: &Path) -> Vec<Vec<u8>> {
@@ -181,6 +209,114 @@ impl AsrEncoder {
     }
 
     /// Run the encoder transformer on GPU.
+    /// Full encode: mel spectrogram → conv stem (CPU) → transformer (GPU) → output.
+    /// `mel_data` is mel-bin-major: [128 × mel_frames].
+    pub fn encode_mel(&mut self, mel_data: &[f32], mel_frames: u32) -> Vec<f32> {
+        let t0 = std::time::Instant::now();
+        let (embeddings, seq_len) = self.conv_stem(mel_data, mel_frames);
+        let stem_ms = t0.elapsed().as_millis();
+        log::info!("[asr-encoder] conv stem: {} mel frames → {} tokens ({stem_ms}ms)",
+            mel_frames, seq_len);
+        self.forward(&embeddings, seq_len)
+    }
+
+    /// Conv stem (CPU): mel → 3×conv2d+GELU → reshape → linear → pos embed → [total_tokens, d_model].
+    fn conv_stem(&self, mel: &[f32], mel_frames: u32) -> (Vec<f32>, u32) {
+        const CONV_HIDDEN: usize = 480;
+        const CHUNK_SIZE: usize = 100;
+        let d_model = self.config.d_model as usize;
+
+        // Calculate total output tokens across all chunks
+        let n_chunks = (mel_frames as usize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut total_tokens = 0usize;
+        let mut chunk_infos = Vec::new(); // (start, chunk_w, w3)
+        for c in 0..n_chunks {
+            let start = c * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(mel_frames as usize);
+            let w = end - start;
+            let w1 = (w + 2 - 3) / 2 + 1;
+            let w2 = (w1 + 2 - 3) / 2 + 1;
+            let w3 = (w2 + 2 - 3) / 2 + 1;
+            chunk_infos.push((start, w, w3));
+            total_tokens += w3;
+        }
+
+        let mut output = vec![0f32; total_tokens * d_model];
+        let mut token_offset = 0;
+
+        for &(start, chunk_w, w3) in &chunk_infos {
+            // Extract chunk mel: [128, chunk_w]
+            let mut chunk_mel = vec![0f32; 128 * chunk_w];
+            for m in 0..128 {
+                let src = m * mel_frames as usize + start;
+                let dst = m * chunk_w;
+                chunk_mel[dst..dst + chunk_w].copy_from_slice(&mel[src..src + chunk_w]);
+            }
+
+            // Conv2D layer 1: [1, 128, chunk_w] → [480, h1, w1]
+            let h1 = (128 + 2 - 3) / 2 + 1; // 64
+            let w1 = (chunk_w + 2 - 3) / 2 + 1;
+            let mut c1 = conv2d(&chunk_mel, &self.stem.conv1_w, &self.stem.conv1_b,
+                                1, CONV_HIDDEN, 128, chunk_w, 3, 2, 1);
+            gelu_inplace(&mut c1);
+
+            // Conv2D layer 2: [480, h1, w1] → [480, h2, w2]
+            let h2 = (h1 + 2 - 3) / 2 + 1; // 32
+            let w2 = (w1 + 2 - 3) / 2 + 1;
+            let mut c2 = conv2d(&c1, &self.stem.conv2_w, &self.stem.conv2_b,
+                                CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 2, 1);
+            gelu_inplace(&mut c2);
+
+            // Conv2D layer 3: [480, h2, w2] → [480, h3, w3]
+            let h3 = (h2 + 2 - 3) / 2 + 1; // 16
+            let _w3_check = (w2 + 2 - 3) / 2 + 1;
+            debug_assert_eq!(_w3_check, w3);
+            let mut c3 = conv2d(&c2, &self.stem.conv3_w, &self.stem.conv3_b,
+                                CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 2, 1);
+            gelu_inplace(&mut c3);
+
+            // Reshape [480, 16, w3] → [w3, 480*16=7680]
+            let conv_proj_dim = CONV_HIDDEN * h3; // 7680
+            let mut reshaped = vec![0f32; w3 * conv_proj_dim];
+            for t in 0..w3 {
+                for ch in 0..CONV_HIDDEN {
+                    for f in 0..h3 {
+                        reshaped[t * conv_proj_dim + ch * h3 + f] =
+                            c3[ch * h3 * w3 + f * w3 + t];
+                    }
+                }
+            }
+
+            // Linear project: [w3, 7680] → [w3, d_model] (no bias)
+            let proj = &output[token_offset * d_model..(token_offset + w3) * d_model];
+            let _ = proj; // borrow check
+            for t in 0..w3 {
+                for d in 0..d_model {
+                    let mut sum = 0f32;
+                    for k in 0..conv_proj_dim {
+                        sum += reshaped[t * conv_proj_dim + k] * self.stem.conv_out_w[d * conv_proj_dim + k];
+                    }
+                    output[(token_offset + t) * d_model + d] = sum;
+                }
+            }
+
+            // Add sinusoidal position embeddings
+            for t in 0..w3 {
+                for d in 0..d_model {
+                    let pos = t as f32;
+                    let dim = d as f32;
+                    let angle = pos / f32::powf(10000.0, 2.0 * (dim / 2.0).floor() / d_model as f32);
+                    let pe = if d % 2 == 0 { angle.sin() } else { angle.cos() };
+                    output[(token_offset + t) * d_model + d] += pe;
+                }
+            }
+
+            token_offset += w3;
+        }
+
+        (output, total_tokens as u32)
+    }
+
     /// Input: token embeddings from conv stem [seq_len, d_model] as f32.
     /// Output: encoder output [seq_len, output_dim] as f32.
     pub fn forward(&mut self, token_embeddings: &[f32], seq_len: u32) -> Vec<f32> {
@@ -222,7 +358,7 @@ impl AsrEncoder {
         log::info!("[asr-encoder] buffers allocated in {}ms, seq_len={}", alloc_ms, seq_len);
 
         // ── Split borrows for transformer layers + output projection ──
-        let Self { gpu, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
+        let Self { gpu, stem: _, layers, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
 
         let x_cur = gpu.create_storage_buffer("enc_x_cur", buf_size);
         gpu.copy_buffer(&x, &x_cur, buf_size);
@@ -299,8 +435,8 @@ impl AsrEncoder {
         result
     }
 
-    fn parse_config(path: &Path) -> AsrEncoderConfig {
-        let config_path = path.join("config.json");
+    fn parse_config(model_dir: &Path) -> AsrEncoderConfig {
+        let config_path = model_dir.join("config.json");
         if !config_path.exists() {
             log::warn!("asr: config.json not found at {:?}, using defaults", config_path);
             return AsrEncoderConfig {
@@ -415,5 +551,51 @@ fn dispatch_add(
     gpu.dispatch("add", shaders::ADD, &[
         bind(0, a), bind(1, b), bind(2, params),
     ], (n.div_ceil(256), 1, 1));
+}
+
+// ── CPU conv stem helpers ──────────────────────────────────────────────
+
+/// 2D convolution: input [c_in, h, w] → output [c_out, h_out, w_out].
+/// weight: [c_out, c_in, kh, kw], bias: [c_out].
+fn conv2d(
+    input: &[f32], weight: &[f32], bias: &[f32],
+    c_in: usize, c_out: usize, h: usize, w: usize,
+    k: usize, stride: usize, pad: usize,
+) -> Vec<f32> {
+    let h_out = (h + 2 * pad - k) / stride + 1;
+    let w_out = (w + 2 * pad - k) / stride + 1;
+    let mut out = vec![0f32; c_out * h_out * w_out];
+
+    for oc in 0..c_out {
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                let mut sum = bias[oc];
+                for ic in 0..c_in {
+                    for kh in 0..k {
+                        for kw in 0..k {
+                            let ih = oh * stride + kh;
+                            let iw = ow * stride + kw;
+                            let ih = ih as isize - pad as isize;
+                            let iw = iw as isize - pad as isize;
+                            if ih >= 0 && ih < h as isize && iw >= 0 && iw < w as isize {
+                                let iv = input[ic * h * w + ih as usize * w + iw as usize];
+                                let wv = weight[oc * c_in * k * k + ic * k * k + kh * k + kw];
+                                sum += iv * wv;
+                            }
+                        }
+                    }
+                }
+                out[oc * h_out * w_out + oh * w_out + ow] = sum;
+            }
+        }
+    }
+    out
+}
+
+/// In-place GELU activation.
+fn gelu_inplace(data: &mut [f32]) {
+    for x in data.iter_mut() {
+        *x = 0.5 * *x * (1.0 + (*x * 0.7978845608 * (1.0 + 0.044715 * *x * *x)).tanh());
+    }
 }
 

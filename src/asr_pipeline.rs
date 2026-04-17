@@ -27,7 +27,8 @@ pub enum DecodeResult {
 
 /// Fused ASR pipeline owning all GPU resources.
 pub struct AsrPipeline {
-    gpu: GpuContext,
+    gpu: GpuContext,      // encoder GPU context
+    dec_gpu: GpuContext,  // decoder GPU context (owns model's buffers)
     encoder: AsrEncoder,
     model: Model,
     prefix_cache: Option<PrefixCache>,
@@ -40,9 +41,7 @@ impl AsrPipeline {
         let encoder = AsrEncoder::load(GpuContext::from_device_queue(
             gpu.device.clone(), gpu.queue.clone(),
         ), model_dir);
-        let (gpu2, model) = asr_decoder::load_bf16_model(model_dir, 256);
-        // Use the decoder's GPU context (it may differ)
-        let _ = gpu2;
+        let (dec_gpu, model) = asr_decoder::load_bf16_model(model_dir, 256);
 
         // Precompute prefix cache for fast decode
         let prefix_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -56,7 +55,7 @@ impl AsrPipeline {
             log::warn!("[asr-pipeline] prefix cache failed, using slow path");
         }
 
-        Self { gpu, encoder, model, prefix_cache }
+        Self { gpu, dec_gpu, encoder, model, prefix_cache }
     }
 
     /// Run the full pipeline: mel spectrogram → encoder → decoder → token IDs.
@@ -66,8 +65,8 @@ impl AsrPipeline {
     pub fn forward(&mut self, mel_data: &[f32], mel_frames: u32) -> DecodeResult {
         let t0 = std::time::Instant::now();
 
-        // Encoder: mel → hidden states
-        let encoder_output = self.encoder.forward(mel_data, mel_frames);
+        // Conv stem (CPU) + encoder transformer (GPU) → hidden states
+        let encoder_output = self.encoder.encode_mel(mel_data, mel_frames);
         let enc_seq_len = encoder_output.len() as u32 / self.model.config.hidden_size;
         let enc_ms = t0.elapsed().as_millis();
 
@@ -75,13 +74,13 @@ impl AsrPipeline {
         let t1 = std::time::Instant::now();
         let token_ids = if let Some(ref cache) = self.prefix_cache {
             asr_decoder::gpu_asr_decode_tokens(
-                &mut self.gpu, &mut self.model, cache,
+                &mut self.dec_gpu, &mut self.model, cache,
                 &encoder_output, enc_seq_len,
             )
         } else {
             // Slow path without prefix cache
             let text = asr_decoder::gpu_asr_decode(
-                &mut self.gpu, &mut self.model,
+                &mut self.dec_gpu, &mut self.model,
                 &encoder_output, enc_seq_len,
             );
             // Can't get token_ids from string path — return as single-token placeholder
