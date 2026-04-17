@@ -330,7 +330,8 @@ impl AsrEncoder {
         let bytes = self.gpu.read_buffer(&out_buf, out_size);
         let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
         let stem_norm: f32 = result.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-encoder] conv stem output: norm={stem_norm:.2}, {} tokens × {} d_model", n_tokens, d_model);
+        log::info!("[asr-encoder] conv stem output: norm={stem_norm:.2}, {} tokens × {} d_model, first4={:?}",
+            n_tokens, d_model, &result[..4.min(result.len())]);
         (result, n_tokens)
     }
 
