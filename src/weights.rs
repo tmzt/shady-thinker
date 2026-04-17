@@ -186,6 +186,8 @@ pub struct ModelWeights {
     /// with INT4_MATVEC_MLX instead of bf16_lm_head.
     pub embed_scales: Option<wgpu::Buffer>,
     pub embed_biases: Option<wgpu::Buffer>,
+    /// true if MLX scales/biases are BF16 (not F16)
+    pub bf16_scales: bool,
 }
 
 /// Model configuration parsed from config.json
@@ -700,7 +702,7 @@ pub fn load_weights(
             layers,
             embed_chunks,
             embed_chunk_size,
-            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
+            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None, bf16_scales: false,
         },
         RawNormWeights {
             layers: norm_weights,
@@ -848,7 +850,7 @@ pub fn load_weights_bf16(
             layers,
             embed_chunks,
             embed_chunk_size,
-            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
+            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None, bf16_scales: false,
         },
         RawNormWeights {
             layers: norm_weights,
@@ -926,7 +928,7 @@ pub fn load_weights_int4(
         embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
         lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
         layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
-        mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
+        mlx_biases: Vec::new(), embed_scales: None, embed_biases: None, bf16_scales: false,
     }, RawNormWeights { layers: nw })
 }
 
@@ -944,6 +946,14 @@ pub fn load_weights_mlx_int4(
     let mm: Vec<memmap2::Mmap> = sf.iter()
         .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
     let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
+
+    // Detect BF16 scales — check dtype of first scale tensor
+    let scales_are_bf16 = st.iter().find_map(|s| {
+        s.tensor("model.layers.0.self_attn.q_proj.scales").ok()
+    }).map_or(false, |t| format!("{:?}", t.dtype()) == "BF16");
+    if scales_are_bf16 {
+        log::info!("[mlx-int4] scales/biases are BF16");
+    }
 
     let get = |n: &str| -> &[u8] {
         for s in &st { if let Ok(t) = s.tensor(n) { return t.data(); } }
@@ -1028,6 +1038,6 @@ pub fn load_weights_mlx_int4(
         self_attn_layers: (0..config.num_hidden_layers as usize).collect(),
         layers, embed_chunks: Vec::new(), embed_chunk_size: 0,
         mlx_biases: biases,
-        embed_scales: Some(embed_sc), embed_biases: Some(embed_bi),
+        embed_scales: Some(embed_sc), embed_biases: Some(embed_bi), bf16_scales: scales_are_bf16,
     }, RawNormWeights { layers: nw })
 }

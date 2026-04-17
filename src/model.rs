@@ -32,6 +32,7 @@ pub(crate) mod shaders {
     pub const BATCHED_SILU_MUL: &str = include_str!("shaders/batched_silu_mul.wgsl");
     pub const CAUSAL_ATTENTION_PREFILL: &str = include_str!("shaders/causal_attention_prefill.wgsl");
     pub const INT4_MATVEC_MLX: &str = include_str!("shaders/int4_matvec_mlx.wgsl");
+    pub const INT4_MATVEC_MLX_BF16: &str = include_str!("shaders/int4_matvec_mlx_bf16.wgsl");
     pub const FUSED_SILU_INT4_MLX: &str = include_str!("shaders/fused_silu_int4_mlx.wgsl");
     pub const INT4_EMBEDDING_MLX: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
 
@@ -268,6 +269,8 @@ pub struct Model {
     /// When true, weights are MLX INT4 (asymmetric minmax, row-major).
     /// Uses int4_matvec_mlx shader with separate biases buffer.
     pub mlx_int4_mode: bool,
+    /// MLX scales/biases are BF16 (not F16). Use INT4_MATVEC_MLX_BF16 shader.
+    pub mlx_bf16_scales: bool,
     /// Current layer index during forward pass (for accessing mlx_biases)
     mlx_current_layer: usize,
     /// Which projection within a layer: 0=q,1=k,2=v,3=o,4=gate,5=up,6=down
@@ -694,6 +697,7 @@ impl Model {
             }).collect();
         }
 
+        let bf16_scales = weights.bf16_scales;
         Self {
             linear_num_key_heads: config.linear_num_key_heads,
             linear_key_dim: config.linear_key_head_dim,
@@ -715,6 +719,7 @@ impl Model {
             q_gated: true, // default: Qwen3.5 gated attention
             norm_direct: false,
             mlx_int4_mode: false,
+            mlx_bf16_scales: bf16_scales,
             mlx_current_layer: 0,
             mlx_current_proj: 0,
             tied_embeddings,
@@ -808,7 +813,8 @@ impl Model {
         gpu.write_buffer(&self.state.p_scratch, 0, bytemuck::bytes_of(&P {
             in_dim: k, out_dim: n, group_size: self.quant_config.group_size, _pad: 0,
         }));
-        gpu.dispatch(name, shaders::INT4_MATVEC_MLX, &[
+        let shader = if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX };
+        gpu.dispatch(name, shader, &[
             gpu::bind(0, input), gpu::bind(1, qweight),
             gpu::bind(2, scales), gpu::bind(3, biases),
             gpu::bind(4, output), gpu::bind(5, &self.state.p_scratch),
@@ -986,7 +992,7 @@ impl Model {
                 let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
                 let nn: f32 = nv.iter().map(|x| x*x).sum::<f32>().sqrt();
                 log::info!("[model] MLX INT4 lm_head: vocab={}, hidden={}, normed_norm={nn:.4}", self.config.vocab_size, h);
-                gpu.dispatch("lm_head_mlx", shaders::INT4_MATVEC_MLX, &[
+                gpu.dispatch("lm_head_mlx", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.normed),
                     gpu::bind(1, &self.weights.embed_tokens),
                     gpu::bind(2, scales),
@@ -1739,32 +1745,69 @@ impl Model {
                 let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
                 let kv_dim = nkv * hd;
 
+                if self.generated_tokens.is_empty() && i == 0 {
+                    gpu.flush();
+                    let dbg = gpu.read_buffer(&self.state.normed, h as u64 * 4);
+                    let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                    let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let has_nan = dv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after rmsnorm: norm={norm:.4} nan={has_nan} first4={:?}", &dv[..4]);
+                }
+
                 // Q projection (MLX INT4) — p_gptq_q has {h, q_dim, gs} layout
-                gpu.dispatch("qproj", shaders::INT4_MATVEC_MLX, &[
+                gpu.dispatch("qproj", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.q_proj_qweight),
                     gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &biases[0]),
                     gpu::bind(4, &self.state.q_out), gpu::bind(5, &self.state.p_gptq_q),
                 ], (q_dim.div_ceil(32), 1, 1));
 
                 // K projection
-                gpu.dispatch("kproj", shaders::INT4_MATVEC_MLX, &[
+                gpu.dispatch("kproj", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.k_proj_qweight),
                     gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &biases[1]),
                     gpu::bind(4, &self.state.k_out), gpu::bind(5, &self.state.p_gptq_kv),
                 ], (kv_dim.div_ceil(32), 1, 1));
 
                 // V projection
-                gpu.dispatch("vproj", shaders::INT4_MATVEC_MLX, &[
+                gpu.dispatch("vproj", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.normed), gpu::bind(1, &sa.v_proj_qweight),
                     gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &biases[2]),
                     gpu::bind(4, &self.state.v_out), gpu::bind(5, &self.state.p_gptq_kv),
                 ], (kv_dim.div_ceil(32), 1, 1));
 
+                if self.generated_tokens.is_empty() && i == 0 {
+                    gpu.flush();
+                    let dbg = gpu.read_buffer(&self.state.q_out, q_dim as u64 * 4);
+                    let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                    let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let has_nan = dv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after qproj: norm={norm:.4} nan={has_nan} q_dim={q_dim}");
+                }
+
                 self.fused_split_qknorm_kvstore(gpu, i);
+
+                if self.generated_tokens.is_empty() && i == 0 {
+                    gpu.flush();
+                    let dbg = gpu.read_buffer(&self.state.q_out, q_dim as u64 * 4);
+                    let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                    let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let has_nan = dv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after qknorm: norm={norm:.4} nan={has_nan}");
+                }
+
                 self.gqa_attention(gpu, i); // sigmoid gate fused in when q_gated
 
+                if self.generated_tokens.is_empty() && i == 0 {
+                    gpu.flush();
+                    let dbg = gpu.read_buffer(&self.state.attn_output, h as u64 * 4);
+                    let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                    let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let has_nan = dv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 after attention: norm={norm:.4} nan={has_nan}");
+                }
+
                 // O projection
-                gpu.dispatch("oproj", shaders::INT4_MATVEC_MLX, &[
+                gpu.dispatch("oproj", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.attn_output), gpu::bind(1, &sa.o_proj_qweight),
                     gpu::bind(2, &sa.o_proj_scales), gpu::bind(3, &biases[3]),
                     gpu::bind(4, &self.state.o_proj_out), gpu::bind(5, &self.state.p_gptq_o),
@@ -1778,13 +1821,13 @@ impl Model {
                 &layer.post_attn_layernorm, &self.state.normed);
 
             // MLP: gate + up (INT4), then fused SiLU + down (INT4)
-            gpu.dispatch("gate", shaders::INT4_MATVEC_MLX, &[
+            gpu.dispatch("gate", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                 gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.gate_proj_qweight),
                 gpu::bind(2, &layer.gate_proj_scales), gpu::bind(3, &biases[4]),
                 gpu::bind(4, &self.state.gate_out), gpu::bind(5, &self.state.p_gptq_gu),
             ], (inter.div_ceil(32), 1, 1));
 
-            gpu.dispatch("up", shaders::INT4_MATVEC_MLX, &[
+            gpu.dispatch("up", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                 gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.up_proj_qweight),
                 gpu::bind(2, &layer.up_proj_scales), gpu::bind(3, &biases[5]),
                 gpu::bind(4, &self.state.up_out), gpu::bind(5, &self.state.p_gptq_gu),
@@ -1797,6 +1840,15 @@ impl Model {
                 gpu::bind(3, &layer.down_proj_scales), gpu::bind(4, &biases[6]),
                 gpu::bind(5, &self.state.mlp_output), gpu::bind(6, &self.state.p_gptq_down),
             ], (h.div_ceil(32), 1, 1));
+
+            if self.generated_tokens.is_empty() && (i == 0 || i == self.config.num_hidden_layers as usize - 1) {
+                gpu.flush();
+                let dbg = gpu.read_buffer(&self.state.mlp_output, h as u64 * 4);
+                let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                let has_nan = dv.iter().any(|x| x.is_nan());
+                let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[model] mlx layer {i}: mlp_out norm={norm:.4} nan={has_nan}");
+            }
         }
 
         // Final norm

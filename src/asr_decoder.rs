@@ -106,6 +106,47 @@ const PREFIX_TAIL: &[u32] = &[TOKEN_IM_END, 198, TOKEN_IM_START, 872, 198, TOKEN
 /// <|audio_end|><|im_end|>\n<|im_start|>assistant\n
 const SUFFIX_BASE: &[u32] = &[TOKEN_AUDIO_END, TOKEN_IM_END, 198, TOKEN_IM_START, 77091, 198];
 
+/// Forward one token through the decoder. Handles MLX INT4 embedding + forward.
+/// `embed_scales_biases`: needed for MLX INT4 embedding lookup (from prefix cache or model weights).
+fn forward_token(
+    gpu: &mut GpuContext, model: &mut Model, token_id: u32,
+    embed_sb: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
+) -> u32 {
+    let h = model.config.hidden_size;
+    if model.mlx_int4_mode {
+        // MLX INT4: use INT4 embedding shader
+        if let Some((sc, bi)) = embed_sb.or_else(|| {
+            // Try model weights' embed_scales/biases
+            match (&model.weights.embed_scales, &model.weights.embed_biases) {
+                (Some(s), Some(b)) => Some((s, b)),
+                _ => None,
+            }
+        }) {
+            #[repr(C)]
+            #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+            struct EP { token_id: u32, dim: u32, group_size: u32, _pad: u32 }
+            gpu.flush();
+            gpu.write_buffer(&model.state.p_scratch, 0, bytemuck::bytes_of(&EP {
+                token_id, dim: h, group_size: model.quant_config.group_size, _pad: 0,
+            }));
+            gpu.dispatch("emb_mlx", INT4_EMBEDDING_MLX_SRC, &[
+                crate::gpu::bind(0, &model.weights.embed_tokens),
+                crate::gpu::bind(1, sc), crate::gpu::bind(2, bi),
+                crate::gpu::bind(3, &model.state.hidden),
+                crate::gpu::bind(4, &model.state.p_scratch),
+            ], (h.div_ceil(256), 1, 1));
+        } else {
+            // Fallback: bf16 embedding (works if embed_tokens is bf16)
+            model.embedding(gpu, token_id);
+        }
+        gpu.flush();
+        gpu.copy_buffer(&model.state.hidden, &model.state.residual, h as u64 * 4);
+        model.forward_mlx_argmax(gpu)
+    } else {
+        model.forward_argmax(gpu, token_id)
+    }
+}
+
 /// GPU ASR decode: encoder output → text.
 /// Takes encoder output embeddings [seq_len × hidden_size] and decodes to text tokens.
 /// Returns decoded text string.
@@ -126,10 +167,10 @@ pub fn gpu_asr_decode(
 
     // ── Prefill: prefix tokens ──
     for &tok in PREFIX_HEAD {
-        model.forward_argmax(gpu, tok);
+        forward_token(gpu, model, tok, None);
     }
     for &tok in PREFIX_TAIL {
-        model.forward_argmax(gpu, tok);
+        forward_token(gpu, model, tok, None);
     }
 
     let prefix_ms = t0.elapsed().as_millis();
@@ -150,12 +191,12 @@ pub fn gpu_asr_decode(
     let force_prompt = &[TOKEN_ASR_TEXT]; // language=en + <|asr_text|>
     let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(force_prompt.iter()).copied().collect();
     for &tok in &suffix[..suffix.len() - 1] {
-        model.forward_argmax(gpu, tok);
+        forward_token(gpu, model, tok, None);
     }
 
     // ── Generate from last suffix token ──
     let t2 = std::time::Instant::now();
-    let mut token = model.forward_argmax(gpu, suffix[suffix.len() - 1]);
+    let mut token = forward_token(gpu, model, suffix[suffix.len() - 1], None);
 
     let mut text = String::new();
     let mut n_generated = 0u32;
@@ -180,7 +221,7 @@ pub fn gpu_asr_decode(
             token_ids.push(token);
         }
 
-        token = model.forward_argmax(gpu, token);
+        token = forward_token(gpu, model, token, None);
     }
 
     let decode_ms = t2.elapsed().as_millis();
@@ -398,8 +439,14 @@ pub fn gpu_asr_decode_tokens(
         } else {
             model.forward_embed_argmax(gpu, chunk);
         }
-        if (i + 1) % 20 == 0 {
-            log::info!("[asr-decode] prefill: {}/{} tokens", i + 1, remain_seq);
+        if i < 5 {
+            gpu.flush();
+            let hid_bytes = gpu.read_buffer(&model.state.hidden, h as u64 * 4);
+            let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
+            let has_nan = hv.iter().any(|x| x.is_nan());
+            let norm: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
+            log::info!("[asr-decode] prefill token {i}: hidden norm={norm:.4} nan={has_nan} tok={}",
+                model.generated_tokens.last().unwrap_or(&0));
         }
     }
     let mut token = *model.generated_tokens.last().unwrap_or(&0);
