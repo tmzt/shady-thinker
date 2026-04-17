@@ -1065,9 +1065,11 @@ impl Model {
             &self.state.attn_partials
         };
 
-        // Use dynamic shader with Q_GATED sigmoid fusion baked in.
-        // Binding 5 (q_gate) is always present; ignored when Q_GATED=false.
-        // p_attn has seq_len written at start of forward(), rest is static.
+        // Write current seq_len to p_attn (tells shader how many KV positions to scan).
+        // Done here so all forward paths (GPTQ, bf16, MLX) share the same write point.
+        let seq_len_val = self.seq_len + 1;
+        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
+
         gpu.dispatch(
             if self.q_gated { "gqa_gated" } else { "gqa" },
             &self.gqa_shader_src,
@@ -1202,9 +1204,7 @@ impl Model {
 
     pub fn forward(&mut self, gpu: &mut GpuContext, token_id: u32) -> u32 {
         let h = self.config.hidden_size;
-        let seq_len_val = self.seq_len + 1;
         gpu.write_buffer(&self.state.p_embed, 0, &token_id.to_le_bytes());
-        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
         self.embedding(gpu, token_id);
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.forward_layers(gpu)
@@ -1212,13 +1212,9 @@ impl Model {
 
     /// Prefill-only forward pass: runs embedding + all layers + KV cache update,
     /// but skips lm_head and the GPU→CPU logit readback.
-    /// All dispatches for this token accumulate in one encoder; submit happens at the next
-    /// read_buffer call (or explicit flush).
     pub fn forward_kv_only(&mut self, gpu: &mut GpuContext, token_id: u32) {
         let h = self.config.hidden_size;
-        let seq_len_val = self.seq_len + 1;
         gpu.write_buffer(&self.state.p_embed, 0, &token_id.to_le_bytes());
-        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
         self.embedding(gpu, token_id);
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.prefill_kv_only = true;
@@ -1226,13 +1222,10 @@ impl Model {
         self.prefill_kv_only = false;
     }
 
-
     /// Forward pass with raw f32 embedding instead of token ID lookup.
     /// Used for ASR decoder where encoder output embeddings are injected directly.
     pub fn forward_embed(&mut self, gpu: &mut GpuContext, embed: &[f32]) -> u32 {
         let h = self.config.hidden_size;
-        let seq_len_val = self.seq_len + 1;
-        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
         gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(embed));
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.forward_layers(gpu)
@@ -1726,10 +1719,6 @@ impl Model {
         let nh = self.config.num_attention_heads;
         let nkv = self.config.num_key_value_heads;
         let hd = self.config.head_dim;
-
-        // Write current seq_len to p_attn so attention knows how many KV positions to scan
-        let seq_len_val = self.seq_len + 1;
-        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
 
         // MLX INT4 uses named params buffers (same byte layout as GPTQ {k, n, gs})
         for i in 0..self.config.num_hidden_layers as usize {
