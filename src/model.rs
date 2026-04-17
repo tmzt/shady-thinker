@@ -1680,18 +1680,16 @@ impl Model {
                 gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
             }
 
-            // Debug: dump after attention+residual for first few layers
-            if self.generated_tokens.is_empty() && i < 3 {
-                gpu.flush();
-                // residual + o_proj_out haven't been summed yet — read o_proj_out
-                let dbg = gpu.read_buffer(&self.state.o_proj_out, h as u64 * 4);
-                let dv: &[f32] = bytemuck::cast_slice(&dbg);
-                let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[gpu-decoder] L{i} o_proj: norm={norm:.4} first4={:?}", &dv[..4]);
-            }
-
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed);
+
+            if self.generated_tokens.is_empty() && i < 3 {
+                gpu.flush();
+                let dbg = gpu.read_buffer(&self.state.residual, h as u64 * 4);
+                let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[gpu-decoder] L{i} after attn+res: norm={norm:.4} first4={:?}", &dv[..4]);
+            }
 
             let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
             let p_down = if self.bf16_mode { &self.state.p_bf16_o } else { &self.state.p_gptq_down };

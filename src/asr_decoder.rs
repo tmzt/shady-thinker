@@ -481,9 +481,15 @@ pub fn gpu_asr_decode_tokens(
     }
     let mut token = *model.generated_tokens.last().unwrap_or(&0);
 
-    // Debug: check normed + logits at last prefill position
+    // Debug: check hidden + normed + logits at last prefill position
     {
         gpu.flush();
+        // Read raw hidden (residual after all layers)
+        let hid_bytes = gpu.read_buffer(&model.state.residual, h as u64 * 4);
+        let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
+        let hn: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-decode] final hidden: norm={hn:.4} first4={:?}", &hv[..4]);
+
         let normed_bytes = gpu.read_buffer(&model.state.normed, h as u64 * 4);
         let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
         let nn: f32 = nv.iter().map(|x| x*x).sum::<f32>().sqrt();
