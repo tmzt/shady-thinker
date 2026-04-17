@@ -120,6 +120,24 @@ impl AsrEncoder {
             panic!("[asr-encoder] tensor not found: {name}");
         };
 
+        // Get tensor shape
+        let get_shape = |name: &str| -> Vec<usize> {
+            for st in &shards {
+                if let Ok(t) = st.tensor(name) {
+                    return t.shape().to_vec();
+                }
+            }
+            if name.starts_with("thinker.") {
+                let alt = &name["thinker.".len()..];
+                for st in &shards {
+                    if let Ok(t) = st.tensor(alt) {
+                        return t.shape().to_vec();
+                    }
+                }
+            }
+            vec![]
+        };
+
         // Convert bf16 bytes → f32 bytes for biases and norm weights.
         // GEMM weights stay as bf16 packed (shader unpacks them).
         // Biases/norms are read as f32 by the shaders.
@@ -187,9 +205,18 @@ impl AsrEncoder {
             let data = get_tensor(name);
             let f32_bytes = bf16_to_f32(data);
             let w: &[f32] = bytemuck::cast_slice(&f32_bytes);
+            let shape = get_shape(name);
             let c_out = w.len() / (c_in * 3 * 3);
-            // Detect and transpose MLX layout [out, kH, kW, in] → PyTorch [out, in, kH, kW]
-            let w_pt = transpose_conv2d_if_mlx(w, c_out, c_in, 3, 3);
+            // Detect layout from shape:
+            //   PyTorch/HF: [c_out, c_in, kH, kW] → shape[1] == c_in
+            //   MLX:        [c_out, kH, kW, c_in] → shape[3] == c_in
+            let is_mlx = shape.len() == 4 && shape[3] == c_in && shape[1] != c_in;
+            let w_pt = if is_mlx {
+                log::info!("[asr-encoder] transposing conv2d from MLX layout: {:?}", shape);
+                transpose_conv2d(w, c_out, c_in, 3, 3)
+            } else {
+                w.to_vec()
+            };
             gpu.upload_buffer(label, bytemuck::cast_slice(&w_pt))
         };
 
@@ -276,6 +303,13 @@ impl AsrEncoder {
             bind(3, &c1_buf), bind(4, &params),
         ], ((CONV_HIDDEN * h1 * w1).div_ceil(256), 1, 1));
 
+        // Debug: conv1 output
+        self.gpu.flush();
+        let c1_bytes = self.gpu.read_buffer(&c1_buf, (CONV_HIDDEN * h1 * w1) as u64 * 4);
+        let c1_vals: &[f32] = bytemuck::cast_slice(&c1_bytes);
+        let c1_norm: f32 = c1_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] conv1: norm={c1_norm:.2} h1={h1} w1={w1} first4={:?}", &c1_vals[..4]);
+
         // Conv2: [480, h1, w1] → [480, h2, w2]
         let c2_size = (CONV_HIDDEN * h2 * w2) as u64 * 4;
         let c2_buf = self.gpu.create_storage_buffer("conv2_out", c2_size);
@@ -288,6 +322,13 @@ impl AsrEncoder {
             bind(0, &c1_buf), bind(1, &self.conv.conv2_w), bind(2, &self.conv.conv2_b),
             bind(3, &c2_buf), bind(4, &params),
         ], ((CONV_HIDDEN * h2 * w2).div_ceil(256), 1, 1));
+
+        // Debug: conv2 output
+        self.gpu.flush();
+        let c2_bytes = self.gpu.read_buffer(&c2_buf, (CONV_HIDDEN * h2 * w2) as u64 * 4);
+        let c2_vals: &[f32] = bytemuck::cast_slice(&c2_bytes);
+        let c2_norm: f32 = c2_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] conv2: norm={c2_norm:.2} h2={h2} w2={w2} first4={:?}", &c2_vals[..4]);
 
         // Conv3: [480, h2, w2] → [480, h3, w3]
         let c3_size = (CONV_HIDDEN * h3 * w3) as u64 * 4;
@@ -673,24 +714,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }}", ch=CONV_HIDDEN)
 }
 
-/// Transpose conv2d weights from MLX [out,kH,kW,in] to PyTorch [out,in,kH,kW] if needed.
-fn transpose_conv2d_if_mlx(w: &[f32], c_out: usize, c_in: usize, kh: usize, kw: usize) -> Vec<f32> {
-    if c_in <= 1 { return w.to_vec(); } // can't detect for depthwise
-    // MLX layout: [c_out, kH, kW, c_in] — inner stride is c_in
-    // PyTorch/HF: [c_out, c_in, kH, kW] — inner stride is 1
-    // Check if inner stride looks like c_in (MLX) by comparing correlation
-    let stride = c_in;
-    if stride <= kw || w.len() <= stride * 2 {
-        return w.to_vec();
-    }
-    // In PyTorch layout, w[0..kw] spans one row of one kernel — should have similar magnitude
-    // In MLX layout, w[0..kw*c_in] spans one row across all input channels — more varied
-    // Check: are elements at stride=1 more correlated than at stride=c_in?
-    let unit_var: f32 = (1..kw.min(4)).map(|i| (w[i] - w[0]).powi(2)).sum();
-    let strided_var: f32 = (1..kw.min(4)).map(|i| (w[i * stride] - w[0]).powi(2)).sum();
-    // If unit stride has LOWER variance, adjacent elements are correlated → PyTorch layout
-    if unit_var <= strided_var { return w.to_vec(); }
-    log::info!("encoder: transposing conv2d weights from MLX layout ({}x{}x{}x{})", c_out, c_in, kh, kw);
+/// Transpose conv2d weights from MLX [out,kH,kW,in] to PyTorch [out,in,kH,kW].
+fn transpose_conv2d(w: &[f32], c_out: usize, c_in: usize, kh: usize, kw: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; c_out * c_in * kh * kw];
     for oc in 0..c_out {
         for ic in 0..c_in {
