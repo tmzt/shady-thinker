@@ -216,16 +216,24 @@ pub fn gpu_asr_decode(
     log::info!("[asr-decode] encoder prefill: {} tokens in {}ms ({:.1}ms/tok)",
         enc_seq_len, enc_ms, enc_ms as f64 / enc_seq_len as f64);
 
-    // ── Prefill: suffix tokens (all but last) ──
-    let force_prompt = &[TOKEN_ASR_TEXT]; // language=en + <|asr_text|>
-    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(force_prompt.iter()).copied().collect();
-    for &tok in &suffix[..suffix.len() - 1] {
+    // ── Prefill: suffix tokens ──
+    // Don't include TOKEN_ASR_TEXT — model generates it naturally (matches C reference)
+    for &tok in &SUFFIX_BASE[..SUFFIX_BASE.len() - 1] {
         forward_token(gpu, model, tok, None);
     }
 
     // ── Generate from last suffix token ──
     let t2 = std::time::Instant::now();
-    let mut token = forward_token(gpu, model, suffix[suffix.len() - 1], None);
+    let mut token = forward_token(gpu, model, SUFFIX_BASE[SUFFIX_BASE.len() - 1], None);
+
+    // Debug: dump final hidden state
+    {
+        gpu.flush();
+        let hid_bytes = gpu.read_buffer(&model.state.residual, hidden as u64 * 4);
+        let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
+        let hn: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-decode] slow path final hidden: norm={hn:.4} first4={:?} seq_len={}", &hv[..4], model.seq_len);
+    }
 
     let mut text = String::new();
     let mut n_generated = 0u32;
