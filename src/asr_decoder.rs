@@ -376,6 +376,12 @@ pub fn gpu_asr_decode_tokens(
     }
 
     let embed_ms = t0.elapsed().as_millis();
+
+    // Debug: check encoder output is non-zero
+    let enc_norm: f32 = encoder_output.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let enc_first8: Vec<f32> = encoder_output.iter().take(8).copied().collect();
+    log::info!("[asr-decode] encoder output: norm={enc_norm:.4}, first8={enc_first8:?}");
+    log::info!("[asr-decode] input_embeds: {} floats, remain_seq={}", input_embeds.len(), remain_seq);
     log::info!("[asr-decode] restored prefix ({} tokens), built {} remaining embeds in {}ms",
         prefix_cache.prefix_len, remain_seq, embed_ms);
 
