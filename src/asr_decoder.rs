@@ -232,7 +232,7 @@ pub fn gpu_asr_decode(
         let hid_bytes = gpu.read_buffer(&model.state.residual, hidden as u64 * 4);
         let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
         let hn: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-decode] slow path final hidden: norm={hn:.4} first4={:?} seq_len={}", &hv[..4], model.seq_len);
+        log::debug!("[asr-decode] slow path final hidden: norm={hn:.4} first4={:?} seq_len={}", &hv[..4], model.seq_len);
     }
 
     let mut text = String::new();
@@ -459,8 +459,8 @@ pub fn gpu_asr_decode_tokens(
     // Debug: check encoder output is non-zero
     let enc_norm: f32 = encoder_output.iter().map(|x| x * x).sum::<f32>().sqrt();
     let enc_first8: Vec<f32> = encoder_output.iter().take(8).copied().collect();
-    log::info!("[asr-decode] encoder output: norm={enc_norm:.4}, first8={enc_first8:?}");
-    log::info!("[asr-decode] input_embeds: {} floats, remain_seq={}", input_embeds.len(), remain_seq);
+    log::debug!("[asr-decode] encoder output: norm={enc_norm:.4}, first8={enc_first8:?}");
+    log::debug!("[asr-decode] input_embeds: {} floats, remain_seq={}", input_embeds.len(), remain_seq);
     log::info!("[asr-decode] restored prefix ({} tokens), built {} remaining embeds in {}ms",
         prefix_cache.prefix_len, remain_seq, embed_ms);
 
@@ -483,7 +483,7 @@ pub fn gpu_asr_decode_tokens(
             let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
             let has_nan = hv.iter().any(|x| x.is_nan());
             let norm: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
-            log::info!("[asr-decode] prefill token {i}: hidden norm={norm:.4} nan={has_nan} tok={}",
+            log::debug!("[asr-decode] prefill token {i}: hidden norm={norm:.4} nan={has_nan} tok={}",
                 model.generated_tokens.last().unwrap_or(&0));
         }
     }
@@ -496,7 +496,7 @@ pub fn gpu_asr_decode_tokens(
         let hid_bytes = gpu.read_buffer(&model.state.residual, h as u64 * 4);
         let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
         let hn: f32 = hv.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-decode] final hidden: norm={hn:.4} first4={:?}", &hv[..4]);
+        log::debug!("[asr-decode] final hidden: norm={hn:.4} first4={:?}", &hv[..4]);
 
         let normed_bytes = gpu.read_buffer(&model.state.normed, h as u64 * 4);
         let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
@@ -506,7 +506,7 @@ pub fn gpu_asr_decode_tokens(
         let (max_idx, max_val) = lv.iter().enumerate()
             .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
         let nonzero = lv.iter().filter(|&&x| x.abs() > 1e-10).count();
-        log::info!("[asr-decode] last prefill: normed_norm={nn:.4} logits max={max_val:.4}@{max_idx} nonzero={nonzero} first_token={token}");
+        log::debug!("[asr-decode] last prefill: normed_norm={nn:.4} logits max={max_val:.4}@{max_idx} nonzero={nonzero} first_token={token}");
     }
 
     let prefill_ms = t1.elapsed().as_millis();

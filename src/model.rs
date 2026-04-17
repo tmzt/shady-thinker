@@ -1009,7 +1009,7 @@ impl Model {
                 let normed_bytes = gpu.read_buffer(&self.state.normed, h as u64 * 4);
                 let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
                 let nn: f32 = nv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[model] MLX INT4 lm_head: vocab={}, hidden={}, normed_norm={nn:.4}", self.config.vocab_size, h);
+                log::debug!("[model] MLX INT4 lm_head: vocab={}, hidden={}, normed_norm={nn:.4}", self.config.vocab_size, h);
                 gpu.dispatch("lm_head_mlx", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
                     gpu::bind(0, &self.state.normed),
                     gpu::bind(1, &self.weights.embed_tokens),
@@ -1635,7 +1635,7 @@ impl Model {
             let dbg = gpu.read_buffer(&self.state.hidden, h as u64 * 4);
             let dv: &[f32] = bytemuck::cast_slice(&dbg);
             let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-            log::info!("[gpu-decoder] embed tok={token_id}: norm={norm:.4} first4={:?}", &dv[..4]);
+            log::debug!("[gpu-decoder] embed tok={token_id}: norm={norm:.4} first4={:?}", &dv[..4]);
         }
         gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
         self.forward_layers_argmax(gpu)
@@ -1702,7 +1702,7 @@ impl Model {
                 let dbg = gpu.read_buffer(&self.state.residual, h as u64 * 4);
                 let dv: &[f32] = bytemuck::cast_slice(&dbg);
                 let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[gpu-decoder] L{i} after attn+res (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
+                log::debug!("[gpu-decoder] L{i} after attn+res (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
             }
 
             let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
@@ -1722,7 +1722,7 @@ impl Model {
                 let dbg = gpu.read_buffer(&self.state.mlp_output, h as u64 * 4);
                 let dv: &[f32] = bytemuck::cast_slice(&dbg);
                 let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[gpu-decoder] L{i} mlp_out (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
+                log::debug!("[gpu-decoder] L{i} mlp_out (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
             }
         }
 
@@ -1786,7 +1786,7 @@ impl Model {
                     let dv: &[f32] = bytemuck::cast_slice(&dbg);
                     let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let has_nan = dv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after rmsnorm: norm={norm:.4} nan={has_nan} first4={:?}", &dv[..4]);
+                    log::debug!("[model] L0 after rmsnorm: norm={norm:.4} nan={has_nan} first4={:?}", &dv[..4]);
                 }
 
                 // Q projection (MLX INT4) — p_gptq_q has {h, q_dim, gs} layout
@@ -1816,12 +1816,12 @@ impl Model {
                     let dv: &[f32] = bytemuck::cast_slice(&dbg);
                     let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let has_nan = dv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after qproj: q_norm={norm:.4} nan={has_nan} q_dim={q_dim}");
+                    log::debug!("[model] L0 after qproj: q_norm={norm:.4} nan={has_nan} q_dim={q_dim}");
                     let kdbg = gpu.read_buffer(&self.state.k_out, kv_dim as u64 * 4);
                     let kv: &[f32] = bytemuck::cast_slice(&kdbg);
                     let knorm: f32 = kv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let knan = kv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after kproj: k_norm={knorm:.4} nan={knan} kv_dim={kv_dim}");
+                    log::debug!("[model] L0 after kproj: k_norm={knorm:.4} nan={knan} kv_dim={kv_dim}");
                 }
 
                 self.fused_split_qknorm_kvstore(gpu, i);
@@ -1835,7 +1835,7 @@ impl Model {
                     let kv: &[f32] = bytemuck::cast_slice(&kdbg);
                     let knorm: f32 = kv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let knan = kv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after qknorm+kvstore: k_cache norm={knorm:.4} nan={knan} seq_len={}", self.seq_len);
+                    log::debug!("[model] L0 after qknorm+kvstore: k_cache norm={knorm:.4} nan={knan} seq_len={}", self.seq_len);
                 }
 
                 self.gqa_attention(gpu, i); // sigmoid gate fused in when q_gated
@@ -1848,13 +1848,13 @@ impl Model {
                     let has_nan = dv.iter().any(|x| x.is_nan());
                     let has_inf = dv.iter().any(|x| x.is_infinite());
                     let first_nan = dv.iter().position(|x| x.is_nan());
-                    log::info!("[model] L0 after attention: norm={norm:.4} nan={has_nan} inf={has_inf} first_nan={first_nan:?} first4={:?}", &dv[..4.min(dv.len())]);
+                    log::debug!("[model] L0 after attention: norm={norm:.4} nan={has_nan} inf={has_inf} first_nan={first_nan:?} first4={:?}", &dv[..4.min(dv.len())]);
                     // Also check q_proj (post-norm, post-RoPE)
                     let qdbg = gpu.read_buffer(&self.state.q_proj, (nh * hd) as u64 * 4);
                     let qv: &[f32] = bytemuck::cast_slice(&qdbg);
                     let qnorm: f32 = qv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let qnan = qv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 q_proj (normed+RoPE): norm={qnorm:.4} nan={qnan}");
+                    log::debug!("[model] L0 q_proj (normed+RoPE): norm={qnorm:.4} nan={qnan}");
                 }
 
                 // O projection
@@ -1898,7 +1898,7 @@ impl Model {
                 let dv: &[f32] = bytemuck::cast_slice(&dbg);
                 let has_nan = dv.iter().any(|x| x.is_nan());
                 let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
-                log::info!("[model] mlx layer {i}: mlp_out norm={norm:.4} nan={has_nan}");
+                log::debug!("[model] mlx layer {i}: mlp_out norm={norm:.4} nan={has_nan}");
             }
         }
 
@@ -1920,7 +1920,7 @@ impl Model {
         if self.generated_tokens.len() < 3 {
             let norm: f32 = logits.iter().map(|x| x*x).sum::<f32>().sqrt();
             let nonzero = logits.iter().filter(|&&x| x.abs() > 1e-10).count();
-            log::info!("[model] logits: norm={norm:.4} max={max_val:.4}@{max_idx} nonzero={nonzero}/{}", logits.len());
+            log::debug!("[model] logits: norm={norm:.4} max={max_val:.4}@{max_idx} nonzero={nonzero}/{}", logits.len());
         }
         self.generated_tokens.push(token);
         token

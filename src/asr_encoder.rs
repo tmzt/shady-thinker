@@ -308,7 +308,7 @@ impl AsrEncoder {
         let c1_bytes = self.gpu.read_buffer(&c1_buf, (CONV_HIDDEN * h1 * w1) as u64 * 4);
         let c1_vals: &[f32] = bytemuck::cast_slice(&c1_bytes);
         let c1_norm: f32 = c1_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-encoder] conv1: norm={c1_norm:.2} h1={h1} w1={w1} first4={:?}", &c1_vals[..4]);
+        log::debug!("[asr-encoder] conv: norm={c1_norm:.2} h1={h1} w1={w1} first4={:?}", &c1_vals[..4]);
 
         // Conv2: [480, h1, w1] → [480, h2, w2]
         let c2_size = (CONV_HIDDEN * h2 * w2) as u64 * 4;
@@ -328,7 +328,7 @@ impl AsrEncoder {
         let c2_bytes = self.gpu.read_buffer(&c2_buf, (CONV_HIDDEN * h2 * w2) as u64 * 4);
         let c2_vals: &[f32] = bytemuck::cast_slice(&c2_bytes);
         let c2_norm: f32 = c2_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-encoder] conv2: norm={c2_norm:.2} h2={h2} w2={w2} first4={:?}", &c2_vals[..4]);
+        log::debug!("[asr-encoder] conv: norm={c2_norm:.2} h2={h2} w2={w2} first4={:?}", &c2_vals[..4]);
 
         // Conv3: [480, h2, w2] → [480, h3, w3]
         let c3_size = (CONV_HIDDEN * h3 * w3) as u64 * 4;
@@ -365,13 +365,13 @@ impl AsrEncoder {
         let c3_bytes = self.gpu.read_buffer(&c3_buf, (CONV_HIDDEN * h3 * w3) as u64 * 4);
         let c3_vals: &[f32] = bytemuck::cast_slice(&c3_bytes);
         let c3_norm: f32 = c3_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-encoder] conv3 output: norm={c3_norm:.2}, first4={:?}", &c3_vals[..4.min(c3_vals.len())]);
+        log::debug!("[asr-encoder] conv output: norm={c3_norm:.2}, first4={:?}", &c3_vals[..4.min(c3_vals.len())]);
 
         // Read back
         let bytes = self.gpu.read_buffer(&out_buf, out_size);
         let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
         let stem_norm: f32 = result.iter().map(|x| x*x).sum::<f32>().sqrt();
-        log::info!("[asr-encoder] conv stem output: norm={stem_norm:.2}, {} tokens × {} d_model, first4={:?}",
+        log::debug!("[asr-encoder] conv stem output: norm={stem_norm:.2}, {} tokens × {} d_model, first4={:?}",
             n_tokens, d_model, &result[..4.min(result.len())]);
         (result, n_tokens)
     }
