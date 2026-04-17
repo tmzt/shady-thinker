@@ -882,6 +882,18 @@ impl Model {
         gate_out: &wgpu::Buffer, up_out: &wgpu::Buffer,
         n: u32, params_buf: &wgpu::Buffer,
     ) {
+        if self.bf16_mode {
+            // BF16: two separate bf16_matvec dispatches for gate and up
+            gpu.dispatch("gate_bf16", shaders::BF16_MATVEC, &[
+                gpu::bind(0, input), gpu::bind(1, gate_qw),
+                gpu::bind(2, gate_out), gpu::bind(3, params_buf),
+            ], (n.div_ceil(32), 1, 1));
+            gpu.dispatch("up_bf16", shaders::BF16_MATVEC, &[
+                gpu::bind(0, input), gpu::bind(1, up_qw),
+                gpu::bind(2, up_out), gpu::bind(3, params_buf),
+            ], (n.div_ceil(32), 1, 1));
+            return;
+        }
         gpu.dispatch("gate_up_fused", shaders::FUSED_GATE_UP_GPTQ_4T, &[
             gpu::bind(0, input),
             gpu::bind(1, gate_qw), gpu::bind(2, gate_sc),
@@ -1668,6 +1680,16 @@ impl Model {
                 gpu.copy_buffer(&self.state.normed, &self.state.o_proj_out, h as u64 * 4);
             }
 
+            // Debug: dump after attention+residual for first few layers
+            if self.generated_tokens.is_empty() && i < 3 {
+                gpu.flush();
+                // residual + o_proj_out haven't been summed yet — read o_proj_out
+                let dbg = gpu.read_buffer(&self.state.o_proj_out, h as u64 * 4);
+                let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[gpu-decoder] L{i} o_proj: norm={norm:.4} first4={:?}", &dv[..4]);
+            }
+
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed);
 
@@ -1682,6 +1704,15 @@ impl Model {
                 &self.state.gate_out, &self.state.up_out,
                 &layer.down_proj_qweight, &layer.down_proj_scales,
                 &self.state.mlp_output, h, p_down);
+
+            // Debug: dump after ffn+residual for first few layers of first token
+            if self.generated_tokens.is_empty() && i < 3 {
+                gpu.flush();
+                let dbg = gpu.read_buffer(&self.state.mlp_output, h as u64 * 4);
+                let dv: &[f32] = bytemuck::cast_slice(&dbg);
+                let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[gpu-decoder] L{i} mlp_out: norm={norm:.4} first4={:?}", &dv[..4]);
+            }
         }
 
         // Final norm + LM head

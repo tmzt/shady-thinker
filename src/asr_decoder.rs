@@ -469,7 +469,7 @@ pub fn gpu_asr_decode_tokens(
         } else {
             model.forward_embed_argmax(gpu, chunk);
         }
-        if i < 5 {
+        if i < 3 || i == remain_seq - 1 {
             gpu.flush();
             let hid_bytes = gpu.read_buffer(&model.state.hidden, h as u64 * 4);
             let hv: &[f32] = bytemuck::cast_slice(&hid_bytes);
@@ -480,6 +480,20 @@ pub fn gpu_asr_decode_tokens(
         }
     }
     let mut token = *model.generated_tokens.last().unwrap_or(&0);
+
+    // Debug: check normed + logits at last prefill position
+    {
+        gpu.flush();
+        let normed_bytes = gpu.read_buffer(&model.state.normed, h as u64 * 4);
+        let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
+        let nn: f32 = nv.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let logits_bytes = gpu.read_buffer(&model.state.logits, model.config.vocab_size as u64 * 4);
+        let lv: &[f32] = bytemuck::cast_slice(&logits_bytes);
+        let (max_idx, max_val) = lv.iter().enumerate()
+            .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+        let nonzero = lv.iter().filter(|&&x| x.abs() > 1e-10).count();
+        log::info!("[asr-decode] last prefill: normed_norm={nn:.4} logits max={max_val:.4}@{max_idx} nonzero={nonzero} first_token={token}");
+    }
 
     let prefill_ms = t1.elapsed().as_millis();
     log::info!("[asr-decode] prefill: {} tokens in {}ms (prefix cached), first_token={}",
