@@ -975,9 +975,17 @@ impl Model {
     /// Dispatch LM head logits computation — handles bf16, GPTQ, and MLX INT4 tied embeddings.
     pub fn dispatch_lm_head(&self, gpu: &mut GpuContext) {
         let h = self.config.hidden_size;
+        log::debug!("[model] dispatch_lm_head: mlx_int4={} tied={} bf16={} has_scales={}",
+            self.mlx_int4_mode, self.tied_embeddings, self.weights.lm_head_is_bf16,
+            self.weights.embed_scales.is_some());
         if self.mlx_int4_mode && self.tied_embeddings {
             // MLX INT4 tied embeddings: use INT4_MATVEC_MLX with embed scales/biases
             if let (Some(ref scales), Some(ref biases)) = (&self.weights.embed_scales, &self.weights.embed_biases) {
+                gpu.flush();
+                let normed_bytes = gpu.read_buffer(&self.state.normed, h as u64 * 4);
+                let nv: &[f32] = bytemuck::cast_slice(&normed_bytes);
+                let nn: f32 = nv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[model] MLX INT4 lm_head: vocab={}, hidden={}, normed_norm={nn:.4}", self.config.vocab_size, h);
                 gpu.dispatch("lm_head_mlx", shaders::INT4_MATVEC_MLX, &[
                     gpu::bind(0, &self.state.normed),
                     gpu::bind(1, &self.weights.embed_tokens),
@@ -1803,9 +1811,14 @@ impl Model {
         // Greedy argmax
         let logits_bytes = gpu.read_buffer(&self.state.logits, self.config.vocab_size as u64 * 4);
         let logits: &[f32] = bytemuck::cast_slice(&logits_bytes);
-        let (max_idx, _) = logits.iter().enumerate()
+        let (max_idx, max_val) = logits.iter().enumerate()
             .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
         let token = max_idx as u32;
+        if self.generated_tokens.len() < 3 {
+            let norm: f32 = logits.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let nonzero = logits.iter().filter(|&&x| x.abs() > 1e-10).count();
+            log::info!("[model] logits: norm={norm:.4} max={max_val:.4}@{max_idx} nonzero={nonzero}/{}", logits.len());
+        }
         self.generated_tokens.push(token);
         token
     }

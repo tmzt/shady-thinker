@@ -319,10 +319,18 @@ impl AsrEncoder {
             bind(2, &out_buf), bind(3, &proj_params),
         ], (n_tokens, d_model.div_ceil(32), 1));
 
-        // Read back
+        // Debug: check intermediate values
         self.gpu.flush();
+        let c3_bytes = self.gpu.read_buffer(&c3_buf, (CONV_HIDDEN * h3 * w3) as u64 * 4);
+        let c3_vals: &[f32] = bytemuck::cast_slice(&c3_bytes);
+        let c3_norm: f32 = c3_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] conv3 output: norm={c3_norm:.2}, first4={:?}", &c3_vals[..4.min(c3_vals.len())]);
+
+        // Read back
         let bytes = self.gpu.read_buffer(&out_buf, out_size);
         let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let stem_norm: f32 = result.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] conv stem output: norm={stem_norm:.2}, {} tokens × {} d_model", n_tokens, d_model);
         (result, n_tokens)
     }
 
@@ -416,16 +424,39 @@ impl AsrEncoder {
 
             // 12. Residual: x = x + ffn_out
             dispatch_add(gpu, &x_cur, &ffn_out, &params_buf, seq_len * d);
+
+            if layer_idx == 0 {
+                gpu.flush();
+                let dbg = gpu.read_buffer(&x_cur, buf_size);
+                let dbg_vals: &[f32] = bytemuck::cast_slice(&dbg);
+                let dbg_norm: f32 = dbg_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
+                log::info!("[asr-encoder] after layer 0: norm={dbg_norm:.2}, first4={:?}", &dbg_vals[..4]);
+            }
         }
 
         // ── Output projection ──
         let num_layers = layers.len();
+
+        // Debug: check output before final projection
+        gpu.flush();
+        let dbg = gpu.read_buffer(&x_cur, buf_size);
+        let dbg_vals: &[f32] = bytemuck::cast_slice(&dbg);
+        let dbg_norm: f32 = dbg_vals.iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] after all layers: norm={dbg_norm:.2}");
 
         // 13. Final LayerNorm
         dispatch_layernorm(gpu, &x_cur, ln_post_w, ln_post_b, &x_norm, &params_buf, seq_len, d);
 
         // 14. proj1 + GELU
         dispatch_bf16_gemm(gpu, &x_norm, proj1_w, proj1_b, &ffn_mid, &params_buf, seq_len, d, d, true);
+
+        gpu.flush();
+        let ln_bytes = gpu.read_buffer(&x_norm, buf_size);
+        let ln_norm: f32 = bytemuck::cast_slice::<u8, f32>(&ln_bytes).iter().map(|x| x*x).sum::<f32>().sqrt();
+        let p1_bytes = gpu.read_buffer(&ffn_mid, buf_size);
+        let p1_norm: f32 = bytemuck::cast_slice::<u8, f32>(&p1_bytes).iter().map(|x| x*x).sum::<f32>().sqrt();
+        log::info!("[asr-encoder] ln_post norm={ln_norm:.2}, proj1 norm={p1_norm:.2}");
+
         dispatch_gelu(gpu, &ffn_mid, &ffn_act, &params_buf, seq_len * d);
 
         // 15. proj2
@@ -629,11 +660,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             sum += conv3[conv_idx] * proj_w[w_base + k];
         }}
     }}
-    // Sinusoidal PE: pe[t, d] = sin/cos(t / 10000^(2*floor(d/2)/d_model))
-    let half_d = d / 2u;
-    let freq = 1.0 / pow(10000.0, f32(half_d * 2u) / f32(p.d_model));
-    let angle = f32(t) * freq;
-    let pe = select(cos(angle), sin(angle), d % 2u == 0u);
+    // Sinusoidal PE (split layout): first half = sin, second half = cos
+    // Matches C reference: pe[t, d] = sin(t * inv_ts) for d < half, cos(t * inv_ts) for d >= half
+    let half = p.d_model / 2u;
+    let dim = select(d - half, d, d < half);  // dimension index within sin/cos half
+    let log_ts = log(10000.0) / f32(half - 1u);
+    let inv_ts = exp(-f32(dim) * log_ts);
+    let angle = f32(t) * inv_ts;
+    let pe = select(cos(angle), sin(angle), d < half);
     output[t * p.d_model + d] = sum + pe;
 }}", ch=CONV_HIDDEN)
 }
