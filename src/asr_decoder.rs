@@ -199,9 +199,18 @@ pub fn gpu_asr_decode(
 
     // ── Prefill: encoder output embeddings ──
     let t1 = std::time::Instant::now();
+    let is_mlx = model.mlx_int4_mode;
     for i in 0..enc_seq_len as usize {
         let embed = &encoder_output[i * hidden..(i + 1) * hidden];
-        model.forward_embed_argmax(gpu, embed);
+        let h = model.config.hidden_size;
+        gpu.write_buffer(&model.state.hidden, 0, bytemuck::cast_slice(embed));
+        gpu.flush();
+        gpu.copy_buffer(&model.state.hidden, &model.state.residual, h as u64 * 4);
+        if is_mlx {
+            model.forward_mlx_argmax(gpu);
+        } else {
+            model.forward_embed_argmax(gpu, embed);
+        }
     }
     let enc_ms = t1.elapsed().as_millis();
     log::info!("[asr-decode] encoder prefill: {} tokens in {}ms ({:.1}ms/tok)",
