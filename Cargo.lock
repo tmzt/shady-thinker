@@ -390,6 +390,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
+ "ui_common",
  "uuid",
 ]
 
@@ -2172,6 +2173,10 @@ dependencies = [
  "unicode-segmentation",
  "unicode_categories",
 ]
+
+[[package]]
+name = "ui_common"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-id-start"

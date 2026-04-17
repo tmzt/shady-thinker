@@ -65,10 +65,11 @@ impl AsrPipeline {
     pub fn forward(&mut self, mel_data: &[f32], mel_frames: u32) -> DecodeResult {
         let t0 = std::time::Instant::now();
 
-        // Conv stem (CPU) + encoder transformer (GPU) → hidden states
-        let encoder_output = self.encoder.encode_mel(mel_data, mel_frames);
-        let enc_seq_len = encoder_output.len() as u32 / self.model.config.hidden_size;
+        // Conv stem (GPU) + encoder transformer (GPU) → hidden states
+        let (encoder_output, enc_seq_len, conv_ms, transformer_ms) =
+            self.encoder.forward_mel(mel_data, mel_frames);
         let enc_ms = t0.elapsed().as_millis();
+        log::info!("[asr-pipeline] encoder: conv={conv_ms}ms transformer={transformer_ms}ms total={enc_ms}ms");
 
         // Decoder: hidden states → token IDs
         let t1 = std::time::Instant::now();
