@@ -414,13 +414,13 @@ pub fn gpu_asr_decode_tokens(
     model.seq_len = prefix_cache.prefix_len;
     model.generated_tokens.clear();
 
-    // Build remaining embeddings: audio + suffix only (prefix is cached)
-    let suffix: Vec<u32> = SUFFIX_BASE.iter().chain(&[TOKEN_ASR_TEXT]).copied().collect();
-    let remain_seq = enc_seq_len as usize + suffix.len();
+    // Build remaining embeddings: audio + suffix_base only (prefix is cached)
+    // TOKEN_ASR_TEXT is NOT prefilled — model generates it naturally (matches C reference)
+    let remain_seq = enc_seq_len as usize + SUFFIX_BASE.len();
 
     let mut input_embeds = Vec::with_capacity(remain_seq * hidden);
     input_embeds.extend_from_slice(encoder_output);
-    for &tok in &suffix {
+    for &tok in SUFFIX_BASE {
         if model.mlx_int4_mode {
             if let (Some(ref sc), Some(ref bi)) = (&prefix_cache.embed_scales, &prefix_cache.embed_biases) {
                 #[repr(C)]
@@ -504,6 +504,9 @@ pub fn gpu_asr_decode_tokens(
     let prefill_ms = t1.elapsed().as_millis();
     log::info!("[asr-decode] prefill: {} tokens in {}ms (prefix cached), first_token={}",
         remain_seq, prefill_ms, token);
+
+    // Don't force TOKEN_ASR_TEXT — let the model generate it naturally (matches C reference)
+    // The prefill ended at suffix_base's last token; model should predict ASR_TEXT next.
 
     // Autoregressive decode
     let t2 = std::time::Instant::now();
