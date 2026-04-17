@@ -173,6 +173,7 @@ pub struct InferenceState {
     pub p_bf16_o:     wgpu::Buffer,  // hidden=nh*hd, vocab=h
     pub p_bf16_gu:    wgpu::Buffer,  // hidden=h, vocab=inter
     pub p_bf16_lm:    wgpu::Buffer,  // hidden=h, vocab=vocab_size
+    pub p_bf16_down:  wgpu::Buffer,  // hidden=inter, vocab=h (for down_proj in bf16 mode)
     pub p_bf16_silu:  wgpu::Buffer,  // {n: inter} for SILU_MUL in bf16 fused path
     // Other static params:
     pub p_norm:       wgpu::Buffer,  // {n: hidden, eps} for rmsnorm/add_rmsnorm
@@ -529,6 +530,11 @@ impl Model {
                 let vocab = config.vocab_size;
                 let buf = gpu.create_buffer("p_bf16_lm", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
                 gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, vocab, 0u32, 0u32]));
+                buf
+            },
+            p_bf16_down: {
+                let buf = gpu.create_buffer("p_bf16_down", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[inter, h, 0u32, 0u32]));
                 buf
             },
             p_bf16_silu: {
@@ -1362,7 +1368,7 @@ impl Model {
 
             // ── MLP ── (fused gate+up dispatch, then fused SiLU+down)
             let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
-            let p_down = if self.bf16_mode { &self.state.p_bf16_o } else { &self.state.p_gptq_down };
+            let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
             self.fused_gate_up_gptq(gpu,
                 &self.state.normed,
                 &layer.gate_proj_qweight, &layer.gate_proj_scales,
@@ -1692,7 +1698,7 @@ impl Model {
             }
 
             let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
-            let p_down = if self.bf16_mode { &self.state.p_bf16_o } else { &self.state.p_gptq_down };
+            let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
             self.fused_gate_up_gptq(gpu,
                 &self.state.normed,
                 &layer.gate_proj_qweight, &layer.gate_proj_scales,
