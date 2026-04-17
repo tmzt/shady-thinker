@@ -972,6 +972,35 @@ impl Model {
         ], (self.config.vocab_size.div_ceil(32), 1, 1));
     }
 
+    /// Dispatch LM head logits computation — handles bf16, GPTQ, and MLX INT4 tied embeddings.
+    pub fn dispatch_lm_head(&self, gpu: &mut GpuContext) {
+        let h = self.config.hidden_size;
+        if self.mlx_int4_mode && self.tied_embeddings {
+            // MLX INT4 tied embeddings: use INT4_MATVEC_MLX with embed scales/biases
+            if let (Some(ref scales), Some(ref biases)) = (&self.weights.embed_scales, &self.weights.embed_biases) {
+                gpu.dispatch("lm_head_mlx", shaders::INT4_MATVEC_MLX, &[
+                    gpu::bind(0, &self.state.normed),
+                    gpu::bind(1, &self.weights.embed_tokens),
+                    gpu::bind(2, scales),
+                    gpu::bind(3, biases),
+                    gpu::bind(4, &self.state.logits),
+                    gpu::bind(5, &self.state.p_gptq_lm),
+                ], (self.config.vocab_size.div_ceil(32), 1, 1));
+            } else {
+                log::error!("[model] mlx_int4 tied_embeddings but no embed_scales/biases!");
+                self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+            }
+        } else if self.tied_embeddings {
+            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
+        } else if self.weights.lm_head_is_bf16 {
+            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
+        } else {
+            self.gptq_matvec(gpu, "lm_head",
+                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
+                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
+        }
+    }
+
     fn argmax(&self, gpu: &mut GpuContext) {
         gpu.dispatch("argmax", shaders::ARGMAX, &[
             gpu::bind(0, &self.state.logits),
@@ -1183,21 +1212,6 @@ impl Model {
         self.prefill_kv_only = false;
     }
 
-    /// Dispatch lm_head onto the current state.normed hidden state → writes logits.
-    /// Must be called after forward_kv_only() + flush_and_wait() for the last token.
-    /// Caller must then call sample_first_decode_token() to sample from the logits.
-    pub fn dispatch_lm_head(&mut self, gpu: &mut GpuContext) {
-        let h = self.config.hidden_size;
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
-    }
 
     /// Forward pass with raw f32 embedding instead of token ID lookup.
     /// Used for ASR decoder where encoder output embeddings are injected directly.
@@ -1369,15 +1383,7 @@ impl Model {
         log::info!("[forward] seq={} layers done, dispatching lm_head", self.seq_len);
 
         // LM head
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
+        self.dispatch_lm_head(gpu);
 
         #[cfg(feature = "jit-lora")]
         if self.training_mode {
@@ -1675,15 +1681,7 @@ impl Model {
         self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
             &self.weights.final_norm, &self.state.normed);
 
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
+        self.dispatch_lm_head(gpu);
 
         self.seq_len += 1;
 
@@ -1797,16 +1795,8 @@ impl Model {
         self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
             &self.weights.final_norm, &self.state.normed);
 
-        // LM head (bf16 — not quantized in MLX model)
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
+        // LM head
+        self.dispatch_lm_head(gpu);
 
         self.seq_len += 1;
 
@@ -2086,15 +2076,7 @@ impl Model {
         }
 
         // LM head
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
+        self.dispatch_lm_head(gpu);
 
         self.seq_len = seq_len;
 
@@ -2457,15 +2439,7 @@ impl Model {
         }
 
         // ── LM head ──
-        if self.tied_embeddings {
-            self.bf16_lm_head(gpu, &self.weights.embed_tokens, h);
-        } else if self.weights.lm_head_is_bf16 {
-            self.bf16_lm_head(gpu, &self.weights.lm_head_qweight, h);
-        } else {
-            self.gptq_matvec(gpu, "lm_head",
-                &self.state.normed, &self.weights.lm_head_qweight, &self.weights.lm_head_scales,
-                &self.state.logits, self.config.vocab_size, &self.state.p_gptq_lm);
-        }
+        self.dispatch_lm_head(gpu);
 
         self.seq_len = seq_len;
         log::info!("[prefill_gptq] done, seq_len={}", seq_len);

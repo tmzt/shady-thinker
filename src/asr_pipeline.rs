@@ -27,9 +27,8 @@ pub enum DecodeResult {
 
 /// Fused ASR pipeline owning all GPU resources.
 pub struct AsrPipeline {
-    gpu: GpuContext,      // encoder GPU context
-    dec_gpu: GpuContext,  // decoder GPU context (owns model's buffers)
-    encoder: AsrEncoder,
+    gpu: GpuContext,       // shared context for decoder + prefix cache
+    encoder: AsrEncoder,   // owns its own GpuContext (same device, separate shader caches)
     model: Model,
     prefix_cache: Option<PrefixCache>,
 }
@@ -41,12 +40,15 @@ impl AsrPipeline {
         let encoder = AsrEncoder::load(GpuContext::from_device_queue(
             gpu.device.clone(), gpu.queue.clone(),
         ), model_dir);
-        let (dec_gpu, model) = asr_decoder::load_bf16_model(model_dir, 256);
 
-        // Precompute prefix cache for fast decode
+        // Decoder model loaded on the same GPU device
+        let dec_gpu = GpuContext::from_device_queue(gpu.device.clone(), gpu.queue.clone());
+        let mut model = asr_decoder::load_model_on_gpu(&dec_gpu, model_dir, 256);
+
+        // Precompute prefix cache — must use dec_gpu so buffers live on the right device
+        let mut dec_gpu = dec_gpu;
         let prefix_cache = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (mut gpu_tmp, mut model_tmp) = asr_decoder::load_bf16_model(model_dir, 256);
-            asr_decoder::precompute_prefix_cache(&mut gpu_tmp, &mut model_tmp, model_dir)
+            asr_decoder::precompute_prefix_cache(&mut dec_gpu, &mut model, model_dir)
         })).ok();
 
         if prefix_cache.is_some() {
@@ -55,7 +57,8 @@ impl AsrPipeline {
             log::warn!("[asr-pipeline] prefix cache failed, using slow path");
         }
 
-        Self { gpu, dec_gpu, encoder, model, prefix_cache }
+        // Merge dec_gpu into gpu — they share the same device, keep dec_gpu's shader caches
+        Self { gpu: dec_gpu, encoder, model, prefix_cache }
     }
 
     /// Run the full pipeline: mel spectrogram → encoder → decoder → token IDs.
@@ -75,13 +78,13 @@ impl AsrPipeline {
         let t1 = std::time::Instant::now();
         let token_ids = if let Some(ref cache) = self.prefix_cache {
             asr_decoder::gpu_asr_decode_tokens(
-                &mut self.dec_gpu, &mut self.model, cache,
+                &mut self.gpu, &mut self.model, cache,
                 &encoder_output, enc_seq_len,
             )
         } else {
             // Slow path without prefix cache
             let text = asr_decoder::gpu_asr_decode(
-                &mut self.dec_gpu, &mut self.model,
+                &mut self.gpu, &mut self.model,
                 &encoder_output, enc_seq_len,
             );
             // Can't get token_ids from string path — return as single-token placeholder

@@ -181,6 +181,11 @@ pub struct ModelWeights {
     /// MLX INT4 biases per layer: [q, k, v, o, gate, up, down]
     /// Empty for GPTQ/bf16 modes.
     pub mlx_biases: Vec<[wgpu::Buffer; 7]>,
+    /// Embedding scales/biases for tied lm_head in MLX INT4 mode.
+    /// When tied_embeddings=true and mlx_int4_mode=true, logits use these
+    /// with INT4_MATVEC_MLX instead of bf16_lm_head.
+    pub embed_scales: Option<wgpu::Buffer>,
+    pub embed_biases: Option<wgpu::Buffer>,
 }
 
 /// Model configuration parsed from config.json
@@ -695,7 +700,7 @@ pub fn load_weights(
             layers,
             embed_chunks,
             embed_chunk_size,
-            mlx_biases: Vec::new(),
+            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
         },
         RawNormWeights {
             layers: norm_weights,
@@ -843,7 +848,7 @@ pub fn load_weights_bf16(
             layers,
             embed_chunks,
             embed_chunk_size,
-            mlx_biases: Vec::new(),
+            mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
         },
         RawNormWeights {
             layers: norm_weights,
@@ -921,7 +926,7 @@ pub fn load_weights_int4(
         embed_tokens:emb, final_norm:fnrm, lm_head_qweight:lmh, lm_head_scales:ds,
         lm_head_is_bf16:true, self_attn_layers:(0..config.num_hidden_layers as usize).collect(),
         layers:ly, embed_chunks:ech, embed_chunk_size:ecs,
-        mlx_biases: Vec::new(),
+        mlx_biases: Vec::new(), embed_scales: None, embed_biases: None,
     }, RawNormWeights { layers: nw })
 }
 
@@ -940,7 +945,14 @@ pub fn load_weights_mlx_int4(
         .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
     let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
 
-    let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let get = |n: &str| -> &[u8] {
+        for s in &st { if let Ok(t) = s.tensor(n) { return t.data(); } }
+        // Tied embeddings: lm_head.weight == model.embed_tokens.weight
+        if n == "lm_head.weight" {
+            for s in &st { if let Ok(t) = s.tensor("model.embed_tokens.weight") { return t.data(); } }
+        }
+        panic!("[mlx-int4] tensor not found: {n}");
+    };
     let up = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
 
     // Embedding — quantized in MLX format, needs chunking for 128MB binding
@@ -1016,5 +1028,6 @@ pub fn load_weights_mlx_int4(
         self_attn_layers: (0..config.num_hidden_layers as usize).collect(),
         layers, embed_chunks: Vec::new(), embed_chunk_size: 0,
         mlx_biases: biases,
+        embed_scales: Some(embed_sc), embed_biases: Some(embed_bi),
     }, RawNormWeights { layers: nw })
 }

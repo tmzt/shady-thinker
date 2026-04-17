@@ -12,10 +12,10 @@ use crate::weights::{ModelConfig, QuantConfig};
 const INT4_EMBEDDING_MLX_SRC: &str = include_str!("shaders/int4_embedding_mlx.wgsl");
 
 /// Load a bf16 ASR decoder model ready for inference.
-/// Handles the nested ASR config (thinker_config.text_config).
-/// Returns (GpuContext, Model) with bf16_mode enabled.
-pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model) {
-    log::info!("[asr-decoder] loading bf16 model from {:?}", model_dir);
+/// Load ASR decoder model onto an existing GPU context.
+/// Handles nested ASR config and bf16/MLX-INT4/INT4-runtime formats.
+pub fn load_model_on_gpu(gpu: &GpuContext, model_dir: &Path, max_seq_len: u32) -> Model {
+    log::info!("[asr-decoder] loading model from {:?}", model_dir);
 
     // Parse config — handle ASR nesting
     let raw: serde_json::Value = serde_json::from_str(
@@ -32,8 +32,6 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
         &raw
     };
     let mut config: ModelConfig = serde_json::from_value(text_cfg.clone()).expect("parse ModelConfig");
-    // ASR decoder uses full rotary encoding (partial_rotary_factor=1.0)
-    // The default 0.25 is for Qwen3.5, not ASR
     if config.partial_rotary_factor < 1.0 && !text_cfg.get("partial_rotary_factor").is_some() {
         config.partial_rotary_factor = 1.0;
     }
@@ -42,34 +40,29 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
         config.num_attention_heads, config.num_key_value_heads, config.vocab_size,
         config.rope_theta, config.head_dim, config.partial_rotary_factor);
 
-    let gpu = GpuContext::new();
-
-    // Detect model format:
-    // - MLX INT4: has model.layers.N.*.biases tensors (pre-quantized, calibrated)
-    // - bf16: has thinker.model.layers.N.* tensors (original HF format)
-    let is_mlx = model_dir.join("config.json").exists() && {
+    let is_mlx = {
         let cfg_text = std::fs::read_to_string(model_dir.join("config.json")).unwrap_or_default();
         cfg_text.contains("\"quant_method\"") || cfg_text.contains("\"quantization_config\"")
     };
     let use_int4_runtime = std::env::var("USE_INT4").map(|v| v == "1").unwrap_or(false);
 
     let (weights, raw_norms, quant_config, mode) = if is_mlx {
-        let (w, n) = crate::weights::load_weights_mlx_int4(&gpu, model_dir, &config);
+        let (w, n) = crate::weights::load_weights_mlx_int4(gpu, model_dir, &config);
         let qc = QuantConfig { bits: 4, group_size: 64, quant_method: "mlx".to_string(), sym: false };
         (w, n, qc, "mlx-int4")
     } else if use_int4_runtime {
-        let (w, n) = crate::weights::load_weights_int4(&gpu, model_dir, &config, 128);
+        let (w, n) = crate::weights::load_weights_int4(gpu, model_dir, &config, 128);
         let qc = QuantConfig { bits: 4, group_size: 128, quant_method: "gptq".to_string(), sym: true };
         (w, n, qc, "int4-runtime")
     } else {
-        let (w, n) = crate::weights::load_weights_bf16(&gpu, model_dir, &config);
+        let (w, n) = crate::weights::load_weights_bf16(gpu, model_dir, &config);
         let qc = QuantConfig { bits: 16, group_size: 1, quant_method: "bf16".to_string(), sym: false };
         (w, n, qc, "bf16")
     };
 
     let chunked = !weights.embed_chunks.is_empty();
     let has_mlx_biases = !weights.mlx_biases.is_empty();
-    let mut model = Model::new(&gpu, config.clone(), quant_config, weights, max_seq_len);
+    let mut model = Model::new(gpu, config.clone(), quant_config, weights, max_seq_len);
     if mode == "bf16" {
         model.bf16_mode = true;
     }
@@ -79,16 +72,23 @@ pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model
     model.q_gated = false;
     model.norm_direct = true;
     model.rebuild_qknorm_shader();
-    model.rebuild_static_params(&gpu);
+    model.rebuild_static_params(gpu);
     log::info!("[asr-decoder] mode={}, chunked_embed={}", mode, chunked);
 
     for (i, norm) in raw_norms.layers.iter().enumerate() {
         if let Some((q, k)) = norm {
-            model.init_qknorm_params(&gpu, i, q, k);
+            model.init_qknorm_params(gpu, i, q, k);
         }
     }
 
     log::info!("[asr-decoder] model ready");
+    model
+}
+
+/// Convenience: create a new GPU context and load the model onto it.
+pub fn load_bf16_model(model_dir: &Path, max_seq_len: u32) -> (GpuContext, Model) {
+    let gpu = GpuContext::new();
+    let model = load_model_on_gpu(&gpu, model_dir, max_seq_len);
     (gpu, model)
 }
 
