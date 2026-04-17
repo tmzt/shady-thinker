@@ -1727,6 +1727,10 @@ impl Model {
         let nkv = self.config.num_key_value_heads;
         let hd = self.config.head_dim;
 
+        // Write current seq_len to p_attn so attention knows how many KV positions to scan
+        let seq_len_val = self.seq_len + 1;
+        gpu.write_buffer(&self.state.p_attn, 0, &seq_len_val.to_le_bytes());
+
         // MLX INT4 uses named params buffers (same byte layout as GPTQ {k, n, gs})
         for i in 0..self.config.num_hidden_layers as usize {
             let layer = &self.weights.layers[i];
@@ -1811,7 +1815,15 @@ impl Model {
                     let dv: &[f32] = bytemuck::cast_slice(&dbg);
                     let norm: f32 = dv.iter().map(|x| x*x).sum::<f32>().sqrt();
                     let has_nan = dv.iter().any(|x| x.is_nan());
-                    log::info!("[model] L0 after attention: norm={norm:.4} nan={has_nan}");
+                    let has_inf = dv.iter().any(|x| x.is_infinite());
+                    let first_nan = dv.iter().position(|x| x.is_nan());
+                    log::info!("[model] L0 after attention: norm={norm:.4} nan={has_nan} inf={has_inf} first_nan={first_nan:?} first4={:?}", &dv[..4.min(dv.len())]);
+                    // Also check q_proj (post-norm, post-RoPE)
+                    let qdbg = gpu.read_buffer(&self.state.q_proj, (nh * hd) as u64 * 4);
+                    let qv: &[f32] = bytemuck::cast_slice(&qdbg);
+                    let qnorm: f32 = qv.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    let qnan = qv.iter().any(|x| x.is_nan());
+                    log::info!("[model] L0 q_proj (normed+RoPE): norm={qnorm:.4} nan={qnan}");
                 }
 
                 // O projection
