@@ -71,6 +71,10 @@ pub fn load_model_on_gpu(gpu: &GpuContext, model_dir: &Path, max_seq_len: u32) -
     }
     model.q_gated = false;
     model.norm_direct = true;
+    // ASR decoder uses NeoX split-half RoPE (not interleaved) regardless of config
+    if let Some(ref mut rp) = model.config.rope_parameters {
+        rp.mrope_interleaved = false;
+    }
     model.rebuild_qknorm_shader();
     model.rebuild_static_params(gpu);
     log::info!("[asr-decoder] mode={}, chunked_embed={}", mode, chunked);

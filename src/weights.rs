@@ -224,8 +224,8 @@ pub struct ModelConfig {
     pub linear_value_head_dim: u32,
     #[serde(default = "default_linear_num_value_heads")]
     pub linear_num_value_heads: u32,
-    // mRoPE config (from rope_parameters in config.json)
-    #[serde(default)]
+    // mRoPE config (rope_scaling or rope_parameters in config.json)
+    #[serde(default, alias = "rope_scaling")]
     pub rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_partial_rotary_factor")]
     pub partial_rotary_factor: f32,
