@@ -33,6 +33,14 @@ impl Default for OmniTokens {
 }
 
 /// Unified session holding both the text decoder and audio encoder.
+///
+/// Design: audio tower and text decoder share the same GPU device and
+/// wgpu::Queue. Audio tower output buffers live on the same device, so
+/// `forward_embed_kv_only` reads them directly (zero-copy).
+///
+/// For multi-device: split at the boundary between audio tower output
+/// and decoder embedding injection — copy `[seq_len, 3584]` f32 buffer
+/// between devices once per utterance (~few MB, negligible).
 pub struct Omni25Session {
     /// Text decoder (standard InferenceSession, handles generate_tokens etc.)
     pub session: InferenceSession,

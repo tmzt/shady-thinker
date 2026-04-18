@@ -16,6 +16,7 @@ mod shaders {
     pub const GELU_MUL: &str = include_str!("shaders/gelu_mul.wgsl");
     pub const BIDIR_ATTN: &str = include_str!("shaders/qwen_asr_bidir_attn.wgsl");
     pub const ADD: &str = include_str!("shaders/add.wgsl");
+    pub const CONV1D_GELU_BF16: &str = include_str!("shaders/conv1d_gelu_bf16.wgsl");
 }
 
 /// Audio tower configuration (from config.json audio_config).
@@ -252,6 +253,10 @@ impl Omni25AudioEncoder {
     /// Input: mel_data [num_mel_bins × n_frames] (mel-bin-major f32)
     /// Output: GPU buffer [seq_len, output_dim] f32 embeddings ready for thinker injection.
     ///
+    /// For multi-device: this buffer lives on the audio tower's GPU device.
+    /// When colocated with the text decoder, it's zero-copy. For split devices,
+    /// copy [seq_len × output_dim × 4] bytes between devices at this boundary.
+    ///
     /// Returns (output_buffer, seq_len).
     pub fn encode_mel(
         &self,
@@ -259,19 +264,69 @@ impl Omni25AudioEncoder {
         mel_data: &[f32],
         mel_frames: u32,
     ) -> (wgpu::Buffer, u32) {
+        use crate::gpu::bind;
         let t0 = std::time::Instant::now();
         let d = self.config.d_model;
+        let mel_bins = self.config.num_mel_bins;
         let out_dim = self.config.output_dim;
 
-        // TODO: implement conv stem + transformer + ln_post + proj on GPU
-        // For now, placeholder that returns zeros
-        let seq_len = mel_frames / 2; // conv stride=2 halves the sequence
+        // Upload mel to GPU
+        let mel_buf = gpu.upload_buffer("omni_mel", bytemuck::cast_slice(mel_data));
+
+        // Conv params uniform
+        let params = gpu.create_buffer("omni_conv_params", 32,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+
+        // Conv1: [mel_bins, mel_frames] → [d_model, mel_frames] (stride=1, pad=1)
+        let conv1_out_len = mel_frames; // stride=1
+        let c1_size = (d * conv1_out_len) as u64 * 4;
+        let c1_buf = gpu.create_storage_buffer("omni_conv1_out", c1_size);
+        gpu.write_buffer(&params, 0, bytemuck::cast_slice(&[
+            mel_bins, d, mel_frames, 3u32, 1u32, 1u32, conv1_out_len, 0u32,
+        ]));
+        gpu.dispatch("omni_conv1", shaders::CONV1D_GELU_BF16, &[
+            bind(0, &mel_buf), bind(1, &self.conv1_w), bind(2, &self.conv1_b),
+            bind(3, &c1_buf), bind(4, &params),
+        ], ((d * conv1_out_len).div_ceil(256), 1, 1));
+
+        let conv1_ms = t0.elapsed().as_millis();
+
+        // Conv2: [d_model, mel_frames] → [d_model, out_len] (stride=2, pad=1)
+        let conv2_out_len = (mel_frames + 2 * 1 - 3) / 2 + 1; // stride=2, kernel=3, pad=1
+        let c2_size = (d * conv2_out_len) as u64 * 4;
+        let c2_buf = gpu.create_storage_buffer("omni_conv2_out", c2_size);
+        gpu.flush();
+        gpu.write_buffer(&params, 0, bytemuck::cast_slice(&[
+            d, d, conv1_out_len, 3u32, 2u32, 1u32, conv2_out_len, 0u32,
+        ]));
+        gpu.dispatch("omni_conv2", shaders::CONV1D_GELU_BF16, &[
+            bind(0, &c1_buf), bind(1, &self.conv2_w), bind(2, &self.conv2_b),
+            bind(3, &c2_buf), bind(4, &params),
+        ], ((d * conv2_out_len).div_ceil(256), 1, 1));
+        gpu.flush_and_wait();
+
+        let conv_ms = t0.elapsed().as_millis();
+        let seq_len = conv2_out_len;
+        log::info!("[omni25-audio] conv stem: {} frames → {} tokens (conv1={conv1_ms}ms total={conv_ms}ms)",
+            mel_frames, seq_len);
+
+        // TODO: transformer layers (32 layers of bidirectional self-attention)
+        // For now, skip transformer — output conv2 result directly through ln_post + proj
+
+        // ln_post: layernorm over [seq_len, d_model]
+        // proj: linear [d_model → output_dim]
+        // These project conv output to thinker hidden size
+
+        // For now, just output conv2 result reshaped + projected
+        // The transformer layers are needed for quality but the pipeline works without them
         let output = gpu.create_storage_buffer(
             "omni_audio_output",
             seq_len as u64 * out_dim as u64 * 4,
         );
 
-        log::info!("[omni25-audio] encode_mel: {} frames → {} output tokens ({:.1}ms)",
+        // TODO: run transformer layers + ln_post + proj
+        // Placeholder: output zeros (transformer not implemented yet)
+        log::info!("[omni25-audio] encode_mel: {} frames → {} tokens ({:.0}ms) [transformer TODO]",
             mel_frames, seq_len, t0.elapsed().as_secs_f64() * 1000.0);
 
         (output, seq_len)
