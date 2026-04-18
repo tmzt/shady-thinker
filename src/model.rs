@@ -488,7 +488,7 @@ impl Model {
             argmax_result: gpu.create_storage_buffer("argmax_result", 8), // {idx: u32, val: f32}
             p_gptq_q: {
                 let gs = quant_config.group_size;
-                let q_dim = nh * hd * 2; // safe default; updated in rebuild_qknorm_shader if needed
+                let q_dim = if config.attn_output_gate { nh * hd * 2 } else { nh * hd };
                 let buf = gpu.create_buffer("p_gptq_q", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
                 gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, q_dim, gs, 0u32]));
                 buf
@@ -526,7 +526,7 @@ impl Model {
                 buf
             },
             p_bf16_q: {
-                let q_dim = nh * hd * 2;
+                let q_dim = if config.attn_output_gate { nh * hd * 2 } else { nh * hd };
                 let buf = gpu.create_buffer("p_bf16_q", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
                 gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, q_dim, 0u32, 0u32]));
                 buf
