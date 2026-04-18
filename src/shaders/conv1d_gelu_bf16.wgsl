@@ -14,14 +14,18 @@
 @group(0) @binding(1) var<storage, read> weight: array<u32>;  // bf16 packed
 @group(0) @binding(2) var<storage, read> bias: array<u32>;    // bf16 packed
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> params: array<u32, 8>;
+struct ConvParams {
+    c_in: u32, c_out: u32, seq_len: u32, kernel_size: u32,
+    stride: u32, pad: u32, out_len: u32, _pad: u32,
+}
+@group(0) @binding(4) var<uniform> params: ConvParams;
 
 fn bf16_to_f32(bits: u32) -> f32 {
     return bitcast<f32>(bits << 16u);
 }
 
 fn unpack_bf16(packed: u32, idx: u32) -> f32 {
-    let half = select(packed & 0xFFFFu, packed >> 16u, idx & 1u == 1u);
+    let half = select(packed & 0xFFFFu, packed >> 16u, (idx & 1u) == 1u);
     return bf16_to_f32(half);
 }
 
@@ -33,13 +37,13 @@ fn gelu(x: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c_in     = params[0];
-    let c_out    = params[1];
-    let seq_len  = params[2];
-    let kernel_sz = params[3];
-    let stride   = params[4];
-    let pad      = params[5];
-    let out_len  = params[6];
+    let c_in     = params.c_in;
+    let c_out    = params.c_out;
+    let seq_len  = params.seq_len;
+    let kernel_sz = params.kernel_size;
+    let stride   = params.stride;
+    let pad      = params.pad;
+    let out_len  = params.out_len;
 
     let idx = gid.x;
     if idx >= c_out * out_len { return; }
