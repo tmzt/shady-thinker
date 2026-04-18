@@ -15,6 +15,7 @@ pub mod model;
 pub mod nomic;
 #[cfg(feature = "jit-lora")]
 pub mod train;
+pub mod omni25_audio;
 pub mod weights;
 pub mod wordpiece;
 #[cfg(feature = "chat")]
