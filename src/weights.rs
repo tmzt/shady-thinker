@@ -241,6 +241,12 @@ pub struct ModelConfig {
     /// Qwen2.5-Omni: thinker config wraps text_config
     #[serde(default)]
     pub thinker_config: Option<Box<ModelConfig>>,
+    /// mRoPE section 1 limit in pairs (computed from rope_parameters.mrope_section)
+    #[serde(default)]
+    pub mrope_s1_limit: u32,
+    /// mRoPE section 2 limit in pairs
+    #[serde(default)]
+    pub mrope_s2_limit: u32,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -306,12 +312,18 @@ impl ModelConfig {
             if let Some(theta) = rp.rope_theta {
                 config.rope_theta = theta;
             }
-            // Compute partial_rotary_factor from mrope_section sum
+            // Compute partial_rotary_factor and section limits from mrope_section
             if !rp.mrope_section.is_empty() && config.head_dim > 0 {
                 let rotary_dims: u32 = rp.mrope_section.iter().sum();
                 config.partial_rotary_factor = rotary_dims as f32 / config.head_dim as f32;
-                log::info!("[config] mrope_section={:?} → partial_rotary_factor={}",
-                    rp.mrope_section, config.partial_rotary_factor);
+                // Section limits in pairs (dim/2) for the RoPE shader
+                if rp.mrope_section.len() >= 2 {
+                    config.mrope_s1_limit = rp.mrope_section[0] / 2;
+                    config.mrope_s2_limit = (rp.mrope_section[0] + rp.mrope_section[1]) / 2;
+                }
+                log::info!("[config] mrope_section={:?} → partial_rotary_factor={}, s1={}, s2={}",
+                    rp.mrope_section, config.partial_rotary_factor,
+                    config.mrope_s1_limit, config.mrope_s2_limit);
             }
         }
         config

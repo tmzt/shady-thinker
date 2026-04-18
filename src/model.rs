@@ -74,7 +74,9 @@ fn build_qknorm_shader_gated(config: &ModelConfig, q_gated: bool) -> String {
 fn build_qknorm_shader_full(config: &ModelConfig, q_gated: bool, norm_offset: f32) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
     let interleaved = config.mrope_interleaved();
-    let s_limit = partial_dim / 2;
+    // Use explicit mrope_section limits if available, else fallback to partial_dim/2
+    let s1_limit = if config.mrope_s1_limit > 0 { config.mrope_s1_limit } else { partial_dim / 2 };
+    let s2_limit = if config.mrope_s2_limit > 0 { config.mrope_s2_limit } else { partial_dim / 2 };
     format!(
         "const ROPE_THETA: f32 = {:.1};\n\
          const MROPE_S1_LIMIT: u32 = {}u;\n\
@@ -84,8 +86,8 @@ fn build_qknorm_shader_full(config: &ModelConfig, q_gated: bool, norm_offset: f3
          const Q_GATED: bool = {};\n\
          const NORM_OFFSET: f32 = {:.1};\n\n{}",
         config.rope_theta,
-        s_limit,
-        s_limit,
+        s1_limit,
+        s2_limit,
         partial_dim,
         interleaved,
         q_gated,
@@ -137,7 +139,8 @@ fn build_batched_qknorm_shader(config: &ModelConfig) -> String {
 fn build_batched_qknorm_shader_gated(config: &ModelConfig) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
     let interleaved = config.mrope_interleaved();
-    let s_limit = partial_dim / 2;
+    let s1_limit = if config.mrope_s1_limit > 0 { config.mrope_s1_limit } else { partial_dim / 2 };
+    let s2_limit = if config.mrope_s2_limit > 0 { config.mrope_s2_limit } else { partial_dim / 2 };
     format!(
         "const ROPE_THETA: f32 = {:.1};\n\
          const MROPE_S1_LIMIT: u32 = {}u;\n\
@@ -146,8 +149,8 @@ fn build_batched_qknorm_shader_gated(config: &ModelConfig) -> String {
          const MROPE_INTERLEAVED: bool = {};\n\
          const NORM_OFFSET: f32 = {:.1};\n\n{}",
         config.rope_theta,
-        s_limit,
-        s_limit,
+        s1_limit,
+        s2_limit,
         partial_dim,
         interleaved,
         1.0f32, // Qwen3.5 always uses (1 + w) norm scaling
