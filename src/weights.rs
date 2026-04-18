@@ -255,7 +255,7 @@ pub struct RopeParameters {
 
 fn default_head_dim() -> u32 { 128 }
 fn default_rms_norm_eps() -> f32 { 1e-6 }
-fn default_partial_rotary_factor() -> f32 { 0.25 }
+fn default_partial_rotary_factor() -> f32 { 1.0 } // default full RoPE; Qwen3.5=0.25, Qwen2.5-Omni computed from mrope_section
 fn default_linear_num_key_heads() -> u32 { 16 }
 fn default_linear_key_dim() -> u32 { 128 }
 fn default_linear_value_dim() -> u32 { 128 }
@@ -301,10 +301,17 @@ impl ModelConfig {
                 }
             }
         }
-        // Resolve rope_theta from rope_parameters if present
+        // Resolve rope_theta and partial_rotary_factor from rope_parameters if present
         if let Some(ref rp) = config.rope_parameters {
             if let Some(theta) = rp.rope_theta {
                 config.rope_theta = theta;
+            }
+            // Compute partial_rotary_factor from mrope_section sum
+            if !rp.mrope_section.is_empty() && config.head_dim > 0 {
+                let rotary_dims: u32 = rp.mrope_section.iter().sum();
+                config.partial_rotary_factor = rotary_dims as f32 / config.head_dim as f32;
+                log::info!("[config] mrope_section={:?} → partial_rotary_factor={}",
+                    rp.mrope_section, config.partial_rotary_factor);
             }
         }
         config
