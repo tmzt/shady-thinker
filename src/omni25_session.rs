@@ -124,27 +124,67 @@ impl Omni25Session {
             mel_frames, audio_seq_len, t0.elapsed().as_secs_f64() * 1000.0);
 
         // 2. Restore prefix snapshot (system prompt KV cache)
-        //    This sets seq_len back to prefix_len
-        // self.session.restore_prefix_snapshot() is private, but generate_inner handles it
-
-        // 3. Build the input sequence:
-        //    [audio_bos] + [AUDIO]*N + [audio_eos] + suffix_ids
-        //    The AUDIO placeholder tokens will have their embeddings replaced
-        let mut input_ids = Vec::with_capacity(2 + audio_seq_len as usize + suffix_ids.len());
-        input_ids.push(self.tokens.audio_bos);
-        for _ in 0..audio_seq_len {
-            input_ids.push(self.tokens.audio_placeholder);
+        self.session.model.seq_len = self.session.prefix_len;
+        self.session.model.generated_tokens.clear();
+        if let Some(ref snap) = self.session.prefix_snapshot {
+            // Restore KV cache from snapshot
+            for (li, (k, v)) in snap.kv.iter().enumerate() {
+                if !k.is_empty() {
+                    self.session.gpu.write_buffer(&self.session.model.state.k_cache[li], 0, k);
+                    self.session.gpu.write_buffer(&self.session.model.state.v_cache[li], 0, v);
+                }
+            }
         }
-        input_ids.push(self.tokens.audio_eos);
-        input_ids.extend_from_slice(suffix_ids);
 
-        log::info!("[omni25] input: {} tokens (1 bos + {} audio + 1 eos + {} suffix)",
-            input_ids.len(), audio_seq_len, suffix_ids.len());
+        // 3. Forward audio tokens through the decoder:
+        //    audio_bos → audio embeddings (via forward_embed_kv_only) → audio_eos → suffix
 
-        // 4. Generate — for now uses standard path (audio embeddings not injected yet)
-        // TODO: inject audio_output embeddings at AUDIO placeholder positions
-        //       instead of looking up the embedding table
-        self.session.generate_tokens(&input_ids, max_tokens, eos_ids, None)
+        // Read audio tower output from GPU → CPU
+        let hidden = self.session.model.config.hidden_size as usize;
+        let audio_bytes = audio_seq_len as usize * hidden * 4;
+        let audio_cpu = self.session.gpu.read_buffer(&audio_output, audio_bytes as u64);
+        let audio_f32: &[f32] = bytemuck::cast_slice(&audio_cpu);
+
+        log::info!("[omni25] injecting {} audio embeddings (dim={})", audio_seq_len, hidden);
+
+        // audio_bos token
+        self.session.model.forward_kv_only(&mut self.session.gpu, self.tokens.audio_bos);
+
+        // Audio embeddings — each is [hidden_size] f32
+        for i in 0..audio_seq_len as usize {
+            let embed = &audio_f32[i * hidden..(i + 1) * hidden];
+            self.session.model.forward_embed_kv_only(&mut self.session.gpu, embed);
+            if (i + 1) % 10 == 0 {
+                self.session.gpu.flush_and_wait();
+            }
+        }
+
+        // audio_eos token
+        self.session.model.forward_kv_only(&mut self.session.gpu, self.tokens.audio_eos);
+
+        // Suffix tokens
+        for &tok in suffix_ids {
+            self.session.model.forward_kv_only(&mut self.session.gpu, tok);
+        }
+        self.session.gpu.flush_and_wait();
+
+        log::info!("[omni25] prefill done (seq_len={}), decoding...",
+            self.session.model.seq_len);
+
+        // 4. Build dummy input_ids for generate_tokens (just suffix — the KV cache is already populated)
+        //    We need to call generate_inner with inject_think=false and the full prefix_len set
+        //    to the current seq_len so it skips prefill and goes straight to decode.
+        let decode_start = self.session.model.seq_len;
+        self.session.prefix_len = decode_start;
+        self.session.capture_prefix_snapshot();
+
+        // Generate with a single dummy token to trigger sampling
+        // The model's seq_len is already at the right position
+        let dummy_ids: Vec<u32> = (0..decode_start).map(|_| 0u32).collect();
+        // Actually: generate_tokens resets seq_len to prefix_len and restores snapshot,
+        // then processes only tokens beyond prefix_len. So we pass dummy_ids of length
+        // prefix_len (skipped) + 0 new tokens → immediate decode.
+        self.session.generate_tokens(&dummy_ids, max_tokens, eos_ids, None)
     }
 
     /// Text-only inference (same as standard InferenceSession).

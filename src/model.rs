@@ -1249,6 +1249,17 @@ impl Model {
         self.forward_layers(gpu)
     }
 
+    /// Forward pass with raw embedding, KV-cache only (no sampling).
+    /// Used for injecting audio embeddings during Omni prefill.
+    pub fn forward_embed_kv_only(&mut self, gpu: &mut GpuContext, embed: &[f32]) {
+        let h = self.config.hidden_size;
+        gpu.write_buffer(&self.state.hidden, 0, bytemuck::cast_slice(embed));
+        gpu.copy_buffer(&self.state.hidden, &self.state.residual, h as u64 * 4);
+        self.prefill_kv_only = true;
+        self.forward_layers(gpu);
+        self.prefill_kv_only = false;
+    }
+
     /// Run transformer layers + lm_head + sampling (shared by forward and forward_embed).
     fn forward_layers(&mut self, gpu: &mut GpuContext) -> u32 {
         let h = self.config.hidden_size;

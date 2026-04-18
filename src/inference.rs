@@ -113,12 +113,12 @@ pub struct ThinkConfig {
 /// In-memory snapshot of GPU state after system prompt prefill.
 /// Allows each generate() to restore the prefix state and run only
 /// the query tokens, instead of re-running the full context.
-struct PrefixSnapshot {
+pub(crate) struct PrefixSnapshot {
     /// Per self-attn layer (indexed by global layer index): (k_bytes, v_bytes).
     /// Only SA layer indices have non-empty vecs.
-    kv: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) kv: Vec<(Vec<u8>, Vec<u8>)>,
     /// Per linear-attn layer (0-based): (hist_bytes, state_bytes).
-    dn: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) dn: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Pure inference session: model + GPU context.
@@ -131,7 +131,7 @@ pub struct InferenceSession {
     /// seq_len to this value so the cached system prompt is never re-run.
     pub prefix_len: u32,
     /// In-memory snapshot captured after set_prefix() completes.
-    prefix_snapshot: Option<PrefixSnapshot>,
+    pub(crate) prefix_snapshot: Option<PrefixSnapshot>,
 }
 
 impl InferenceSession {
@@ -241,7 +241,7 @@ impl InferenceSession {
     /// Capture the current GPU state (KV caches + DeltaNet hist/state) into an
     /// in-memory snapshot.  Called after set_prefix() and after loading a prefix
     /// cache from disk so each generate() can restore from this snapshot cheaply.
-    fn capture_prefix_snapshot(&mut self) {
+    pub(crate) fn capture_prefix_snapshot(&mut self) {
         let nkv  = self.config.num_key_value_heads as u64;
         let hd   = self.config.head_dim as u64;
         let plen = self.prefix_len as u64;
