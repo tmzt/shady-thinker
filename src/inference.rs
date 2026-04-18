@@ -170,6 +170,10 @@ impl InferenceSession {
         log::info!("[shady-thinker] step 5/6: creating model pipeline");
         let mut model =
             Model::new(&gpu, config.clone(), quant_config, model_weights, max_seq_len);
+        if weight_format == "bf16" {
+            model.bf16_mode = true;
+            log::info!("[shady-thinker] BF16 mode enabled");
+        }
         log::info!("[shady-thinker] model pipeline created ({:.1}s)", t0.elapsed().as_secs_f32());
 
         log::info!("[shady-thinker] step 6/6: initializing QK norm params");
