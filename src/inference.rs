@@ -302,7 +302,7 @@ impl InferenceSession {
 
     /// Restore the prefix snapshot to GPU buffers and reset seq_len to prefix_len.
     /// After this, the model is ready to process query tokens incrementally.
-    fn restore_prefix_snapshot(&mut self) {
+    pub fn restore_prefix_snapshot(&mut self) {
         let snap = match self.prefix_snapshot.as_ref() {
             Some(s) => s,
             None => return,
