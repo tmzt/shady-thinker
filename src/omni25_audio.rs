@@ -27,6 +27,7 @@ mod shaders {
     pub const ADD: &str = include_str!("shaders/add.wgsl");
     pub const CONV1D_GELU_BF16: &str = include_str!("shaders/conv1d_gelu_bf16.wgsl");
     pub const CONV1D_BF16: &str = include_str!("shaders/conv1d_bf16.wgsl");
+    pub const GELU: &str = include_str!("shaders/gelu.wgsl");
 }
 
 /// Audio tower configuration (from config.json audio_config).
@@ -536,7 +537,7 @@ fn dispatch_gelu(
     struct P { n: u32, _p: [u32; 3] }
     gpu.flush();
     gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n, _p: [0; 3] }));
-    gpu.dispatch("gelu", shaders::GELU_MUL, &[
+    gpu.dispatch("gelu", shaders::GELU, &[
         bind(0, input), bind(1, output), bind(2, params),
     ], (n.div_ceil(256), 1, 1));
 }
