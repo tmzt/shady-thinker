@@ -117,6 +117,7 @@ impl Omni25Session {
         &mut self,
         mel_data: &[f32],
         mel_frames: u32,
+        pre_audio_ids: &[u32],
         suffix_ids: &[u32],
         max_tokens: u32,
         eos_ids: &[u32],
@@ -144,8 +145,13 @@ impl Omni25Session {
             }
         }
 
-        // 3. Forward audio tokens through the decoder:
-        //    audio_bos → audio embeddings (via forward_embed_kv_only) → audio_eos → suffix
+        // 3. Forward through decoder:
+        //    pre_audio → audio_bos → audio embeddings → audio_eos → suffix
+
+        // Pre-audio tokens (e.g. "<|im_start|>user\n")
+        for &tok in pre_audio_ids {
+            self.session.model.forward_kv_only(&mut self.session.gpu, tok);
+        }
 
         // Read audio tower output from GPU → CPU
         let hidden = self.session.model.config.hidden_size as usize;
@@ -170,29 +176,38 @@ impl Omni25Session {
         // audio_eos token
         self.session.model.forward_kv_only(&mut self.session.gpu, self.tokens.audio_eos);
 
-        // Suffix tokens
-        for &tok in suffix_ids {
-            self.session.model.forward_kv_only(&mut self.session.gpu, tok);
+        // Suffix tokens — all but last via kv_only, last via forward() to get lm_head logits
+        if suffix_ids.len() > 1 {
+            for &tok in &suffix_ids[..suffix_ids.len() - 1] {
+                self.session.model.forward_kv_only(&mut self.session.gpu, tok);
+            }
         }
         self.session.gpu.flush_and_wait();
 
         log::info!("[omni25] prefill done (seq_len={}), decoding...",
             self.session.model.seq_len);
 
-        // 4. Build dummy input_ids for generate_tokens (just suffix — the KV cache is already populated)
-        //    We need to call generate_inner with inject_think=false and the full prefix_len set
-        //    to the current seq_len so it skips prefill and goes straight to decode.
-        let decode_start = self.session.model.seq_len;
-        self.session.prefix_len = decode_start;
-        self.session.capture_prefix_snapshot();
+        // 4. Decode: forward the last suffix token through full forward() to get first logits,
+        //    then continue autoregressive decoding.
+        let last_suffix = *suffix_ids.last().unwrap_or(&0);
+        let first_token = self.session.model.forward(&mut self.session.gpu, last_suffix);
+        log::info!("[omni25] first decode token: {}", first_token);
 
-        // Generate with a single dummy token to trigger sampling
-        // The model's seq_len is already at the right position
-        let dummy_ids: Vec<u32> = (0..decode_start).map(|_| 0u32).collect();
-        // Actually: generate_tokens resets seq_len to prefix_len and restores snapshot,
-        // then processes only tokens beyond prefix_len. So we pass dummy_ids of length
-        // prefix_len (skipped) + 0 new tokens → immediate decode.
-        self.session.generate_tokens(&dummy_ids, max_tokens, eos_ids, None)
+        let mut generated = vec![first_token];
+        let mut token = first_token;
+        for _ in 1..max_tokens {
+            if eos_ids.contains(&token) { break; }
+            token = self.session.model.forward(&mut self.session.gpu, token);
+            generated.push(token);
+        }
+
+        crate::inference::GenerateResult {
+            token_ids: generated.iter().filter(|t| !eos_ids.contains(t)).copied().collect(),
+            token_count: generated.len(),
+            tokens_per_sec: 0.0, // TODO: compute
+            state: crate::inference::GenerateState::Complete,
+            epiphany_count: 0,
+        }
     }
 
     /// Text-only inference (same as standard InferenceSession).
