@@ -715,7 +715,7 @@ impl InferenceSession {
         let mut generated = Vec::new();
         let bf16 = self.model.bf16_mode;
         let hybrid = self.model.is_hybrid_attn();
-        let use_gptq = !bf16 && !inject_think; // hybrid models now handled in prefill_gptq
+        let use_gptq = !bf16 && !inject_think;
         log::info!("[shady-thinker] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
             input_ids.len(), bf16, inject_think, hybrid,
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });

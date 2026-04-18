@@ -696,8 +696,8 @@ impl Model {
         };
 
         let tied_embeddings = config.tie_word_embeddings;
-        let qknorm_shader_src = build_qknorm_shader(&config);
         let q_gated = config.attn_output_gate;
+        let qknorm_shader_src = build_qknorm_shader_gated(&config, q_gated);
         let gqa_shader_src = build_gqa_shader(q_gated);
         let batched_qknorm_src = if q_gated {
             build_batched_qknorm_shader_gated(&config)
