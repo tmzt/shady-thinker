@@ -765,6 +765,19 @@ pub fn load_weights_bf16(
         gpu.upload_buffer(label, get(name))
     };
 
+    let try_get = |name: &str| -> Option<&[u8]> {
+        for st in &shards {
+            if let Ok(t) = st.tensor(name) {
+                return Some(t.data());
+            }
+        }
+        None
+    };
+
+    let try_upload = |label: &str, name: &str| -> Option<wgpu::Buffer> {
+        try_get(name).map(|data| gpu.upload_buffer(label, data))
+    };
+
     // Dummy 4-byte buffer for scales (unused in bf16 mode)
     let dummy = gpu.create_storage_buffer("dummy", 4);
 
@@ -813,10 +826,14 @@ pub fn load_weights_bf16(
     for i in 0..config.num_hidden_layers as usize {
         let p = format!("thinker.model.layers.{i}");
 
-        // Q/K norm raw bytes for qknorm_params
-        let q_norm_bytes = get(&format!("{p}.self_attn.q_norm.weight")).to_vec();
-        let k_norm_bytes = get(&format!("{p}.self_attn.k_norm.weight")).to_vec();
-        norm_weights.push(Some((q_norm_bytes, k_norm_bytes)));
+        // Q/K norm raw bytes for qknorm_params (optional — absent in Qwen2.5)
+        let q_norm_data = try_get(&format!("{p}.self_attn.q_norm.weight"));
+        let k_norm_data = try_get(&format!("{p}.self_attn.k_norm.weight"));
+        if let (Some(qn), Some(kn)) = (q_norm_data, k_norm_data) {
+            norm_weights.push(Some((qn.to_vec(), kn.to_vec())));
+        } else {
+            norm_weights.push(None);
+        }
 
         let sa = SelfAttnWeights {
             q_proj_qweight: upload(&format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
@@ -827,8 +844,17 @@ pub fn load_weights_bf16(
             v_proj_scales: dummy.clone(),
             o_proj_qweight: upload(&format!("{p}.o"), &format!("{p}.self_attn.o_proj.weight")),
             o_proj_scales: dummy.clone(),
-            q_norm: upload(&format!("{p}.qn"), &format!("{p}.self_attn.q_norm.weight")),
-            k_norm: upload(&format!("{p}.kn"), &format!("{p}.self_attn.k_norm.weight")),
+            q_norm: try_upload(&format!("{p}.qn"), &format!("{p}.self_attn.q_norm.weight"))
+                .unwrap_or_else(|| {
+                    // Qwen2.5: no q_norm — zeros → identity with NORM_OFFSET=1.0
+                    let zeros = vec![0u8; config.head_dim as usize * 2]; // bf16
+                    gpu.upload_buffer(&format!("{p}.qn"), &zeros)
+                }),
+            k_norm: try_upload(&format!("{p}.kn"), &format!("{p}.self_attn.k_norm.weight"))
+                .unwrap_or_else(|| {
+                    let zeros = vec![0u8; config.head_dim as usize * 2];
+                    gpu.upload_buffer(&format!("{p}.kn"), &zeros)
+                }),
         };
 
         let layer = LayerWeights {
@@ -888,6 +914,7 @@ pub fn load_weights_int4(
     let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
 
     let get = |n: &str| -> &[u8] { for s in &st { if let Ok(t)=s.tensor(n) { return t.data(); } } panic!("{n}"); };
+    let tg = |n: &str| -> Option<&[u8]> { for s in &st { if let Ok(t)=s.tensor(n) { return Some(t.data()); } } None };
     let shp = |n: &str| -> Vec<usize> { for s in &st { if let Ok(t)=s.tensor(n) { return t.shape().to_vec(); } } panic!("{n}"); };
     let bf = |l:&str,n:&str| -> wgpu::Buffer { gpu.upload_buffer(l, get(n)) };
     let q4 = |l:&str,n:&str| -> (wgpu::Buffer,wgpu::Buffer) {
@@ -913,8 +940,13 @@ pub fn load_weights_int4(
 
     for i in 0..config.num_hidden_layers as usize {
         let p=format!("thinker.model.layers.{i}");
-        nw.push(Some((get(&format!("{p}.self_attn.q_norm.weight")).to_vec(),
-                       get(&format!("{p}.self_attn.k_norm.weight")).to_vec())));
+        let qn = tg(&format!("{p}.self_attn.q_norm.weight"));
+        let kn = tg(&format!("{p}.self_attn.k_norm.weight"));
+        if let (Some(q), Some(k)) = (qn, kn) {
+            nw.push(Some((q.to_vec(), k.to_vec())));
+        } else {
+            nw.push(None);
+        }
         let (qq,qs)=q4("q",&format!("{p}.self_attn.q_proj.weight"));
         let (kq,ks)=q4("k",&format!("{p}.self_attn.k_proj.weight"));
         let (vq,vs)=q4("v",&format!("{p}.self_attn.v_proj.weight"));
@@ -926,8 +958,10 @@ pub fn load_weights_int4(
             attn: AttnWeights::SelfAttn(SelfAttnWeights {
                 q_proj_qweight:qq,q_proj_scales:qs, k_proj_qweight:kq,k_proj_scales:ks,
                 v_proj_qweight:vq,v_proj_scales:vs, o_proj_qweight:oq,o_proj_scales:os,
-                q_norm:bf("qn",&format!("{p}.self_attn.q_norm.weight")),
-                k_norm:bf("kn",&format!("{p}.self_attn.k_norm.weight")),
+                q_norm: tg(&format!("{p}.self_attn.q_norm.weight")).map(|d| gpu.upload_buffer("qn", d))
+                    .unwrap_or_else(|| { let z=vec![0u8;config.head_dim as usize*2]; gpu.upload_buffer("qn",&z) }),
+                k_norm: tg(&format!("{p}.self_attn.k_norm.weight")).map(|d| gpu.upload_buffer("kn", d))
+                    .unwrap_or_else(|| { let z=vec![0u8;config.head_dim as usize*2]; gpu.upload_buffer("kn",&z) }),
             }),
             gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
             down_proj_qweight:dq,down_proj_scales:dss,
