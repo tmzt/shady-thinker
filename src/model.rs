@@ -676,7 +676,8 @@ impl Model {
 
         let tied_embeddings = config.tie_word_embeddings;
         let qknorm_shader_src = build_qknorm_shader(&config);
-        let gqa_shader_src = build_gqa_shader(true); // q_gated=true by default (Qwen3.5)
+        let q_gated = config.attn_output_gate;
+        let gqa_shader_src = build_gqa_shader(q_gated);
         let batched_qknorm_gated_src = build_batched_qknorm_shader_gated(&config);
         let vocab_size_for_bitmap = config.vocab_size;
 
@@ -722,7 +723,7 @@ impl Model {
             #[cfg(feature = "jit-lora")]
             lora: None,
             bf16_mode: false,
-            q_gated: true, // default: Qwen3.5 gated attention
+            q_gated,
             norm_direct: false,
             mlx_int4_mode: false,
             mlx_bf16_scales: bf16_scales,

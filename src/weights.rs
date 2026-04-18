@@ -203,6 +203,9 @@ pub struct ModelConfig {
     pub num_key_value_heads: u32,
     #[serde(default = "default_head_dim")]
     pub head_dim: u32,
+    /// Qwen3.5: gated attention output (Q outputs 2×head_dim, sigmoid gate applied)
+    #[serde(default)]
+    pub attn_output_gate: bool,
     #[serde(default)]
     pub num_hidden_layers: u32,
     #[serde(default)]

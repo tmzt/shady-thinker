@@ -174,7 +174,8 @@ impl InferenceSession {
             model.bf16_mode = true;
             log::info!("[shady-thinker] BF16 mode enabled");
         }
-        log::info!("[shady-thinker] model pipeline created ({:.1}s)", t0.elapsed().as_secs_f32());
+        log::info!("[shady-thinker] model pipeline created ({:.1}s), q_gated={}, bf16={}, vocab={}",
+            t0.elapsed().as_secs_f32(), model.q_gated, model.bf16_mode, model.config.vocab_size);
 
         log::info!("[shady-thinker] step 6/6: initializing QK norm params");
         for (i, norm_data) in raw_norms.layers.iter().enumerate() {
