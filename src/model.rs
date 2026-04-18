@@ -700,7 +700,9 @@ impl Model {
 
         let tied_embeddings = config.tie_word_embeddings;
         let q_gated = config.attn_output_gate;
-        let qknorm_shader_src = build_qknorm_shader_gated(&config, q_gated);
+        // Qwen3.5 uses (1+w)*x norm (offset=1.0), Qwen2.5 uses w*x (offset=0.0)
+        let norm_offset = if q_gated { 1.0f32 } else { 0.0f32 };
+        let qknorm_shader_src = build_qknorm_shader_full(&config, q_gated, norm_offset);
         let gqa_shader_src = build_gqa_shader(q_gated);
         let batched_qknorm_src = if q_gated {
             build_batched_qknorm_shader_gated(&config)
@@ -752,7 +754,7 @@ impl Model {
             lora: None,
             bf16_mode: false,
             q_gated,
-            norm_direct: false,
+            norm_direct: !q_gated, // Qwen2.5: direct w*x, Qwen3.5: (1+w)*x
             mlx_int4_mode: false,
             mlx_bf16_scales: bf16_scales,
             mlx_current_layer: 0,
@@ -1322,7 +1324,24 @@ impl Model {
 
             // ── Pre-attention norm ──
             if i == 0 {
+                // Debug: dump embedding and normed for first layer of first token
+                if self.seq_len < 3 || (self.seq_len > 880 && self.seq_len < 890) {
+                    gpu.flush_and_wait();
+                    let h_bytes = gpu.read_buffer(&self.state.hidden, h as u64 * 4);
+                    let h_vals: &[f32] = bytemuck::cast_slice(&h_bytes);
+                    let h_norm: f32 = h_vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    log::info!("[debug] seq={} embed: norm={:.4} first4={:.6?}", self.seq_len,
+                        h_norm, &h_vals[..4]);
+                }
                 self.rmsnorm(gpu, &self.state.hidden, &layer.input_layernorm, &self.state.normed);
+                if self.seq_len < 3 || (self.seq_len > 880 && self.seq_len < 890) {
+                    gpu.flush_and_wait();
+                    let n_bytes = gpu.read_buffer(&self.state.normed, h as u64 * 4);
+                    let n_vals: &[f32] = bytemuck::cast_slice(&n_bytes);
+                    let n_norm: f32 = n_vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    log::info!("[debug] seq={} normed: norm={:.4} first4={:.6?}", self.seq_len,
+                        n_norm, &n_vals[..4]);
+                }
             } else {
                 self.add_rmsnorm(gpu, &self.state.residual, &self.state.mlp_output,
                     &layer.input_layernorm, &self.state.normed);
@@ -1346,6 +1365,16 @@ impl Model {
                         &self.state.q_out, h, q_dim);
                 }
 
+                // Debug: dump Q output
+                if i == 0 && (self.seq_len < 3 || (self.seq_len > 880 && self.seq_len < 890)) {
+                    gpu.flush_and_wait();
+                    let q_dim_actual = if self.q_gated { nh * hd * 2 } else { nh * hd };
+                    let q_bytes = gpu.read_buffer(&self.state.q_out, q_dim_actual as u64 * 4);
+                    let q_vals: &[f32] = bytemuck::cast_slice(&q_bytes);
+                    let q_norm: f32 = q_vals.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    log::info!("[debug] seq={} q_proj: norm={:.4} first4={:.6?}", self.seq_len,
+                        q_norm, &q_vals[..4]);
+                }
                 self.gptq_matvec_opt_bias(gpu, "kproj",
                     &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
                     sa.k_bias.as_ref(), &self.state.k_out, kv_dim, p_kv);
@@ -2340,6 +2369,8 @@ impl Model {
         struct GemmP { k: u32, n: u32, group_size: u32, _pad: u32 }
 
         let gs = self.quant_config.group_size;
+        let pg_norm_shader = if self.norm_direct { shaders::BATCHED_RMSNORM } else { shaders::BATCHED_RMSNORM_1PW };
+        let pg_addnorm_shader = if self.norm_direct { shaders::BATCHED_ADD_RMSNORM } else { shaders::BATCHED_ADD_RMSNORM_1PW };
         // Local params buffer for prefill dispatches — reused per layer with flush+write
         let pg_params = gpu.create_buffer("pg_params", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         // Clone the shader src to avoid borrow conflicts inside the layer loop
@@ -2385,14 +2416,14 @@ impl Model {
             if layer_idx == 0 {
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&NormP {
                     n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
-                gpu.dispatch("pg_norm0", shaders::BATCHED_RMSNORM_1PW, &[
+                gpu.dispatch("pg_norm0", pg_norm_shader, &[
                     gpu::bind(0, &residual), gpu::bind(1, &layer.input_layernorm),
                     gpu::bind(2, &normed),   gpu::bind(3, &pg_params),
                 ], (seq_len, 1, 1));
             } else {
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&NormP {
                     n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
-                gpu.dispatch("pg_addnorm", shaders::BATCHED_ADD_RMSNORM_1PW, &[
+                gpu.dispatch("pg_addnorm", pg_addnorm_shader, &[
                     gpu::bind(0, &residual), gpu::bind(1, &mlp_out),
                     gpu::bind(2, &layer.input_layernorm), gpu::bind(3, &normed),
                     gpu::bind(4, &pg_params),
@@ -2589,7 +2620,7 @@ impl Model {
             gpu.flush();
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&NormP {
                 n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
-            gpu.dispatch("pg_postnorm", shaders::BATCHED_ADD_RMSNORM_1PW, &[
+            gpu.dispatch("pg_postnorm", pg_addnorm_shader, &[
                 gpu::bind(0, &residual), gpu::bind(1, &mlp_out),
                 gpu::bind(2, &layer.post_attn_layernorm), gpu::bind(3, &normed),
                 gpu::bind(4, &pg_params),
@@ -2639,7 +2670,7 @@ impl Model {
             struct NormP2 { n: u32, eps: f32, seq_len: u32, _pad: u32 }
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&NormP2 {
                 n: h, eps: self.config.rms_norm_eps, seq_len, _pad: 0 }));
-            gpu.dispatch("pg_final_norm", shaders::BATCHED_ADD_RMSNORM_1PW, &[
+            gpu.dispatch("pg_final_norm", pg_addnorm_shader, &[
                 gpu::bind(0, &residual), gpu::bind(1, &mlp_out),
                 gpu::bind(2, &self.weights.final_norm), gpu::bind(3, &normed),
                 gpu::bind(4, &pg_params),
