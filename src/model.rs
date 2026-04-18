@@ -16,6 +16,7 @@ pub(crate) mod shaders {
     pub const GQA_REDUCE: &str = include_str!("shaders/gqa_reduce.wgsl");
     pub const GPTQ_MATVEC: &str = include_str!("shaders/gptq_matvec.wgsl");
     pub const GPTQ_MATVEC_BIAS: &str = include_str!("shaders/gptq_matvec_bias.wgsl");
+    pub const GPTQ_GEMM_BIAS_4T: &str = include_str!("shaders/gptq_gemm_bias_4t.wgsl");
     pub const FUSED_SILU_GPTQ: &str = include_str!("shaders/fused_silu_gptq.wgsl");
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
     pub const BF16_MATVEC_TILED: &str = include_str!("shaders/bf16_matvec_tiled.wgsl");
@@ -2315,7 +2316,8 @@ impl Model {
 
         // ── Allocate batched scratch buffers ──
         let normed  = gpu.create_storage_buffer("pg_normed",  sl * h as u64 * f);
-        let q_raw   = gpu.create_storage_buffer("pg_q_raw",  sl * (nh * hd * 2) as u64 * f);
+        let q_raw_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
+        let q_raw   = gpu.create_storage_buffer("pg_q_raw",  sl * q_raw_dim as u64 * f);
         let q_proj  = gpu.create_storage_buffer("pg_q_proj", sl * (nh * hd) as u64 * f);
         let q_gate  = gpu.create_storage_buffer("pg_q_gate", sl * (nh * hd) as u64 * f);
         let k_buf   = gpu.create_storage_buffer("pg_k",      sl * (nkv * hd) as u64 * f);
@@ -2408,30 +2410,54 @@ impl Model {
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: q_dim, group_size: gs, _pad: 0 }));
                 let wg_n = q_dim.div_ceil(8);
                 let q_target = if self.q_gated { &q_raw } else { &q_proj };
-                gpu.dispatch("pg_q", gemm_shader, &[
-                    gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
-                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, q_target),
-                    gpu::bind(4, &pg_params),
-                ], (wg_n, seq_len, 1));
+                if let Some(ref qb) = sa.q_bias {
+                    gpu.dispatch("pg_q", shaders::GPTQ_GEMM_BIAS_4T, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
+                        gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, q_target),
+                        gpu::bind(4, &pg_params), gpu::bind(5, qb),
+                    ], (wg_n, seq_len, 1));
+                } else {
+                    gpu.dispatch("pg_q", gemm_shader, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
+                        gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, q_target),
+                        gpu::bind(4, &pg_params),
+                    ], (wg_n, seq_len, 1));
+                }
 
                 // ── K proj ──
                 gpu.flush();
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
                 let wg_kv = kv_dim.div_ceil(8);
-                gpu.dispatch("pg_k", gemm_shader, &[
-                    gpu::bind(0, &normed), gpu::bind(1, &sa.k_proj_qweight),
-                    gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &k_buf),
-                    gpu::bind(4, &pg_params),
-                ], (wg_kv, seq_len, 1));
+                if let Some(ref kb) = sa.k_bias {
+                    gpu.dispatch("pg_k", shaders::GPTQ_GEMM_BIAS_4T, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.k_proj_qweight),
+                        gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &k_buf),
+                        gpu::bind(4, &pg_params), gpu::bind(5, kb),
+                    ], (wg_kv, seq_len, 1));
+                } else {
+                    gpu.dispatch("pg_k", gemm_shader, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.k_proj_qweight),
+                        gpu::bind(2, &sa.k_proj_scales), gpu::bind(3, &k_buf),
+                        gpu::bind(4, &pg_params),
+                    ], (wg_kv, seq_len, 1));
+                }
 
                 // ── V proj ──
                 gpu.flush();
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: kv_dim, group_size: gs, _pad: 0 }));
-                gpu.dispatch("pg_v", gemm_shader, &[
-                    gpu::bind(0, &normed), gpu::bind(1, &sa.v_proj_qweight),
-                    gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &v_buf),
-                    gpu::bind(4, &pg_params),
-                ], (wg_kv, seq_len, 1));
+                if let Some(ref vb) = sa.v_bias {
+                    gpu.dispatch("pg_v", shaders::GPTQ_GEMM_BIAS_4T, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.v_proj_qweight),
+                        gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &v_buf),
+                        gpu::bind(4, &pg_params), gpu::bind(5, vb),
+                    ], (wg_kv, seq_len, 1));
+                } else {
+                    gpu.dispatch("pg_v", gemm_shader, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &sa.v_proj_qweight),
+                        gpu::bind(2, &sa.v_proj_scales), gpu::bind(3, &v_buf),
+                        gpu::bind(4, &pg_params),
+                    ], (wg_kv, seq_len, 1));
+                }
 
                 // ── Batched Q_GATED qknorm + RoPE + KV cache write ──
                 // batched_qknorm_params[layer_idx] has header+weights pre-loaded.
