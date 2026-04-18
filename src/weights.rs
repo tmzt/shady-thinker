@@ -104,6 +104,10 @@ pub struct SelfAttnWeights {
     pub o_proj_scales: wgpu::Buffer,
     pub q_norm: wgpu::Buffer,
     pub k_norm: wgpu::Buffer,
+    /// Optional Q/K/V biases (Qwen2.5 has them, Qwen3.5 does not)
+    pub q_bias: Option<wgpu::Buffer>,
+    pub k_bias: Option<wgpu::Buffer>,
+    pub v_bias: Option<wgpu::Buffer>,
 }
 
 /// DeltaNet linear attention layer weights
@@ -432,6 +436,15 @@ fn is_self_attn_layer(tensor_map: &HashMap<String, wgpu::Buffer>, prefix: &str, 
     tensor_map.contains_key(&qkey) || tensor_map.contains_key(&wkey)
 }
 
+/// Convert f16 bytes to f32 and upload to GPU.
+fn upload_f16_as_f32(gpu: &GpuContext, f16_bytes: &[u8], label: &str) -> wgpu::Buffer {
+    let f16_vals: &[u16] = bytemuck::cast_slice(f16_bytes);
+    let f32_vals: Vec<f32> = f16_vals.iter()
+        .map(|&bits| half::f16::from_bits(bits).to_f32())
+        .collect();
+    gpu.upload_buffer(label, bytemuck::cast_slice(&f32_vals))
+}
+
 /// Dequantize GPTQ INT4 symmetric weights to BF16 bytes.
 /// Matches the GPU shader convention: `f32(nibble) - 8.0` × scale.
 /// qweight: [packed_rows, N] as u32 (8 int4 per u32, row-major)
@@ -554,8 +567,19 @@ pub fn load_weights(
             }
         }
 
+        // Collect self_attn bias raw bytes (f16) for explicit f16→f32 conversion later
+        for (name, view) in tensors.tensors() {
+            if name.contains(".self_attn.") && name.ends_with(".bias") {
+                raw_bytes_map.insert(name.to_string(), view.data().to_vec());
+            }
+        }
+
         for (name, view) in tensors.tensors() {
             if name.ends_with(".qzeros") || name.ends_with(".g_idx") {
+                continue;
+            }
+            // Skip self_attn biases — handled with f16→f32 conversion in layer construction
+            if name.contains(".self_attn.") && name.ends_with(".bias") {
                 continue;
             }
             // Skip non-thinker tensors (talker, token2wav, visual) for Omni models
@@ -572,7 +596,6 @@ pub fn load_weights(
             {
                 continue;
             }
-
             let bytes = view.data();
 
             // Keep raw bytes for norm weights and DeltaNet in_proj_a/b (for merging)
@@ -659,6 +682,12 @@ pub fn load_weights(
                     .unwrap_or_else(|| gpu.upload_buffer("qn_z", &vec![0u8; config.head_dim as usize * 2])),
                 k_norm: try_take(&mut tensor_map, &format!("{pfx}.self_attn.k_norm.weight"))
                     .unwrap_or_else(|| gpu.upload_buffer("kn_z", &vec![0u8; config.head_dim as usize * 2])),
+                q_bias: raw_bytes_map.remove(&format!("{pfx}.self_attn.q_proj.bias"))
+                    .map(|b| upload_f16_as_f32(gpu, &b, "qb")),
+                k_bias: raw_bytes_map.remove(&format!("{pfx}.self_attn.k_proj.bias"))
+                    .map(|b| upload_f16_as_f32(gpu, &b, "kb")),
+                v_bias: raw_bytes_map.remove(&format!("{pfx}.self_attn.v_proj.bias"))
+                    .map(|b| upload_f16_as_f32(gpu, &b, "vb")),
             })
         } else {
             // Merge in_proj_a + in_proj_b into ab_weight (concat raw BF16 bytes)
@@ -912,6 +941,9 @@ pub fn load_weights_bf16(
                     let zeros = vec![0u8; config.head_dim as usize * 2];
                     gpu.upload_buffer(&format!("{p}.kn"), &zeros)
                 }),
+            q_bias: try_upload(&format!("{p}.qb"), &format!("{p}.self_attn.q_proj.bias")),
+            k_bias: try_upload(&format!("{p}.kb"), &format!("{p}.self_attn.k_proj.bias")),
+            v_bias: try_upload(&format!("{p}.vb"), &format!("{p}.self_attn.v_proj.bias")),
         };
 
         let layer = LayerWeights {
@@ -1019,6 +1051,7 @@ pub fn load_weights_int4(
                     .unwrap_or_else(|| { let z=vec![0u8;config.head_dim as usize*2]; gpu.upload_buffer("qn",&z) }),
                 k_norm: tg(&format!("{p}.self_attn.k_norm.weight")).map(|d| gpu.upload_buffer("kn", d))
                     .unwrap_or_else(|| { let z=vec![0u8;config.head_dim as usize*2]; gpu.upload_buffer("kn",&z) }),
+                q_bias: None, k_bias: None, v_bias: None,
             }),
             gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
             down_proj_qweight:dq,down_proj_scales:dss,
@@ -1124,6 +1157,7 @@ pub fn load_weights_mlx_int4(
                 o_proj_qweight:oq, o_proj_scales:os,
                 q_norm:up("qn",&format!("{p}.self_attn.q_norm.weight")),
                 k_norm:up("kn",&format!("{p}.self_attn.k_norm.weight")),
+                q_bias: None, k_bias: None, v_bias: None,
             }),
             gate_proj_qweight:gq, gate_proj_scales:gs,
             up_proj_qweight:uq, up_proj_scales:us,

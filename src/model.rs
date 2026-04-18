@@ -15,6 +15,7 @@ pub(crate) mod shaders {
     pub const GQA_ATTENTION_HEAD: &str = include_str!("shaders/gqa_attention_head.wgsl");
     pub const GQA_REDUCE: &str = include_str!("shaders/gqa_reduce.wgsl");
     pub const GPTQ_MATVEC: &str = include_str!("shaders/gptq_matvec.wgsl");
+    pub const GPTQ_MATVEC_BIAS: &str = include_str!("shaders/gptq_matvec_bias.wgsl");
     pub const FUSED_SILU_GPTQ: &str = include_str!("shaders/fused_silu_gptq.wgsl");
     pub const BF16_MATVEC: &str = include_str!("shaders/bf16_matvec.wgsl");
     pub const BF16_MATVEC_TILED: &str = include_str!("shaders/bf16_matvec_tiled.wgsl");
@@ -833,20 +834,35 @@ impl Model {
         input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
         output: &wgpu::Buffer, n: u32, params_buf: &wgpu::Buffer,
     ) {
+        self.gptq_matvec_opt_bias(gpu, name, input, qweight, scales, None, output, n, params_buf);
+    }
+
+    pub fn gptq_matvec_opt_bias(
+        &self, gpu: &mut GpuContext, name: &str,
+        input: &wgpu::Buffer, qweight: &wgpu::Buffer, scales: &wgpu::Buffer,
+        bias: Option<&wgpu::Buffer>,
+        output: &wgpu::Buffer, n: u32, params_buf: &wgpu::Buffer,
+    ) {
         if self.bf16_mode {
-            // BF16 mode: qweight contains bf16 packed weights, scales is unused
-            // params_buf is a bf16 params buffer with {hidden_size, vocab_size}
             gpu.dispatch(name, shaders::BF16_MATVEC, &[
                 gpu::bind(0, input), gpu::bind(1, qweight),
                 gpu::bind(2, output), gpu::bind(3, params_buf),
             ], (n.div_ceil(32), 1, 1));
             return;
         }
-        gpu.dispatch(name, shaders::GPTQ_MATVEC_4T, &[
-            gpu::bind(0, input), gpu::bind(1, qweight),
-            gpu::bind(2, scales), gpu::bind(3, output),
-            gpu::bind(4, params_buf),
-        ], (n.div_ceil(8), 1, 1));
+        if let Some(bias) = bias {
+            gpu.dispatch(name, shaders::GPTQ_MATVEC_BIAS, &[
+                gpu::bind(0, input), gpu::bind(1, qweight),
+                gpu::bind(2, scales), gpu::bind(3, output),
+                gpu::bind(4, params_buf), gpu::bind(5, bias),
+            ], (n.div_ceil(32), 1, 1));
+        } else {
+            gpu.dispatch(name, shaders::GPTQ_MATVEC_4T, &[
+                gpu::bind(0, input), gpu::bind(1, qweight),
+                gpu::bind(2, scales), gpu::bind(3, output),
+                gpu::bind(4, params_buf),
+            ], (n.div_ceil(8), 1, 1));
+        }
     }
 
     pub fn fused_silu_gptq_down(
@@ -1288,9 +1304,9 @@ impl Model {
                 let p_q = if self.bf16_mode { &self.state.p_bf16_q } else { &self.state.p_gptq_q };
                 let p_kv = if self.bf16_mode { &self.state.p_bf16_kv } else { &self.state.p_gptq_kv };
                 let p_o = if self.bf16_mode { &self.state.p_bf16_o } else { &self.state.p_gptq_o };
-                self.gptq_matvec(gpu, "qproj",
+                self.gptq_matvec_opt_bias(gpu, "qproj",
                     &self.state.normed, &sa.q_proj_qweight, &sa.q_proj_scales,
-                    &self.state.q_out, q_dim, p_q);
+                    sa.q_bias.as_ref(), &self.state.q_out, q_dim, p_q);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[0]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
@@ -1299,12 +1315,12 @@ impl Model {
                         &self.state.q_out, h, q_dim);
                 }
 
-                self.gptq_matvec(gpu, "kproj",
+                self.gptq_matvec_opt_bias(gpu, "kproj",
                     &self.state.normed, &sa.k_proj_qweight, &sa.k_proj_scales,
-                    &self.state.k_out, kv_dim, p_kv);
-                self.gptq_matvec(gpu, "vproj",
+                    sa.k_bias.as_ref(), &self.state.k_out, kv_dim, p_kv);
+                self.gptq_matvec_opt_bias(gpu, "vproj",
                     &self.state.normed, &sa.v_proj_qweight, &sa.v_proj_scales,
-                    &self.state.v_out, kv_dim, p_kv);
+                    sa.v_bias.as_ref(), &self.state.v_out, kv_dim, p_kv);
                 #[cfg(feature = "jit-lora")]
                 if self.lora.as_ref().map_or(false, |l| l.config.targets[1]) {
                     let lw = &self.lora.as_ref().unwrap().layers[i];
