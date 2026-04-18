@@ -462,6 +462,15 @@ impl Omni25AudioEncoder {
             &enc_params, seq_len, d, out_dim, true);
 
         gpu.flush_and_wait();
+        // Debug: compare final output with HF reference
+        {
+            let out_bytes = gpu.read_buffer(&output, seq_len as u64 * out_dim as u64 * 4);
+            let out_f32: &[f32] = bytemuck::cast_slice(&out_bytes);
+            let norm: f32 = out_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let t0_norm: f32 = out_f32[..out_dim as usize].iter().map(|x| x*x).sum::<f32>().sqrt();
+            log::info!("[omni25-audio] final output: norm={:.2} token[0] norm={:.4} first8={:.4?}",
+                norm, t0_norm, &out_f32[..8]);
+        }
         let total_ms = t0.elapsed().as_millis();
         log::info!("[omni25-audio] encode_mel: {} frames → {} tokens ({total_ms}ms, conv={conv_ms}ms)",
             mel_frames, seq_len);
