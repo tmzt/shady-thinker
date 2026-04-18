@@ -446,6 +446,77 @@ impl InferenceSession {
         Ok(())
     }
 
+    /// Save the full conversation KV state (up to `model.seq_len` tokens).
+    /// Same binary v2 format as prefix cache — the loader doesn't distinguish.
+    pub fn save_session_cache(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let nkv  = self.config.num_key_value_heads as u64;
+        let hd   = self.config.head_dim as u64;
+        let slen = self.model.seq_len as u64;
+
+        let dn_nhv = self.config.linear_num_value_heads as u64;
+        let dn_kd  = self.config.linear_key_head_dim as u64;
+        let dn_vd  = self.config.linear_value_head_dim as u64;
+        let dn_nkh = self.config.linear_num_key_heads as u64;
+        let dn_total_ch = dn_nkh * dn_kd * 2 + dn_nhv * dn_vd;
+
+        let attn_layers = self.model.weights.self_attn_layers.clone();
+        let num_linear  = self.model.state.deltanet_hist.len();
+        let sa_stride   = slen * nkv * hd * 4;
+        let hist_bytes  = 3 * dn_total_ch * 4;
+        let state_bytes = dn_nhv * dn_kd * dn_vd * 4;
+
+        let mut buf = Vec::with_capacity(
+            44 + attn_layers.len() * (4 + 2 * sa_stride as usize)
+               + num_linear * (4 + hist_bytes as usize + state_bytes as usize),
+        );
+
+        buf.write_all(&0xCA5E_CAFE_u32.to_le_bytes())?;
+        buf.write_all(&2_u32.to_le_bytes())?;
+        buf.write_all(&(self.model.seq_len).to_le_bytes())?;
+        buf.write_all(&(attn_layers.len() as u32).to_le_bytes())?;
+        buf.write_all(&(nkv as u32).to_le_bytes())?;
+        buf.write_all(&(hd  as u32).to_le_bytes())?;
+        buf.write_all(&(num_linear as u32).to_le_bytes())?;
+        buf.write_all(&(dn_total_ch as u32).to_le_bytes())?;
+        buf.write_all(&(dn_nhv as u32).to_le_bytes())?;
+        buf.write_all(&(dn_kd  as u32).to_le_bytes())?;
+        buf.write_all(&(dn_vd  as u32).to_le_bytes())?;
+
+        let readback_timeout = std::time::Duration::from_secs(20);
+
+        for &li in &attn_layers {
+            buf.write_all(&(li as u32).to_le_bytes())?;
+            let k = self.gpu.try_read_buffer_offset(&self.model.state.k_cache[li], 0, sa_stride, readback_timeout)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "GPU readback timed out"))?;
+            let v = self.gpu.try_read_buffer_offset(&self.model.state.v_cache[li], 0, sa_stride, readback_timeout)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "GPU readback timed out"))?;
+            buf.write_all(&k)?;
+            buf.write_all(&v)?;
+        }
+
+        let mut lin_idx = 0usize;
+        for layer_idx in 0..self.model.weights.layers.len() {
+            if attn_layers.contains(&layer_idx) { continue; }
+            if lin_idx >= num_linear { break; }
+            buf.write_all(&(layer_idx as u32).to_le_bytes())?;
+            let hist = self.gpu.try_read_buffer_offset(
+                &self.model.state.deltanet_hist[lin_idx], 0, hist_bytes, readback_timeout)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "GPU readback timed out"))?;
+            let state = self.gpu.try_read_buffer_offset(
+                &self.model.state.deltanet_state[lin_idx], 0, state_bytes, readback_timeout)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "GPU readback timed out"))?;
+            buf.write_all(&hist)?;
+            buf.write_all(&state)?;
+            lin_idx += 1;
+        }
+
+        std::fs::write(path, &buf)?;
+        log::info!("[shady-thinker] saved session cache: {} ({} bytes, seq_len={}, {} sa + {} la layers)",
+            path.display(), buf.len(), self.model.seq_len, attn_layers.len(), num_linear);
+        Ok(())
+    }
+
     /// Try to load a prefix cache built by save_prefix_cache().
     /// Returns true and sets prefix_len on success; returns false if the file is
     /// absent, invalid, or has mismatched dimensions.
