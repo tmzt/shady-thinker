@@ -17,6 +17,7 @@ mod shaders {
     pub const BIDIR_ATTN: &str = include_str!("shaders/qwen_asr_bidir_attn.wgsl");
     pub const ADD: &str = include_str!("shaders/add.wgsl");
     pub const CONV1D_GELU_BF16: &str = include_str!("shaders/conv1d_gelu_bf16.wgsl");
+    pub const CONV1D_BF16: &str = include_str!("shaders/conv1d_bf16.wgsl");
 }
 
 /// Audio tower configuration (from config.json audio_config).
@@ -299,7 +300,7 @@ impl Omni25AudioEncoder {
         gpu.write_buffer(&params, 0, bytemuck::cast_slice(&[
             d, d, conv1_out_len, 3u32, 2u32, 1u32, conv2_out_len, 0u32,
         ]));
-        gpu.dispatch("omni_conv2", shaders::CONV1D_GELU_BF16, &[
+        gpu.dispatch("omni_conv2", shaders::CONV1D_BF16, &[
             bind(0, &c1_buf), bind(1, &self.conv2_w), bind(2, &self.conv2_b),
             bind(3, &c2_buf), bind(4, &params),
         ], ((d * conv2_out_len).div_ceil(256), 1, 1));
@@ -344,6 +345,15 @@ impl Omni25AudioEncoder {
                 transposed[t * d as usize + ch] = c2_f32[ch * seq_len as usize + t];
             }
         }
+        // Debug: conv2 output comparison with HF reference
+        {
+            let norm: f32 = transposed.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let t0 = &transposed[0..8.min(d as usize)];
+            let t0_norm: f32 = transposed[..d as usize].iter().map(|x| x*x).sum::<f32>().sqrt();
+            log::info!("[omni25-audio] conv2 transposed: norm={:.2} token[0] norm={:.4} first8={:.6?}",
+                norm, t0_norm, t0);
+        }
+
         // Sinusoidal positional encoding (matches HF SinusoidsPositionEmbedding)
         {
             let max_timescale: f32 = 10000.0;
