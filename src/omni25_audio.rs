@@ -344,9 +344,22 @@ impl Omni25AudioEncoder {
                 transposed[t * d as usize + ch] = c2_f32[ch * seq_len as usize + t];
             }
         }
+        // Sinusoidal positional encoding (matches HF SinusoidsPositionEmbedding)
+        {
+            let max_timescale: f32 = 10000.0;
+            let channels = d as usize;
+            let half = channels / 2;
+            let log_inc = (max_timescale.ln()) / (half as f32 - 1.0);
+            for t in 0..seq_len as usize {
+                for c in 0..half {
+                    let inv_ts = (-log_inc * c as f32).exp();
+                    let angle = t as f32 * inv_ts;
+                    transposed[t * d as usize + c] += angle.sin();
+                    transposed[t * d as usize + half + c] += angle.cos();
+                }
+            }
+        }
         let x_cur = gpu.upload_buffer("omni_enc_x", bytemuck::cast_slice(&transposed));
-
-        // TODO: add sinusoidal positional encoding (Whisper-style)
 
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
@@ -393,6 +406,26 @@ impl Omni25AudioEncoder {
                 log::info!("[omni25-audio] transformer layer {}/{}", layer_idx + 1, self.layers.len());
             }
         }
+
+        // ── AvgPool1d(2, stride=2): reduce seq_len by 2x ──
+        // Pool along the time dimension: output[t, d] = (input[2t, d] + input[2t+1, d]) / 2
+        let pooled_len = seq_len / 2;
+        {
+            gpu.flush_and_wait();
+            let x_bytes = gpu.read_buffer(&x_cur, (seq_len * d) as u64 * 4);
+            let x_f32: &[f32] = bytemuck::cast_slice(&x_bytes);
+            let mut pooled = vec![0f32; (pooled_len * d) as usize];
+            for t in 0..pooled_len as usize {
+                for c in 0..d as usize {
+                    let a = x_f32[t * 2 * d as usize + c];
+                    let b = x_f32[(t * 2 + 1) * d as usize + c];
+                    pooled[t * d as usize + c] = (a + b) * 0.5;
+                }
+            }
+            gpu.write_buffer(&x_cur, 0, bytemuck::cast_slice(&pooled));
+        }
+        let seq_len = pooled_len;
+        log::info!("[omni25-audio] avg_pool: {} → {} tokens", pooled_len * 2, seq_len);
 
         // ── Final LayerNorm + output projection ──
         dispatch_layernorm(gpu, &x_cur, &self.ln_post_w, &self.ln_post_b,
