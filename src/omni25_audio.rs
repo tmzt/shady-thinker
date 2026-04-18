@@ -10,6 +10,15 @@ use std::path::Path;
 use safetensors::SafeTensors;
 use crate::gpu::GpuContext;
 
+/// Convert BF16 raw bytes to f32 bytes for shaders that read f32.
+fn bf16_bytes_to_f32(data: &[u8]) -> Vec<u8> {
+    let bf16: &[u16] = bytemuck::cast_slice(data);
+    let f32_vals: Vec<f32> = bf16.iter()
+        .map(|&bits| f32::from_bits((bits as u32) << 16))
+        .collect();
+    bytemuck::cast_slice(&f32_vals).to_vec()
+}
+
 mod shaders {
     pub const BF16_GEMM: &str = include_str!("shaders/bf16_gemm.wgsl");
     pub const LAYERNORM: &str = include_str!("shaders/layernorm.wgsl");
@@ -171,15 +180,15 @@ impl Omni25AudioEncoder {
 
         // Final layer norm
         let ln_post_w = gpu.upload_buffer("omni_ln_post_w",
-            get_tensor("thinker.audio_tower.ln_post.weight"));
+            &bf16_bytes_to_f32(get_tensor("thinker.audio_tower.ln_post.weight")));
         let ln_post_b = gpu.upload_buffer("omni_ln_post_b",
-            get_tensor("thinker.audio_tower.ln_post.bias"));
+            &bf16_bytes_to_f32(get_tensor("thinker.audio_tower.ln_post.bias")));
 
         // Output projection
         let proj_w = gpu.upload_buffer("omni_proj_w",
             get_tensor("thinker.audio_tower.proj.weight"));
         let proj_b = gpu.upload_buffer("omni_proj_b",
-            get_tensor("thinker.audio_tower.proj.bias"));
+            &bf16_bytes_to_f32(get_tensor("thinker.audio_tower.proj.bias")));
 
         // Audio BOS/EOS embeddings
         let audio_bos_eos = gpu.upload_buffer("omni_audio_bos_eos",
@@ -200,30 +209,30 @@ impl Omni25AudioEncoder {
                 get_tensor(&format!("{prefix}.self_attn.out_proj.weight")));
 
             let bq = gpu.upload_buffer(&format!("omni_l{i}_bq"),
-                get_tensor(&format!("{prefix}.self_attn.q_proj.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.self_attn.q_proj.bias"))));
             let bv = gpu.upload_buffer(&format!("omni_l{i}_bv"),
-                get_tensor(&format!("{prefix}.self_attn.v_proj.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.self_attn.v_proj.bias"))));
             let bo = gpu.upload_buffer(&format!("omni_l{i}_bo"),
-                get_tensor(&format!("{prefix}.self_attn.out_proj.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.self_attn.out_proj.bias"))));
 
             let attn_norm_w = gpu.upload_buffer(&format!("omni_l{i}_an_w"),
-                get_tensor(&format!("{prefix}.self_attn_layer_norm.weight")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.self_attn_layer_norm.weight"))));
             let attn_norm_b = gpu.upload_buffer(&format!("omni_l{i}_an_b"),
-                get_tensor(&format!("{prefix}.self_attn_layer_norm.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.self_attn_layer_norm.bias"))));
 
             let fc1 = gpu.upload_buffer(&format!("omni_l{i}_fc1"),
                 get_tensor(&format!("{prefix}.fc1.weight")));
             let fc2 = gpu.upload_buffer(&format!("omni_l{i}_fc2"),
                 get_tensor(&format!("{prefix}.fc2.weight")));
             let fc1_bias = gpu.upload_buffer(&format!("omni_l{i}_fc1b"),
-                get_tensor(&format!("{prefix}.fc1.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.fc1.bias"))));
             let fc2_bias = gpu.upload_buffer(&format!("omni_l{i}_fc2b"),
-                get_tensor(&format!("{prefix}.fc2.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.fc2.bias"))));
 
             let ffn_norm_w = gpu.upload_buffer(&format!("omni_l{i}_fn_w"),
-                get_tensor(&format!("{prefix}.final_layer_norm.weight")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.final_layer_norm.weight"))));
             let ffn_norm_b = gpu.upload_buffer(&format!("omni_l{i}_fn_b"),
-                get_tensor(&format!("{prefix}.final_layer_norm.bias")));
+                &bf16_bytes_to_f32(get_tensor(&format!("{prefix}.final_layer_norm.bias"))));
 
             layers.push(AudioLayer {
                 wq, wk, wv, wo, bq, bv, bo,
@@ -411,9 +420,14 @@ impl Omni25AudioEncoder {
             // 12. Residual add
             dispatch_add(gpu, &x_cur, &ffn_out, &enc_params, seq_len * d);
 
-            if (layer_idx + 1) % 8 == 0 {
+            if (layer_idx + 1) % 8 == 0 || layer_idx == 0 {
                 gpu.flush_and_wait();
-                log::info!("[omni25-audio] transformer layer {}/{}", layer_idx + 1, self.layers.len());
+                let dbg = gpu.read_buffer(&x_cur, (seq_len * d) as u64 * 4);
+                let dbg_f32: &[f32] = bytemuck::cast_slice(&dbg);
+                let norm: f32 = dbg_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
+                let t0: &[f32] = &dbg_f32[..8.min(d as usize)];
+                log::info!("[omni25-audio] layer {}/{}: norm={:.2} token[0] first4={:.4?}",
+                    layer_idx + 1, self.layers.len(), norm, &t0[..4]);
             }
         }
 
