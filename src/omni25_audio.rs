@@ -421,14 +421,9 @@ impl Omni25AudioEncoder {
             // 12. Residual add
             dispatch_add(gpu, &x_cur, &ffn_out, &enc_params, seq_len * d);
 
-            if (layer_idx + 1) % 8 == 0 || layer_idx == 0 {
+            if (layer_idx + 1) % 8 == 0 {
                 gpu.flush_and_wait();
-                let dbg = gpu.read_buffer(&x_cur, (seq_len * d) as u64 * 4);
-                let dbg_f32: &[f32] = bytemuck::cast_slice(&dbg);
-                let norm: f32 = dbg_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
-                let t0: &[f32] = &dbg_f32[..8.min(d as usize)];
-                log::info!("[omni25-audio] layer {}/{}: norm={:.2} token[0] first4={:.4?}",
-                    layer_idx + 1, self.layers.len(), norm, &t0[..4]);
+                log::info!("[omni25-audio] transformer layer {}/{}", layer_idx + 1, self.layers.len());
             }
         }
 
@@ -463,15 +458,6 @@ impl Omni25AudioEncoder {
             &enc_params, seq_len, d, out_dim, true);
 
         gpu.flush_and_wait();
-        // Debug: compare final output with HF reference
-        {
-            let out_bytes = gpu.read_buffer(&output, seq_len as u64 * out_dim as u64 * 4);
-            let out_f32: &[f32] = bytemuck::cast_slice(&out_bytes);
-            let norm: f32 = out_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let t0_norm: f32 = out_f32[..out_dim as usize].iter().map(|x| x*x).sum::<f32>().sqrt();
-            log::info!("[omni25-audio] final output: norm={:.2} token[0] norm={:.4} first8={:.4?}",
-                norm, t0_norm, &out_f32[..8]);
-        }
         let total_ms = t0.elapsed().as_millis();
         log::info!("[omni25-audio] encode_mel: {} frames → {} tokens ({total_ms}ms, conv={conv_ms}ms)",
             mel_frames, seq_len);
