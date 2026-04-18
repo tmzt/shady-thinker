@@ -429,6 +429,97 @@ fn is_self_attn_layer(tensor_map: &HashMap<String, wgpu::Buffer>, prefix: &str, 
     tensor_map.contains_key(&qkey) || tensor_map.contains_key(&wkey)
 }
 
+/// Reorder GPTQ qweight rows using g_idx inverse permutation.
+/// This converts desc_act layout to sequential group layout so the shader
+/// can use `row / group_size` instead of g_idx lookup.
+///
+/// qweight: [packed_rows, N] as int32 (8 int4 values per int32, column-major packing)
+/// g_idx: [in_features] mapping each input row to its group
+/// Returns reordered qweight bytes.
+fn permute_qweight_by_g_idx(qweight: &[u8], g_idx: &[i32], in_features: usize, out_features: usize) -> Vec<u8> {
+    let packed_rows = in_features / 8;
+
+    // Build inverse permutation: sort rows by (group, position within group)
+    let mut perm: Vec<usize> = (0..in_features).collect();
+    perm.sort_by_key(|&i| (g_idx[i], i));
+
+    // Repack qweight with permuted row order
+    // Original layout: qweight[packed_row][col] where packed_row packs 8 consecutive rows
+    // We need to unpack all nibbles, permute, then repack
+    let qw: &[u32] = bytemuck::cast_slice(qweight);
+    let mut unpacked = vec![0u8; in_features * out_features]; // nibble values
+
+    // Unpack: qw[packed_row * out_features + col] contains 8 nibbles for rows [packed_row*8..packed_row*8+8]
+    for pr in 0..packed_rows {
+        for col in 0..out_features {
+            let packed = qw[pr * out_features + col];
+            for bit in 0..8 {
+                let row = pr * 8 + bit;
+                let nibble = ((packed >> (bit * 4)) & 0xF) as u8;
+                unpacked[row * out_features + col] = nibble;
+            }
+        }
+    }
+
+    // Permute rows
+    let mut permuted = vec![0u8; in_features * out_features];
+    for (new_row, &old_row) in perm.iter().enumerate() {
+        for col in 0..out_features {
+            permuted[new_row * out_features + col] = unpacked[old_row * out_features + col];
+        }
+    }
+
+    // Repack into int32
+    let mut result = vec![0u32; packed_rows * out_features];
+    for pr in 0..packed_rows {
+        for col in 0..out_features {
+            let mut packed = 0u32;
+            for bit in 0..8 {
+                let row = pr * 8 + bit;
+                packed |= (permuted[row * out_features + col] as u32) << (bit * 4);
+            }
+            result[pr * out_features + col] = packed;
+        }
+    }
+
+    bytemuck::cast_slice(&result).to_vec()
+}
+
+/// Reorder scales to match sequential group layout after g_idx permutation.
+/// scales: [num_groups, out_features] as f16
+/// g_idx: [in_features] — after sorting by g_idx, groups are sequential
+/// group_size: quantization group size
+fn permute_scales_by_g_idx(scales: &[u8], g_idx: &[i32], in_features: usize, out_features: usize, group_size: usize) -> Vec<u8> {
+    let num_groups = (in_features + group_size - 1) / group_size;
+    let scale_f16: &[u16] = bytemuck::cast_slice(scales);
+
+    // Build group order: sort rows, then the group at position [new_group] was originally [old_group]
+    let mut perm: Vec<usize> = (0..in_features).collect();
+    perm.sort_by_key(|&i| (g_idx[i], i));
+
+    // Map: new_group → old_group
+    let mut group_map = vec![0usize; num_groups];
+    for new_group in 0..num_groups {
+        let representative_row = new_group * group_size;
+        if representative_row < perm.len() {
+            group_map[new_group] = g_idx[perm[representative_row]] as usize;
+        }
+    }
+
+    // Reorder scale rows
+    let mut result = vec![0u16; num_groups * out_features];
+    for new_g in 0..num_groups {
+        let old_g = group_map[new_g];
+        if old_g < num_groups {
+            for col in 0..out_features {
+                result[new_g * out_features + col] = scale_f16[old_g * out_features + col];
+            }
+        }
+    }
+
+    bytemuck::cast_slice(&result).to_vec()
+}
+
 /// Dequantize GPTQ INT4 symmetric weights to BF16 bytes.
 /// Matches the GPU shader convention: `f32(nibble) - 8.0` × scale.
 /// qweight: [packed_rows, N] as u32 (8 int4 per u32, row-major)
@@ -551,6 +642,20 @@ pub fn load_weights(
             }
         }
 
+        // Collect g_idx for desc_act permutation
+        let mut g_idx_map: HashMap<String, Vec<i32>> = HashMap::new();
+        for (name, view) in tensors.tensors() {
+            if name.ends_with(".g_idx") {
+                let data = view.data();
+                let idx: Vec<i32> = data.chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                // Key: strip .g_idx suffix to get the proj prefix
+                let proj_key = name.strip_suffix(".g_idx").unwrap_or(&name).to_string();
+                g_idx_map.insert(proj_key, idx);
+            }
+        }
+
         for (name, view) in tensors.tensors() {
             if name.ends_with(".qzeros") || name.ends_with(".g_idx") {
                 continue;
@@ -591,7 +696,35 @@ pub fn load_weights(
                 oversized_raw.insert(name.to_string(), bytes.to_vec());
                 continue;
             }
-            let buffer = gpu.upload_buffer(&name, bytes);
+            // Apply g_idx permutation for desc_act GPTQ models
+            let bytes = if name.ends_with(".qweight") || name.ends_with(".scales") {
+                let proj_key = if name.ends_with(".qweight") {
+                    name.strip_suffix(".qweight").unwrap()
+                } else {
+                    name.strip_suffix(".scales").unwrap()
+                };
+                if let Some(g_idx) = g_idx_map.get(proj_key) {
+                    let in_features = g_idx.len();
+                    // Infer out_features from tensor size
+                    if name.ends_with(".qweight") {
+                        let packed_rows = in_features / 8;
+                        let out_features = bytes.len() / (packed_rows * 4);
+                        let permuted = permute_qweight_by_g_idx(bytes, g_idx, in_features, out_features);
+                        std::borrow::Cow::Owned(permuted)
+                    } else {
+                        // scales: [num_groups, out_features] as f16
+                        let num_groups = (in_features + 127) / 128; // group_size=128
+                        let out_features = bytes.len() / (num_groups * 2);
+                        let permuted = permute_scales_by_g_idx(bytes, g_idx, in_features, out_features, 128);
+                        std::borrow::Cow::Owned(permuted)
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(bytes)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(bytes)
+            };
+            let buffer = gpu.upload_buffer(&name, &bytes);
             tensor_map.insert(name.to_string(), buffer);
         }
     }
