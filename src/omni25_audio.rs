@@ -310,25 +310,181 @@ impl Omni25AudioEncoder {
         log::info!("[omni25-audio] conv stem: {} frames → {} tokens (conv1={conv1_ms}ms total={conv_ms}ms)",
             mel_frames, seq_len);
 
-        // TODO: transformer layers (32 layers of bidirectional self-attention)
-        // For now, skip transformer — output conv2 result directly through ln_post + proj
+        // ── Transformer layers (32 layers of bidirectional self-attention) ──
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
+        let ffn_dim = self.config.ffn_dim;
 
-        // ln_post: layernorm over [seq_len, d_model]
-        // proj: linear [d_model → output_dim]
-        // These project conv output to thinker hidden size
+        let buf_size = (seq_len * d) as u64 * 4;
+        let x_norm = gpu.create_storage_buffer("omni_enc_xn", buf_size);
+        let q_buf = gpu.create_storage_buffer("omni_enc_q", buf_size);
+        let k_buf = gpu.create_storage_buffer("omni_enc_k", buf_size);
+        let v_buf = gpu.create_storage_buffer("omni_enc_v", buf_size);
+        let attn_out = gpu.create_storage_buffer("omni_enc_attn", buf_size);
+        let o_out = gpu.create_storage_buffer("omni_enc_o", buf_size);
+        let ffn_size = (seq_len * ffn_dim) as u64 * 4;
+        let ffn_mid = gpu.create_storage_buffer("omni_enc_ffn1", ffn_size);
+        let ffn_act = gpu.create_storage_buffer("omni_enc_ffn2", ffn_size);
+        let ffn_out = gpu.create_storage_buffer("omni_enc_ffno", buf_size);
+        let enc_params = gpu.create_buffer("omni_enc_p", 64,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
-        // For now, just output conv2 result reshaped + projected
-        // The transformer layers are needed for quality but the pipeline works without them
-        let output = gpu.create_storage_buffer(
-            "omni_audio_output",
-            seq_len as u64 * out_dim as u64 * 4,
-        );
+        // Dummy bias for k_proj (which has no bias in Omni)
+        let dummy_bias = gpu.create_storage_buffer("omni_enc_dummy", d as u64 * 2);
 
-        // TODO: run transformer layers + ln_post + proj
-        // Placeholder: output zeros (transformer not implemented yet)
-        log::info!("[omni25-audio] encode_mel: {} frames → {} tokens ({:.0}ms) [transformer TODO]",
-            mel_frames, seq_len, t0.elapsed().as_secs_f64() * 1000.0);
+        // Conv2 output needs to be reshaped from [d_model, seq_len] to [seq_len, d_model]
+        // TODO: add transpose shader or handle layout in GEMM
+        // For now: read back and re-upload transposed
+        gpu.flush_and_wait();
+        let c2_bytes = gpu.read_buffer(&c2_buf, (d * seq_len) as u64 * 4);
+        let c2_f32: &[f32] = bytemuck::cast_slice(&c2_bytes);
+        let mut transposed = vec![0f32; (seq_len * d) as usize];
+        for ch in 0..d as usize {
+            for t in 0..seq_len as usize {
+                transposed[t * d as usize + ch] = c2_f32[ch * seq_len as usize + t];
+            }
+        }
+        let x_cur = gpu.upload_buffer("omni_enc_x", bytemuck::cast_slice(&transposed));
+
+        // TODO: add sinusoidal positional encoding (Whisper-style)
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+
+            // 1. LayerNorm
+            dispatch_layernorm(gpu, &x_cur, &layer.attn_norm_w, &layer.attn_norm_b,
+                &x_norm, &enc_params, seq_len, d);
+
+            // 2-4. Q/K/V projections (k has no bias)
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wq, &layer.bq, &q_buf,
+                &enc_params, seq_len, d, d, true);
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wk, &dummy_bias, &k_buf,
+                &enc_params, seq_len, d, d, false);
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.wv, &layer.bv, &v_buf,
+                &enc_params, seq_len, d, d, true);
+
+            // 5. Bidirectional attention (full sequence, no window)
+            dispatch_bidir_attn(gpu, &q_buf, &k_buf, &v_buf, &attn_out,
+                &enc_params, seq_len, num_heads, head_dim, 0, seq_len);
+
+            // 6. Output projection
+            dispatch_bf16_gemm(gpu, &attn_out, &layer.wo, &layer.bo, &o_out,
+                &enc_params, seq_len, d, d, true);
+
+            // 7. Residual add
+            dispatch_add(gpu, &x_cur, &o_out, &enc_params, seq_len * d);
+
+            // 8. FFN LayerNorm
+            dispatch_layernorm(gpu, &x_cur, &layer.ffn_norm_w, &layer.ffn_norm_b,
+                &x_norm, &enc_params, seq_len, d);
+
+            // 9-11. FFN: fc1 + GELU + fc2
+            dispatch_bf16_gemm(gpu, &x_norm, &layer.fc1, &layer.fc1_bias, &ffn_mid,
+                &enc_params, seq_len, d, ffn_dim, true);
+            dispatch_gelu(gpu, &ffn_mid, &ffn_act, &enc_params, seq_len * ffn_dim);
+            dispatch_bf16_gemm(gpu, &ffn_act, &layer.fc2, &layer.fc2_bias, &ffn_out,
+                &enc_params, seq_len, ffn_dim, d, true);
+
+            // 12. Residual add
+            dispatch_add(gpu, &x_cur, &ffn_out, &enc_params, seq_len * d);
+
+            if (layer_idx + 1) % 8 == 0 {
+                gpu.flush_and_wait();
+                log::info!("[omni25-audio] transformer layer {}/{}", layer_idx + 1, self.layers.len());
+            }
+        }
+
+        // ── Final LayerNorm + output projection ──
+        dispatch_layernorm(gpu, &x_cur, &self.ln_post_w, &self.ln_post_b,
+            &x_norm, &enc_params, seq_len, d);
+
+        // proj: [d_model → output_dim] linear
+        let output = gpu.create_storage_buffer("omni_audio_output",
+            seq_len as u64 * out_dim as u64 * 4);
+        dispatch_bf16_gemm(gpu, &x_norm, &self.proj_w, &self.proj_b, &output,
+            &enc_params, seq_len, d, out_dim, true);
+
+        gpu.flush_and_wait();
+        let total_ms = t0.elapsed().as_millis();
+        log::info!("[omni25-audio] encode_mel: {} frames → {} tokens ({total_ms}ms, conv={conv_ms}ms)",
+            mel_frames, seq_len);
 
         (output, seq_len)
     }
+}
+
+// ── GPU dispatch helpers (shared with asr_encoder) ──────────────────────
+
+fn dispatch_layernorm(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer, seq_len: u32, dim: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32, eps: f32, seq_len: u32, _pad: u32 }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n: dim, eps: 1e-5, seq_len, _pad: 0 }));
+    gpu.dispatch("layernorm", shaders::LAYERNORM, &[
+        bind(0, input), bind(1, weight), bind(2, bias), bind(3, output), bind(4, params),
+    ], (seq_len, 1, 1));
+}
+
+fn dispatch_bf16_gemm(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer,
+    seq_len: u32, d_in: u32, d_out: u32, has_bias: bool,
+) {
+    use crate::gpu::bind;
+    #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { d_in: u32, d_out: u32, seq_len: u32, has_bias: u32 }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { d_in, d_out, seq_len, has_bias: has_bias as u32 }));
+    gpu.dispatch("bf16_gemm", shaders::BF16_GEMM, &[
+        bind(0, input), bind(1, weight), bind(2, bias), bind(3, output), bind(4, params),
+    ], (d_out.div_ceil(32), seq_len, 1));
+}
+
+fn dispatch_bidir_attn(
+    gpu: &mut GpuContext, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer,
+    output: &wgpu::Buffer, params: &wgpu::Buffer,
+    seq_len: u32, num_heads: u32, head_dim: u32, window_start: u32, window_end: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { seq_len: u32, head_dim: u32, num_heads: u32, win_s: u32, win_e: u32, _p: [u32; 3] }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P {
+        seq_len, head_dim, num_heads, win_s: window_start, win_e: window_end, _p: [0; 3],
+    }));
+    gpu.dispatch("bidir_attn", shaders::BIDIR_ATTN, &[
+        bind(0, q), bind(1, k), bind(2, v), bind(3, output), bind(4, params),
+    ], (num_heads, seq_len, 1));
+}
+
+fn dispatch_gelu(
+    gpu: &mut GpuContext, input: &wgpu::Buffer, output: &wgpu::Buffer,
+    params: &wgpu::Buffer, n: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32, _p: [u32; 3] }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n, _p: [0; 3] }));
+    gpu.dispatch("gelu", shaders::GELU_MUL, &[
+        bind(0, input), bind(1, output), bind(2, params),
+    ], (n.div_ceil(256), 1, 1));
+}
+
+fn dispatch_add(
+    gpu: &mut GpuContext, a: &wgpu::Buffer, b: &wgpu::Buffer,
+    params: &wgpu::Buffer, n: u32,
+) {
+    use crate::gpu::bind;
+    #[repr(C)] #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+    struct P { n: u32, _p: [u32; 3] }
+    gpu.flush();
+    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P { n, _p: [0; 3] }));
+    gpu.dispatch("add", shaders::ADD, &[
+        bind(0, a), bind(1, b), bind(2, params),
+    ], (n.div_ceil(256), 1, 1));
 }
