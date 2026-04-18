@@ -397,6 +397,9 @@ pub struct RawNormWeights {
 
 fn detect_layer_prefix(tensor_map: &HashMap<String, wgpu::Buffer>) -> String {
     for name in tensor_map.keys() {
+        if name.starts_with("thinker.model.layers.0.") {
+            return "thinker.model.layers".to_string();
+        }
         if name.starts_with("model.language_model.layers.0.") {
             return "model.language_model.layers".to_string();
         }
@@ -409,7 +412,9 @@ fn detect_layer_prefix(tensor_map: &HashMap<String, wgpu::Buffer>) -> String {
 
 fn detect_model_prefix(tensor_map: &HashMap<String, wgpu::Buffer>, oversized_raw: &HashMap<String, Vec<u8>>) -> (&'static str, &'static str, &'static str) {
     let has_key = |k: &str| tensor_map.contains_key(k) || oversized_raw.contains_key(k);
-    if has_key("model.language_model.embed_tokens.weight") {
+    if has_key("thinker.model.embed_tokens.weight") {
+        ("thinker.model.embed_tokens.weight", "thinker.model.norm.weight", "thinker.lm_head")
+    } else if has_key("model.language_model.embed_tokens.weight") {
         ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "model.language_model.lm_head")
     } else {
         ("model.embed_tokens.weight", "model.norm.weight", "lm_head")
@@ -550,6 +555,14 @@ pub fn load_weights(
             if name.ends_with(".qzeros") || name.ends_with(".g_idx") {
                 continue;
             }
+            // Skip non-thinker tensors (talker, token2wav, visual) for Omni models
+            if (name.starts_with("talker.") || name.starts_with("token2wav.") || name.starts_with("thinker.visual.")) {
+                continue;
+            }
+            // Skip audio tower — loaded separately by omni25_audio
+            if name.starts_with("thinker.audio_tower.") {
+                continue;
+            }
             // Skip quantized in_proj_a/b — already dequantized above
             if (name.ends_with(".in_proj_a.qweight") || name.ends_with(".in_proj_a.scales")
                 || name.ends_with(".in_proj_b.qweight") || name.ends_with(".in_proj_b.scales"))
@@ -618,6 +631,9 @@ pub fn load_weights(
     fn take(map: &mut HashMap<String, wgpu::Buffer>, name: &str) -> wgpu::Buffer {
         map.remove(name).unwrap_or_else(|| panic!("missing tensor: {name}"))
     }
+    fn try_take(map: &mut HashMap<String, wgpu::Buffer>, name: &str) -> Option<wgpu::Buffer> {
+        map.remove(name)
+    }
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
     let mut norm_weights = Vec::with_capacity(config.num_hidden_layers as usize);
@@ -636,8 +652,10 @@ pub fn load_weights(
                 v_proj_scales: take(&mut tensor_map, &format!("{pfx}.self_attn.v_proj.scales")),
                 o_proj_qweight: take(&mut tensor_map, &format!("{pfx}.self_attn.o_proj.qweight")),
                 o_proj_scales: take(&mut tensor_map, &format!("{pfx}.self_attn.o_proj.scales")),
-                q_norm: take(&mut tensor_map, &format!("{pfx}.self_attn.q_norm.weight")),
-                k_norm: take(&mut tensor_map, &format!("{pfx}.self_attn.k_norm.weight")),
+                q_norm: try_take(&mut tensor_map, &format!("{pfx}.self_attn.q_norm.weight"))
+                    .unwrap_or_else(|| gpu.upload_buffer("qn_z", &vec![0u8; config.head_dim as usize * 2])),
+                k_norm: try_take(&mut tensor_map, &format!("{pfx}.self_attn.k_norm.weight"))
+                    .unwrap_or_else(|| gpu.upload_buffer("kn_z", &vec![0u8; config.head_dim as usize * 2])),
             })
         } else {
             // Merge in_proj_a + in_proj_b into ab_weight (concat raw BF16 bytes)
