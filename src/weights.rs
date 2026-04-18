@@ -354,6 +354,42 @@ impl Default for QuantConfig {
     }
 }
 
+/// Detect weight format from the safetensor metadata.
+/// Returns "bf16" if model has .weight but no .qweight tensors,
+/// "gptq" if .qweight/.scales present, "mlx_int4" if MLX format.
+pub fn detect_weight_format(model_dir: &Path) -> String {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if let Ok(data) = std::fs::read_to_string(&index_path) {
+        if let Ok(idx) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(map) = idx.get("weight_map").and_then(|v| v.as_object()) {
+                let has_qweight = map.keys().any(|k| k.ends_with(".qweight"));
+                if has_qweight {
+                    return "gptq".to_string();
+                }
+                return "bf16".to_string();
+            }
+        }
+    }
+    // Single shard — check tensor names directly
+    let mut shard_files: Vec<_> = std::fs::read_dir(model_dir)
+        .into_iter().flatten().flatten()
+        .filter(|e| e.path().extension().map_or(false, |x| x == "safetensors"))
+        .filter(|e| !e.path().to_string_lossy().contains(".index."))
+        .map(|e| e.path())
+        .collect();
+    shard_files.sort();
+    if let Some(path) = shard_files.first() {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(st) = SafeTensors::deserialize(&data) {
+                let has_qweight = st.names().iter().any(|n| n.ends_with(".qweight"));
+                if has_qweight { return "gptq".to_string(); }
+                return "bf16".to_string();
+            }
+        }
+    }
+    "gptq".to_string() // fallback
+}
+
 /// Raw norm weight bytes per layer for QK norm uniform initialization
 pub struct RawNormWeights {
     pub layers: Vec<Option<(Vec<u8>, Vec<u8>)>>, // Some((q_norm, k_norm)) for self-attn layers

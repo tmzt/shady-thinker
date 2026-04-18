@@ -141,24 +141,30 @@ impl InferenceSession {
 
         log::info!("[shady-thinker] step 1/6: reading config.json");
         let config = weights::ModelConfig::from_file(&model_dir.join("config.json"));
-        log::info!("[shady-thinker] step 2/6: reading quantize_config.json");
-        let quant_config =
-            weights::QuantConfig::from_file(&model_dir.join("quantize_config.json"));
-        log::info!("[shady-thinker] config: {} layers, {} heads, dim={}, bits={}, group_size={} ({:.1}s)",
+        log::info!("[shady-thinker] step 2/6: detecting weight format");
+        let weight_format = weights::detect_weight_format(&model_dir);
+        let quant_config = if weight_format == "bf16" {
+            log::info!("[shady-thinker] detected BF16 weights");
+            weights::QuantConfig { bits: 16, group_size: 0, quant_method: "bf16".to_string(), sym: false }
+        } else {
+            weights::QuantConfig::from_file(&model_dir.join("quantize_config.json"))
+        };
+        log::info!("[shady-thinker] config: {} layers, {} heads, dim={}, format={}, bits={} ({:.1}s)",
             config.num_hidden_layers, config.num_attention_heads, config.hidden_size,
-            quant_config.bits, quant_config.group_size, t0.elapsed().as_secs_f32());
+            weight_format, quant_config.bits, t0.elapsed().as_secs_f32());
 
         log::info!("[shady-thinker] step 3/6: creating GPU context");
         let mut gpu = GpuContext::new();
         log::info!("[shady-thinker] GPU context ready ({:.1}s)", t0.elapsed().as_secs_f32());
 
-        // Pipeline cache disabled: loading from disk makes PowerVR re-JIT all dispatches
-        // in sequence (slow path), while no-cache lets the driver batch-compile during warmup
-        // and keep the compiled kernels hot in GPU memory for the entire session.
-        let _ = shader_cache_key; // still used by prefix_cache_path hash
+        let _ = shader_cache_key;
 
         log::info!("[shady-thinker] step 4/6: loading weights from safetensors");
-        let (model_weights, raw_norms) = weights::load_weights(&gpu, &model_dir, &config);
+        let (model_weights, raw_norms) = if weight_format == "bf16" {
+            weights::load_weights_bf16(&gpu, &model_dir, &config)
+        } else {
+            weights::load_weights(&gpu, &model_dir, &config)
+        };
         log::info!("[shady-thinker] weights loaded ({:.1}s)", t0.elapsed().as_secs_f32());
 
         log::info!("[shady-thinker] step 5/6: creating model pipeline");
