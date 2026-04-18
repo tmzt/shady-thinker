@@ -312,18 +312,16 @@ impl ModelConfig {
             if let Some(theta) = rp.rope_theta {
                 config.rope_theta = theta;
             }
-            // Compute partial_rotary_factor and section limits from mrope_section
+            // Compute section limits from mrope_section (pairs per section)
             if !rp.mrope_section.is_empty() && config.head_dim > 0 {
-                let rotary_dims: u32 = rp.mrope_section.iter().sum();
-                config.partial_rotary_factor = rotary_dims as f32 / config.head_dim as f32;
-                // Section limits in pairs (dim/2) for the RoPE shader
+                // mrope_section values are already in pairs
                 if rp.mrope_section.len() >= 2 {
-                    config.mrope_s1_limit = rp.mrope_section[0] / 2;
-                    config.mrope_s2_limit = (rp.mrope_section[0] + rp.mrope_section[1]) / 2;
+                    config.mrope_s1_limit = rp.mrope_section[0];
+                    config.mrope_s2_limit = rp.mrope_section[0] + rp.mrope_section[1];
                 }
-                log::info!("[config] mrope_section={:?} → partial_rotary_factor={}, s1={}, s2={}",
-                    rp.mrope_section, config.partial_rotary_factor,
-                    config.mrope_s1_limit, config.mrope_s2_limit);
+                log::info!("[config] mrope_section={:?} → s1={}, s2={}, partial_rotary_factor={}",
+                    rp.mrope_section, config.mrope_s1_limit, config.mrope_s2_limit,
+                    config.partial_rotary_factor);
             }
         }
         config
