@@ -114,6 +114,25 @@ fn build_gqa_shader(q_gated: bool) -> String {
 
 /// Build the batched Q_GATED qknorm+RoPE+KV-store shader for GPTQ prefill.
 /// Injects ROPE_THETA, MROPE limits, PARTIAL_DIM, MROPE_INTERLEAVED, NORM_OFFSET.
+/// Build the batched qknorm+RoPE shader for non-gated Q (Qwen2.5).
+fn build_batched_qknorm_shader(config: &ModelConfig) -> String {
+    let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
+    let interleaved = config.mrope_interleaved();
+    format!(
+        "const ROPE_THETA: f32 = {:.1};\n\
+         const PARTIAL_DIM: u32 = {}u;\n\
+         const MROPE_INTERLEAVED: bool = {};\n\n{}",
+        config.rope_theta,
+        partial_dim,
+        interleaved,
+        include_str!("shaders/batched_qknorm_rope.wgsl")
+            .lines()
+            .skip(12) // skip 9 comment lines + 3 const lines
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn build_batched_qknorm_shader_gated(config: &ModelConfig) -> String {
     let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
     let interleaved = config.mrope_interleaved();
@@ -287,7 +306,7 @@ pub struct Model {
     /// GQA attention shader source with Q_GATED sigmoid fusion baked in.
     gqa_shader_src: String,
     /// Batched Q_GATED qknorm+RoPE shader for GPTQ prefill.
-    batched_qknorm_gated_src: String,
+    batched_qknorm_src: String,
     linear_num_key_heads: u32,
     linear_key_dim: u32,
     linear_value_dim: u32,
@@ -679,7 +698,11 @@ impl Model {
         let qknorm_shader_src = build_qknorm_shader(&config);
         let q_gated = config.attn_output_gate;
         let gqa_shader_src = build_gqa_shader(q_gated);
-        let batched_qknorm_gated_src = build_batched_qknorm_shader_gated(&config);
+        let batched_qknorm_src = if q_gated {
+            build_batched_qknorm_shader_gated(&config)
+        } else {
+            build_batched_qknorm_shader(&config)
+        };
         let vocab_size_for_bitmap = config.vocab_size;
 
         // Pre-allocate persistent per-chunk buffers for lm_head.
@@ -735,7 +758,7 @@ impl Model {
             seen_bitmap_cpu: vec![0u32; vocab_size_for_bitmap.div_ceil(32) as usize],
             qknorm_shader_src,
             gqa_shader_src,
-            batched_qknorm_gated_src,
+            batched_qknorm_src,
             json_sampler: None,
         }
     }
@@ -763,7 +786,11 @@ impl Model {
         let norm_offset = if self.norm_direct { 0.0 } else { 1.0 };
         self.qknorm_shader_src = build_qknorm_shader_full(&self.config, self.q_gated, norm_offset);
         self.gqa_shader_src = build_gqa_shader(self.q_gated);
-        self.batched_qknorm_gated_src = build_batched_qknorm_shader_gated(&self.config);
+        self.batched_qknorm_src = if self.q_gated {
+            build_batched_qknorm_shader_gated(&self.config)
+        } else {
+            build_batched_qknorm_shader(&self.config)
+        };
     }
 
     /// Re-write static param buffers whose values depend on runtime settings (q_gated).
@@ -2311,7 +2338,7 @@ impl Model {
         // Local params buffer for prefill dispatches — reused per layer with flush+write
         let pg_params = gpu.create_buffer("pg_params", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         // Clone the shader src to avoid borrow conflicts inside the layer loop
-        let batched_qknorm_gated_src = self.batched_qknorm_gated_src.clone();
+        let batched_qknorm_src = self.batched_qknorm_src.clone();
 
         // ── DeltaNet scratch buffers (used only for hybrid linear-attn layers) ──
         let lnkh = self.linear_num_key_heads;
@@ -2373,16 +2400,17 @@ impl Model {
 
             if is_sa {
                 let sa = layer.self_attn().expect("prefill_gptq: layer is_sa but no self_attn weights");
-                let q_dim = nh * hd * 2; // Q_GATED: output [nh, hd*2]
+                let q_dim = if self.q_gated { nh * hd * 2 } else { nh * hd };
                 let kv_dim = nkv * hd;
 
-                // ── Q proj: [seq, h] → [seq, nh*hd*2] ──
+                // ── Q proj ──
                 gpu.flush();
                 gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: q_dim, group_size: gs, _pad: 0 }));
                 let wg_n = q_dim.div_ceil(8);
+                let q_target = if self.q_gated { &q_raw } else { &q_proj };
                 gpu.dispatch("pg_q", gemm_shader, &[
                     gpu::bind(0, &normed), gpu::bind(1, &sa.q_proj_qweight),
-                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, &q_raw),
+                    gpu::bind(2, &sa.q_proj_scales), gpu::bind(3, q_target),
                     gpu::bind(4, &pg_params),
                 ], (wg_n, seq_len, 1));
 
@@ -2410,16 +2438,28 @@ impl Model {
                 // Write seq_len (4 bytes) at offset 16 (seq_len field in header).
                 gpu.flush();
                 gpu.write_buffer(&self.state.batched_qknorm_params[layer_idx], 16, &seq_len.to_le_bytes());
-                gpu.dispatch("pg_qknorm", &batched_qknorm_gated_src, &[
-                    gpu::bind(0, &q_raw),   // [seq, nh, hd*2]
-                    gpu::bind(1, &q_proj),  // [seq, nh, hd] out
-                    gpu::bind(2, &q_gate),  // [seq, nh, hd] out
-                    gpu::bind(3, &k_buf),   // [seq, nkv, hd] in/out
-                    gpu::bind(4, &v_buf),   // [seq, nkv, hd] in
-                    gpu::bind(5, &self.state.k_cache[layer_idx]),
-                    gpu::bind(6, &self.state.v_cache[layer_idx]),
-                    gpu::bind(7, &self.state.batched_qknorm_params[layer_idx]),
-                ], (nh + nkv, seq_len, 1));
+                if self.q_gated {
+                    gpu.dispatch("pg_qknorm", &batched_qknorm_src, &[
+                        gpu::bind(0, &q_raw),   // [seq, nh, hd*2]
+                        gpu::bind(1, &q_proj),  // [seq, nh, hd] out
+                        gpu::bind(2, &q_gate),  // [seq, nh, hd] out
+                        gpu::bind(3, &k_buf),   // [seq, nkv, hd] in/out
+                        gpu::bind(4, &v_buf),   // [seq, nkv, hd] in
+                        gpu::bind(5, &self.state.k_cache[layer_idx]),
+                        gpu::bind(6, &self.state.v_cache[layer_idx]),
+                        gpu::bind(7, &self.state.batched_qknorm_params[layer_idx]),
+                    ], (nh + nkv, seq_len, 1));
+                } else {
+                    // Non-gated: q_proj is both input and output (no q_raw/q_gate split)
+                    gpu.dispatch("pg_qknorm", &batched_qknorm_src, &[
+                        gpu::bind(0, &q_proj),  // [seq, nh, hd] in/out
+                        gpu::bind(1, &k_buf),   // [seq, nkv, hd] in/out
+                        gpu::bind(2, &v_buf),   // [seq, nkv, hd] in
+                        gpu::bind(3, &self.state.k_cache[layer_idx]),
+                        gpu::bind(4, &self.state.v_cache[layer_idx]),
+                        gpu::bind(5, &self.state.batched_qknorm_params[layer_idx]),
+                    ], (nh + nkv, seq_len, 1));
+                }
 
                 // ── Causal attention (batched) ──
                 {
@@ -2437,8 +2477,8 @@ impl Model {
                     ], (nh, seq_len, 1));
                 }
 
-                // ── Sigmoid gate on attention output ──
-                {
+                // ── Sigmoid gate on attention output (Q_GATED only) ──
+                if self.q_gated {
                     let n = seq_len * nh * hd;
                     gpu.flush();
                     gpu.write_buffer(&pg_params, 0, &n.to_le_bytes());
@@ -2446,6 +2486,9 @@ impl Model {
                         gpu::bind(0, &attn_out), gpu::bind(1, &q_gate),
                         gpu::bind(2, &o_out),    gpu::bind(3, &pg_params),
                     ], (n.div_ceil(256), 1, 1));
+                } else {
+                    // Non-gated: attn_out goes directly to O projection input
+                    gpu.copy_buffer(&attn_out, &o_out, (seq_len * nh * hd) as u64 * 4);
                 }
 
                 // ── O projection: [seq, nh*hd] → [seq, h] → mlp_out ──
