@@ -696,9 +696,18 @@ pub fn load_weights(
                 o_proj_qweight: take(&mut tensor_map, &format!("{pfx}.self_attn.o_proj.qweight")),
                 o_proj_scales: take(&mut tensor_map, &format!("{pfx}.self_attn.o_proj.scales")),
                 q_norm: try_take(&mut tensor_map, &format!("{pfx}.self_attn.q_norm.weight"))
-                    .unwrap_or_else(|| gpu.upload_buffer("qn_z", &vec![0u8; config.head_dim as usize * 2])),
+                    .unwrap_or_else(|| {
+                        // BF16 1.0 = 0x3F80; identity for direct-mode norm
+                        let mut v = vec![0u8; config.head_dim as usize * 2];
+                        for i in 0..config.head_dim as usize { v[i*2] = 0x80; v[i*2+1] = 0x3F; }
+                        gpu.upload_buffer("qn_id", &v)
+                    }),
                 k_norm: try_take(&mut tensor_map, &format!("{pfx}.self_attn.k_norm.weight"))
-                    .unwrap_or_else(|| gpu.upload_buffer("kn_z", &vec![0u8; config.head_dim as usize * 2])),
+                    .unwrap_or_else(|| {
+                        let mut v = vec![0u8; config.head_dim as usize * 2];
+                        for i in 0..config.head_dim as usize { v[i*2] = 0x80; v[i*2+1] = 0x3F; }
+                        gpu.upload_buffer("kn_id", &v)
+                    }),
                 q_bias: raw_bytes_map.remove(&format!("{pfx}.self_attn.q_proj.bias"))
                     .map(|b| upload_f16_as_f32(gpu, &b, "qb")),
                 k_bias: raw_bytes_map.remove(&format!("{pfx}.self_attn.k_proj.bias"))
@@ -751,14 +760,27 @@ pub fn load_weights(
             post_attn_layernorm: take(&mut tensor_map, &format!("{pfx}.post_attention_layernorm.weight")),
         });
 
-        // Raw norm bytes for self-attn layers
+        // Raw norm bytes for self-attn layers.
+        // When q_norm/k_norm don't exist (e.g. Qwen2.5), fill with BF16 1.0
+        // so the qknorm shader computes (NORM_OFFSET + 1.0) * x / rms.
+        // With NORM_OFFSET=0.0 (direct mode), this gives standard RMSNorm: 1.0 * x / rms.
+        // Zero-fill would zero out all Q/K values (NORM_OFFSET + 0.0 = 0.0).
         if is_sa {
+            let bf16_ones = || -> Vec<u8> {
+                // BF16 representation of 1.0 = 0x3F80
+                let mut v = vec![0u8; config.head_dim as usize * 2];
+                for i in 0..config.head_dim as usize {
+                    v[i * 2] = 0x80;     // low byte
+                    v[i * 2 + 1] = 0x3F; // high byte
+                }
+                v
+            };
             let q_bytes = raw_bytes_map
                 .remove(&format!("{pfx}.self_attn.q_norm.weight"))
-                .unwrap_or_default();
+                .unwrap_or_else(bf16_ones);
             let k_bytes = raw_bytes_map
                 .remove(&format!("{pfx}.self_attn.k_norm.weight"))
-                .unwrap_or_default();
+                .unwrap_or_else(bf16_ones);
             norm_weights.push(Some((q_bytes, k_bytes)));
         } else {
             norm_weights.push(None);
@@ -929,14 +951,18 @@ pub fn load_weights_bf16(
     for i in 0..config.num_hidden_layers as usize {
         let p = format!("thinker.model.layers.{i}");
 
-        // Q/K norm raw bytes for qknorm_params (optional — absent in Qwen2.5)
+        // Q/K norm raw bytes for qknorm_params.
+        // When absent (Qwen2.5), use BF16 1.0 so norm computes identity: (0.0+1.0)*x/rms
+        let bf16_ones_hd = || -> Vec<u8> {
+            let mut v = vec![0u8; config.head_dim as usize * 2];
+            for j in 0..config.head_dim as usize { v[j*2] = 0x80; v[j*2+1] = 0x3F; }
+            v
+        };
         let q_norm_data = try_get(&format!("{p}.self_attn.q_norm.weight"));
         let k_norm_data = try_get(&format!("{p}.self_attn.k_norm.weight"));
-        if let (Some(qn), Some(kn)) = (q_norm_data, k_norm_data) {
-            norm_weights.push(Some((qn.to_vec(), kn.to_vec())));
-        } else {
-            norm_weights.push(None);
-        }
+        let qn = q_norm_data.map(|d| d.to_vec()).unwrap_or_else(bf16_ones_hd);
+        let kn = k_norm_data.map(|d| d.to_vec()).unwrap_or_else(bf16_ones_hd);
+        norm_weights.push(Some((qn, kn)));
 
         let sa = SelfAttnWeights {
             q_proj_qweight: upload(&format!("{p}.q"), &format!("{p}.self_attn.q_proj.weight")),
@@ -949,14 +975,16 @@ pub fn load_weights_bf16(
             o_proj_scales: dummy.clone(),
             q_norm: try_upload(&format!("{p}.qn"), &format!("{p}.self_attn.q_norm.weight"))
                 .unwrap_or_else(|| {
-                    // Qwen2.5: no q_norm — zeros → identity with NORM_OFFSET=1.0
-                    let zeros = vec![0u8; config.head_dim as usize * 2]; // bf16
-                    gpu.upload_buffer(&format!("{p}.qn"), &zeros)
+                    // Qwen2.5: no q_norm — BF16 1.0 for identity with NORM_OFFSET=0.0
+                    let mut v = vec![0u8; config.head_dim as usize * 2];
+                    for j in 0..config.head_dim as usize { v[j*2] = 0x80; v[j*2+1] = 0x3F; }
+                    gpu.upload_buffer(&format!("{p}.qn"), &v)
                 }),
             k_norm: try_upload(&format!("{p}.kn"), &format!("{p}.self_attn.k_norm.weight"))
                 .unwrap_or_else(|| {
-                    let zeros = vec![0u8; config.head_dim as usize * 2];
-                    gpu.upload_buffer(&format!("{p}.kn"), &zeros)
+                    let mut v = vec![0u8; config.head_dim as usize * 2];
+                    for j in 0..config.head_dim as usize { v[j*2] = 0x80; v[j*2+1] = 0x3F; }
+                    gpu.upload_buffer(&format!("{p}.kn"), &v)
                 }),
             q_bias: try_upload(&format!("{p}.qb"), &format!("{p}.self_attn.q_proj.bias")),
             k_bias: try_upload(&format!("{p}.kb"), &format!("{p}.self_attn.k_proj.bias")),

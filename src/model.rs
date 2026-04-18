@@ -51,6 +51,8 @@ pub(crate) mod shaders {
     pub const FUSED_GATE_UP_GPTQ_4T: &str = include_str!("shaders/fused_gate_up_gptq_4t.wgsl");
 
     // Sampling shader (combined penalty + gate + top-K in one pass)
+    pub const FUSED_ROPE_KVSTORE: &str = include_str!("shaders/fused_rope_kvstore.wgsl");
+    pub const BATCHED_ROPE: &str = include_str!("shaders/batched_rope.wgsl");
     pub const SAMPLE_TOPK: &str = include_str!("shaders/sample_topk.wgsl");
 
     // LoRA shaders
@@ -95,6 +97,53 @@ fn build_qknorm_shader_full(config: &ModelConfig, q_gated: bool, norm_offset: f3
         include_str!("shaders/fused_split_qknorm_kvstore.wgsl")
             .lines()
             .skip(7) // skip the 7 hardcoded const lines
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Build the fused_rope_kvstore shader (no QK norm, just RoPE + KV cache write).
+/// For models without head-wise Q/K normalization (e.g. Qwen2.5).
+fn build_rope_kvstore_shader(config: &ModelConfig, q_gated: bool) -> String {
+    let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
+    let interleaved = config.mrope_interleaved();
+    let s1_limit = if config.mrope_s1_limit > 0 { config.mrope_s1_limit } else { partial_dim / 2 };
+    let s2_limit = if config.mrope_s2_limit > 0 { config.mrope_s2_limit } else { partial_dim / 2 };
+    format!(
+        "const ROPE_THETA: f32 = {:.1};\n\
+         const MROPE_S1_LIMIT: u32 = {}u;\n\
+         const MROPE_S2_LIMIT: u32 = {}u;\n\
+         const PARTIAL_DIM: u32 = {}u;\n\
+         const MROPE_INTERLEAVED: bool = {};\n\
+         const Q_GATED: bool = {};\n\n{}",
+        config.rope_theta,
+        s1_limit,
+        s2_limit,
+        partial_dim,
+        interleaved,
+        q_gated,
+        include_str!("shaders/fused_rope_kvstore.wgsl")
+            .lines()
+            .skip(12) // skip 6 comment lines + 6 const lines
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Build the batched RoPE shader (no QK norm) for prefill.
+fn build_batched_rope_shader(config: &ModelConfig) -> String {
+    let partial_dim = (config.head_dim as f32 * config.partial_rotary_factor) as u32;
+    let interleaved = config.mrope_interleaved();
+    format!(
+        "const ROPE_THETA: f32 = {:.1};\n\
+         const PARTIAL_DIM: u32 = {}u;\n\
+         const MROPE_INTERLEAVED: bool = {};\n\n{}",
+        config.rope_theta,
+        partial_dim,
+        interleaved,
+        include_str!("shaders/batched_rope.wgsl")
+            .lines()
+            .skip(13) // skip 9 comment lines + 1 blank + 3 const lines
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -700,14 +749,18 @@ impl Model {
 
         let tied_embeddings = config.tie_word_embeddings;
         let q_gated = config.attn_output_gate;
-        // Qwen3.5 uses (1+w)*x norm (offset=1.0), Qwen2.5 uses w*x (offset=0.0)
-        let norm_offset = if q_gated { 1.0f32 } else { 0.0f32 };
-        let qknorm_shader_src = build_qknorm_shader_full(&config, q_gated, norm_offset);
+        // Qwen3.5: gated Q + head-wise QK norm → qknorm shader
+        // Qwen2.5: no gated Q, no QK norm → rope-only shader (skip normalization)
+        let qknorm_shader_src = if q_gated {
+            build_qknorm_shader_full(&config, true, 1.0) // (1+w)*x norm
+        } else {
+            build_rope_kvstore_shader(&config, false) // RoPE only, no norm
+        };
         let gqa_shader_src = build_gqa_shader(q_gated);
         let batched_qknorm_src = if q_gated {
             build_batched_qknorm_shader_gated(&config)
         } else {
-            build_batched_qknorm_shader(&config)
+            build_batched_rope_shader(&config)
         };
         let vocab_size_for_bitmap = config.vocab_size;
 

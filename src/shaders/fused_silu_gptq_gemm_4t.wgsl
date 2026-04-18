@@ -3,6 +3,8 @@
 // 8 columns per workgroup (32 threads / 4 lanes per column).
 // Dispatch: (ceil(N / 8), S, 1)
 
+const GPTQ_ZP: f32 = 8.0;
+
 struct Params {
     K: u32,
     N: u32,
@@ -56,14 +58,14 @@ fn main(
             let packed = qweight[pr * N + col];
 
             let row_base = in_base + pr * 8u;
-            sum += (f32((packed)       & 0xFu) - 8.0) * scale * silu(a[row_base])     * b[row_base];
-            sum += (f32((packed >> 4u) & 0xFu) - 8.0) * scale * silu(a[row_base + 1u]) * b[row_base + 1u];
-            sum += (f32((packed >> 8u) & 0xFu) - 8.0) * scale * silu(a[row_base + 2u]) * b[row_base + 2u];
-            sum += (f32((packed >> 12u) & 0xFu) - 8.0) * scale * silu(a[row_base + 3u]) * b[row_base + 3u];
-            sum += (f32((packed >> 16u) & 0xFu) - 8.0) * scale * silu(a[row_base + 4u]) * b[row_base + 4u];
-            sum += (f32((packed >> 20u) & 0xFu) - 8.0) * scale * silu(a[row_base + 5u]) * b[row_base + 5u];
-            sum += (f32((packed >> 24u) & 0xFu) - 8.0) * scale * silu(a[row_base + 6u]) * b[row_base + 6u];
-            sum += (f32((packed >> 28u) & 0xFu) - 8.0) * scale * silu(a[row_base + 7u]) * b[row_base + 7u];
+            sum += (f32((packed)       & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base])     * b[row_base];
+            sum += (f32((packed >> 4u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 1u]) * b[row_base + 1u];
+            sum += (f32((packed >> 8u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 2u]) * b[row_base + 2u];
+            sum += (f32((packed >> 12u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 3u]) * b[row_base + 3u];
+            sum += (f32((packed >> 16u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 4u]) * b[row_base + 4u];
+            sum += (f32((packed >> 20u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 5u]) * b[row_base + 5u];
+            sum += (f32((packed >> 24u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 6u]) * b[row_base + 6u];
+            sum += (f32((packed >> 28u) & 0xFu) - GPTQ_ZP) * scale * silu(a[row_base + 7u]) * b[row_base + 7u];
 
             pr += 1u;
         }

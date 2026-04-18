@@ -147,7 +147,15 @@ impl InferenceSession {
             log::info!("[shady-thinker] detected BF16 weights");
             weights::QuantConfig { bits: 16, group_size: 0, quant_method: "bf16".to_string(), sym: false }
         } else {
-            weights::QuantConfig::from_file(&model_dir.join("quantize_config.json"))
+            // Try both naming conventions: GPTQ uses quantize_config.json,
+            // AutoRound uses quantization_config.json
+            let path1 = model_dir.join("quantize_config.json");
+            let path2 = model_dir.join("quantization_config.json");
+            if path1.exists() {
+                weights::QuantConfig::from_file(&path1)
+            } else {
+                weights::QuantConfig::from_file(&path2)
+            }
         };
         log::info!("[shady-thinker] config: {} layers, {} heads, dim={}, format={}, bits={} ({:.1}s)",
             config.num_hidden_layers, config.num_attention_heads, config.hidden_size,

@@ -3,6 +3,8 @@
 // 8 columns per workgroup (32 threads / 4 lanes per column).
 // Dispatch: (ceil(inter / 8), 1, 1)
 
+const GPTQ_ZP: f32 = 8.0;
+
 struct Params {
     K: u32,
     N: u32,
@@ -68,8 +70,8 @@ fn main(
         for (var k: u32 = 0u; k < 8u; k++) {
             let shift = k * 4u;
             let inp   = input[row_base + k];
-            gate_sum += (f32((g_packed >> shift) & 0xFu) - 8.0) * gate_sc * inp;
-            up_sum   += (f32((u_packed >> shift) & 0xFu) - 8.0) * up_sc   * inp;
+            gate_sum += (f32((g_packed >> shift) & 0xFu) - GPTQ_ZP) * gate_sc * inp;
+            up_sum   += (f32((u_packed >> shift) & 0xFu) - GPTQ_ZP) * up_sc   * inp;
         }
         pr += 1u;
     }
