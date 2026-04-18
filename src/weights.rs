@@ -231,6 +231,9 @@ pub struct ModelConfig {
     pub partial_rotary_factor: f32,
     #[serde(default)]
     pub text_config: Option<Box<ModelConfig>>,
+    /// Qwen2.5-Omni: thinker config wraps text_config
+    #[serde(default)]
+    pub thinker_config: Option<Box<ModelConfig>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -271,8 +274,19 @@ impl ModelConfig {
     pub fn from_file(path: &Path) -> Self {
         let data = std::fs::read_to_string(path).expect("failed to read config.json");
         let mut config: Self = serde_json::from_str(&data).expect("failed to parse config.json");
+        // Qwen2.5-Omni: thinker_config.text_config
         if config.hidden_size == 0 {
-            if let Some(tc) = config.text_config.take() {
+            if let Some(mut tc) = config.thinker_config.take() {
+                let model_type = config.model_type.clone();
+                if let Some(ttc) = tc.text_config.take() {
+                    config = *ttc;
+                } else {
+                    config = *tc;
+                }
+                if config.model_type.is_empty() {
+                    config.model_type = model_type;
+                }
+            } else if let Some(tc) = config.text_config.take() {
                 let model_type = config.model_type.clone();
                 config = *tc;
                 if config.model_type.is_empty() {
