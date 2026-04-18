@@ -521,10 +521,18 @@ impl InferenceSession {
     /// Returns true and sets prefix_len on success; returns false if the file is
     /// absent, invalid, or has mismatched dimensions.
     pub fn try_load_prefix_cache(&mut self, path: &std::path::Path) -> bool {
-        match std::fs::read(path) {
-            Ok(data) => self.try_load_prefix_cache_bytes(&data),
-            Err(_) => false,
-        }
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("[shady-thinker] mmap failed for {:?}: {e}", path);
+                return false;
+            }
+        };
+        self.try_load_prefix_cache_bytes(&mmap)
     }
 
     /// Load a prefix cache from raw bytes (e.g. embedded via `include_bytes!`).
