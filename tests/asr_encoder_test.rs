@@ -518,11 +518,12 @@ fn verify_single_token_forward() {
     // Python: [0.4453, 0.4192, -1.2779, -0.1052]
 
     // MLP
+    let expert = layer.mlp.dense();
     model.gptq_matvec(&mut gpu, "gate_l0",
-        &model.state.normed, &layer.gate_proj_qweight, &layer.gate_proj_scales,
+        &model.state.normed, &expert.gate_proj_qweight, &expert.gate_proj_scales,
         &model.state.gate_out, inter, &model.state.p_bf16_gu);
     model.gptq_matvec(&mut gpu, "up_l0",
-        &model.state.normed, &layer.up_proj_qweight, &layer.up_proj_scales,
+        &model.state.normed, &expert.up_proj_qweight, &expert.up_proj_scales,
         &model.state.up_out, inter, &model.state.p_bf16_gu);
     gpu.flush();
     let gate0 = gpu.read_buffer(&model.state.gate_out, inter as u64 * 4);
@@ -534,7 +535,7 @@ fn verify_single_token_forward() {
 
     model.fused_silu_gptq_down(&mut gpu,
         &model.state.gate_out, &model.state.up_out,
-        &layer.down_proj_qweight, &layer.down_proj_scales,
+        &expert.down_proj_qweight, &expert.down_proj_scales,
         &model.state.mlp_output, h, &model.state.p_gptq_down);
 
     // After MLP, residual gets updated at next layer's pre-attn

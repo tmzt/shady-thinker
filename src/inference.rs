@@ -378,11 +378,21 @@ impl InferenceSession {
     /// Encodes the model (via shader hash) and prompt content so a cache is
     /// invalidated if either changes.
     pub fn prefix_cache_path(model_dir: &std::path::Path, prompt: &str) -> std::path::PathBuf {
+        Self::prefix_cache_path_with_extra(model_dir, prompt, 0)
+    }
+
+    /// Build a cache-key path with an extra hash component (e.g. external tool definitions).
+    /// The extra_hash is mixed into the prompt hash so the cache invalidates when
+    /// either the prompt text or external config changes.
+    pub fn prefix_cache_path_with_extra(
+        model_dir: &std::path::Path, prompt: &str, extra_hash: u64,
+    ) -> std::path::PathBuf {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let model_hash = shader_cache_key();
         let mut h = DefaultHasher::new();
         prompt.hash(&mut h);
+        extra_hash.hash(&mut h);
         let prompt_hash = h.finish();
         model_dir.join(format!("prefix_cache_{model_hash:016x}_{prompt_hash:016x}.bin"))
     }

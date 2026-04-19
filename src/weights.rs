@@ -132,19 +132,50 @@ pub enum AttnWeights {
     LinearAttn(LinearAttnWeights),
 }
 
-/// Per-layer weight buffers on GPU
-pub struct LayerWeights {
-    pub attn: AttnWeights,
-    // MLP projections (shared by both layer types)
+/// Per-expert MLP weight buffers (gate + up + down projections)
+pub struct ExpertWeights {
     pub gate_proj_qweight: wgpu::Buffer,
     pub gate_proj_scales: wgpu::Buffer,
     pub up_proj_qweight: wgpu::Buffer,
     pub up_proj_scales: wgpu::Buffer,
     pub down_proj_qweight: wgpu::Buffer,
     pub down_proj_scales: wgpu::Buffer,
+}
+
+/// MLP weights — either a single dense FFN or MoE with router + experts
+pub enum MlpWeights {
+    /// Standard dense FFN (single expert)
+    Dense(ExpertWeights),
+    /// Mixture of Experts: router selects top-k experts per token
+    Moe {
+        /// Router weight [num_experts, hidden_size] BF16
+        router_weight: wgpu::Buffer,
+        /// Per-expert MLP weights
+        experts: Vec<ExpertWeights>,
+    },
+}
+
+/// Per-layer weight buffers on GPU
+pub struct LayerWeights {
+    pub attn: AttnWeights,
+    pub mlp: MlpWeights,
     // Norm weights (BF16 packed as u32)
     pub input_layernorm: wgpu::Buffer,
     pub post_attn_layernorm: wgpu::Buffer,
+}
+
+impl MlpWeights {
+    /// Get the dense expert weights. Panics if this is an MoE layer.
+    pub fn dense(&self) -> &ExpertWeights {
+        match self {
+            MlpWeights::Dense(e) => e,
+            MlpWeights::Moe { .. } => panic!("expected Dense MLP, got MoE"),
+        }
+    }
+
+    pub fn is_moe(&self) -> bool {
+        matches!(self, MlpWeights::Moe { .. })
+    }
 }
 
 impl LayerWeights {
@@ -236,6 +267,13 @@ pub struct ModelConfig {
     pub rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_partial_rotary_factor")]
     pub partial_rotary_factor: f32,
+    // MoE (Mixture of Experts) config
+    /// Total number of experts per MoE layer (0 = dense model)
+    #[serde(default)]
+    pub num_experts: u32,
+    /// Number of active experts per token (top-k routing)
+    #[serde(default)]
+    pub num_experts_per_tok: u32,
     #[serde(default)]
     pub text_config: Option<Box<ModelConfig>>,
     /// Qwen2.5-Omni: thinker config wraps text_config
@@ -748,14 +786,38 @@ pub fn load_weights(
             })
         };
 
+        let mlp = if config.num_experts > 0 {
+            // MoE: load router + per-expert weights
+            let router_weight = take(&mut tensor_map, &format!("{pfx}.mlp.gate.weight"));
+            let num_experts = config.num_experts as usize;
+            let mut experts = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                experts.push(ExpertWeights {
+                    gate_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.gate_proj.qweight")),
+                    gate_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.gate_proj.scales")),
+                    up_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.up_proj.qweight")),
+                    up_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.up_proj.scales")),
+                    down_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.down_proj.qweight")),
+                    down_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.down_proj.scales")),
+                });
+            }
+            log::info!("Layer {i}: MoE with {} experts", num_experts);
+            MlpWeights::Moe { router_weight, experts }
+        } else {
+            // Dense FFN
+            MlpWeights::Dense(ExpertWeights {
+                gate_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.gate_proj.qweight")),
+                gate_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.gate_proj.scales")),
+                up_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.up_proj.qweight")),
+                up_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.up_proj.scales")),
+                down_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.down_proj.qweight")),
+                down_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.down_proj.scales")),
+            })
+        };
+
         layers.push(LayerWeights {
             attn,
-            gate_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.gate_proj.qweight")),
-            gate_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.gate_proj.scales")),
-            up_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.up_proj.qweight")),
-            up_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.up_proj.scales")),
-            down_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.down_proj.qweight")),
-            down_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.down_proj.scales")),
+            mlp,
             input_layernorm: take(&mut tensor_map, &format!("{pfx}.input_layernorm.weight")),
             post_attn_layernorm: take(&mut tensor_map, &format!("{pfx}.post_attention_layernorm.weight")),
         });
@@ -993,12 +1055,14 @@ pub fn load_weights_bf16(
 
         let layer = LayerWeights {
             attn: AttnWeights::SelfAttn(sa),
-            gate_proj_qweight: upload(&format!("{p}.gate"), &format!("{p}.mlp.gate_proj.weight")),
-            gate_proj_scales: dummy.clone(),
-            up_proj_qweight: upload(&format!("{p}.up"), &format!("{p}.mlp.up_proj.weight")),
-            up_proj_scales: dummy.clone(),
-            down_proj_qweight: upload(&format!("{p}.down"), &format!("{p}.mlp.down_proj.weight")),
-            down_proj_scales: dummy.clone(),
+            mlp: MlpWeights::Dense(ExpertWeights {
+                gate_proj_qweight: upload(&format!("{p}.gate"), &format!("{p}.mlp.gate_proj.weight")),
+                gate_proj_scales: dummy.clone(),
+                up_proj_qweight: upload(&format!("{p}.up"), &format!("{p}.mlp.up_proj.weight")),
+                up_proj_scales: dummy.clone(),
+                down_proj_qweight: upload(&format!("{p}.down"), &format!("{p}.mlp.down_proj.weight")),
+                down_proj_scales: dummy.clone(),
+            }),
             input_layernorm: upload(&format!("{p}.in"), &format!("{p}.input_layernorm.weight")),
             post_attn_layernorm: upload(&format!("{p}.pa"), &format!("{p}.post_attention_layernorm.weight")),
         };
@@ -1098,8 +1162,10 @@ pub fn load_weights_int4(
                     .unwrap_or_else(|| { let z=vec![0u8;config.head_dim as usize*2]; gpu.upload_buffer("kn",&z) }),
                 q_bias: None, k_bias: None, v_bias: None,
             }),
-            gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
-            down_proj_qweight:dq,down_proj_scales:dss,
+            mlp: MlpWeights::Dense(ExpertWeights {
+                gate_proj_qweight:gq,gate_proj_scales:gs, up_proj_qweight:uq,up_proj_scales:us,
+                down_proj_qweight:dq,down_proj_scales:dss,
+            }),
             input_layernorm:bf("il",&format!("{p}.input_layernorm.weight")),
             post_attn_layernorm:bf("pl",&format!("{p}.post_attention_layernorm.weight")),
         });
@@ -1204,9 +1270,11 @@ pub fn load_weights_mlx_int4(
                 k_norm:up("kn",&format!("{p}.self_attn.k_norm.weight")),
                 q_bias: None, k_bias: None, v_bias: None,
             }),
-            gate_proj_qweight:gq, gate_proj_scales:gs,
-            up_proj_qweight:uq, up_proj_scales:us,
-            down_proj_qweight:dq, down_proj_scales:dss,
+            mlp: MlpWeights::Dense(ExpertWeights {
+                gate_proj_qweight:gq, gate_proj_scales:gs,
+                up_proj_qweight:uq, up_proj_scales:us,
+                down_proj_qweight:dq, down_proj_scales:dss,
+            }),
             input_layernorm:up("il",&format!("{p}.input_layernorm.weight")),
             post_attn_layernorm:up("pl",&format!("{p}.post_attention_layernorm.weight")),
         });

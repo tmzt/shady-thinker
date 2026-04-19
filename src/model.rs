@@ -50,6 +50,9 @@ pub(crate) mod shaders {
     pub const FUSED_GATE_UP_GPTQ: &str = include_str!("shaders/fused_gate_up_gptq.wgsl");
     pub const FUSED_GATE_UP_GPTQ_4T: &str = include_str!("shaders/fused_gate_up_gptq_4t.wgsl");
 
+    // MoE weighted accumulation (grad[i] += lambda * anchor[i])
+    pub const GRAD_FMA: &str = include_str!("shaders/grad_fma.wgsl");
+
     // Sampling shader (combined penalty + gate + top-K in one pass)
     pub const FUSED_ROPE_KVSTORE: &str = include_str!("shaders/fused_rope_kvstore.wgsl");
     pub const BATCHED_ROPE: &str = include_str!("shaders/batched_rope.wgsl");
@@ -62,6 +65,30 @@ pub(crate) mod shaders {
     pub const LORA_UP_ADD: &str = include_str!("shaders/lora_up_add.wgsl");
     #[cfg(feature = "jit-lora")]
     pub const LORA_DOWN_SILU: &str = include_str!("shaders/lora_down_silu.wgsl");
+}
+
+/// CPU-side top-k expert routing: softmax over logits, select top-k, renormalize weights.
+fn route_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    // Softmax
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&x| (x - max_val).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+
+    // Top-k selection
+    let mut indexed: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.truncate(k);
+
+    // Renormalize selected weights
+    let selected_sum: f32 = indexed.iter().map(|&(_, w)| w).sum();
+    if selected_sum > 0.0 {
+        for item in &mut indexed {
+            item.1 /= selected_sum;
+        }
+    }
+
+    indexed
 }
 
 /// Build the fused_split_qknorm_kvstore shader source with model-specific constants.
@@ -298,6 +325,14 @@ pub struct InferenceState {
     pub deltanet_output: wgpu::Buffer,    // [num_value_heads * value_dim]
     pub deltanet_ab: wgpu::Buffer,        // merged in_proj_a @ hidden for alpha/beta
     pub deltanet_z: wgpu::Buffer,         // Z-gate output [num_value_heads * value_dim]
+
+    // MoE state buffers (only used when num_experts > 0)
+    pub moe_router_logits: wgpu::Buffer,  // [num_experts] f32
+    pub moe_accum: wgpu::Buffer,          // [hidden_size] f32 — weighted expert output accumulator
+    pub p_moe_router: wgpu::Buffer,       // params for router bf16_matvec {hidden, num_experts}
+    pub p_moe_gu: wgpu::Buffer,           // params for expert gate+up {hidden, expert_inter, gs}
+    pub p_moe_down: wgpu::Buffer,         // params for expert SiLU+down {expert_inter, hidden, gs}
+    pub p_moe_fma: wgpu::Buffer,          // params for weighted accumulation {n, lambda}
 }
 
 /// Number of attention splits for GQA (trade off parallelism vs overhead)
@@ -745,6 +780,38 @@ impl Model {
                 let lvd = config.linear_value_head_dim;
                 gpu.create_storage_buffer("deltanet_z", (lnvh * lvd) as u64 * f)
             },
+
+            // MoE buffers
+            moe_router_logits: {
+                let ne = if config.num_experts > 0 { config.num_experts } else { 1 };
+                gpu.create_storage_buffer("moe_router_logits", ne as u64 * f)
+            },
+            moe_accum: gpu.create_storage_buffer("moe_accum", h as u64 * f),
+            p_moe_router: {
+                let ne = if config.num_experts > 0 { config.num_experts } else { 1 };
+                let buf = gpu.create_buffer("p_moe_router", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, ne, 0u32, 0u32]));
+                buf
+            },
+            p_moe_gu: {
+                let gs = quant_config.group_size;
+                let moe_inter = if config.num_experts > 0 { inter } else { 1 };
+                let buf = gpu.create_buffer("p_moe_gu", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, moe_inter, gs, 0u32]));
+                buf
+            },
+            p_moe_down: {
+                let gs = quant_config.group_size;
+                let moe_inter = if config.num_experts > 0 { inter } else { 1 };
+                let buf = gpu.create_buffer("p_moe_down", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[moe_inter, h, gs, 0u32]));
+                buf
+            },
+            p_moe_fma: {
+                let buf = gpu.create_buffer("p_moe_fma", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, 0u32]));
+                buf
+            },
         };
 
         let tied_embeddings = config.tie_word_embeddings;
@@ -1010,6 +1077,68 @@ impl Model {
             gpu::bind(5, gate_out), gpu::bind(6, up_out),
             gpu::bind(7, params_buf),
         ], (n.div_ceil(8), 1, 1));
+    }
+
+    /// MoE dispatch: router → top-k → loop over selected experts → weighted accumulation.
+    /// Router runs on GPU (bf16_matvec), top-k selection on CPU (128 floats readback),
+    /// then each selected expert runs the existing fused gate+up and SiLU+down pipeline.
+    fn dispatch_moe(
+        &self, gpu: &mut GpuContext,
+        router_weight: &wgpu::Buffer,
+        experts: &[crate::weights::ExpertWeights],
+        h: u32, inter: u32,
+    ) {
+        let num_experts = self.config.num_experts;
+        let k = self.config.num_experts_per_tok as usize;
+
+        // 1. Router: bf16_matvec(normed, router_weight) → router_logits
+        gpu.dispatch("moe_router", shaders::BF16_MATVEC, &[
+            gpu::bind(0, &self.state.normed),
+            gpu::bind(1, router_weight),
+            gpu::bind(2, &self.state.moe_router_logits),
+            gpu::bind(3, &self.state.p_moe_router),
+        ], (num_experts.div_ceil(32), 1, 1));
+
+        // 2. GPU flush + readback router logits
+        gpu.flush_and_wait();
+        let logit_bytes = gpu.read_buffer(&self.state.moe_router_logits, num_experts as u64 * 4);
+        let logits: &[f32] = bytemuck::cast_slice(&logit_bytes);
+
+        // 3. CPU softmax + top-k selection
+        let selected = route_top_k(logits, k);
+
+        // 4. Zero the accumulator
+        gpu.write_buffer(&self.state.moe_accum, 0, &vec![0u8; h as usize * 4]);
+
+        // 5. For each selected expert: gate+up → SiLU+down → weighted accumulation
+        for &(expert_id, weight) in &selected {
+            let expert = &experts[expert_id];
+
+            // gate+up projection
+            self.fused_gate_up_gptq(gpu,
+                &self.state.normed,
+                &expert.gate_proj_qweight, &expert.gate_proj_scales,
+                &expert.up_proj_qweight, &expert.up_proj_scales,
+                &self.state.gate_out, &self.state.up_out, inter, &self.state.p_moe_gu);
+
+            // SiLU + down projection → mlp_output
+            self.fused_silu_gptq_down(gpu,
+                &self.state.gate_out, &self.state.up_out,
+                &expert.down_proj_qweight, &expert.down_proj_scales,
+                &self.state.mlp_output, h, &self.state.p_moe_down);
+
+            // Weighted accumulation: moe_accum += weight * mlp_output
+            gpu.write_buffer(&self.state.p_moe_fma, 0,
+                bytemuck::cast_slice(&[h, weight.to_bits()]));
+            gpu.dispatch("moe_accum", shaders::GRAD_FMA, &[
+                gpu::bind(0, &self.state.moe_accum),
+                gpu::bind(1, &self.state.mlp_output),
+                gpu::bind(2, &self.state.p_moe_fma),
+            ], (h.div_ceil(256), 1, 1));
+        }
+
+        // 6. Copy accumulator to mlp_output
+        gpu.copy_buffer(&self.state.moe_accum, &self.state.mlp_output, h as u64 * 4);
     }
 
     pub fn add_rmsnorm(
@@ -1507,21 +1636,28 @@ impl Model {
             self.add_rmsnorm(gpu, &self.state.residual, &self.state.o_proj_out,
                 &layer.post_attn_layernorm, &self.state.normed);
 
-            // ── MLP ── (fused gate+up dispatch, then fused SiLU+down)
-            let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
-            let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
-            self.fused_gate_up_gptq(gpu,
-                &self.state.normed,
-                &layer.gate_proj_qweight, &layer.gate_proj_scales,
-                &layer.up_proj_qweight, &layer.up_proj_scales,
-                &self.state.gate_out, &self.state.up_out, inter, p_gu);
-            self.fused_silu_gptq_down(gpu,
-                &self.state.gate_out, &self.state.up_out,
-                &layer.down_proj_qweight, &layer.down_proj_scales,
-                &self.state.mlp_output, h, p_down);
-            #[cfg(feature = "jit-lora")]
-            if self.lora.as_ref().map_or(false, |l| l.config.targets[3]) {
-                self.lora_apply_down_proj(gpu, i);
+            // ── MLP ──
+            match &layer.mlp {
+                crate::weights::MlpWeights::Dense(expert) => {
+                    let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
+                    let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
+                    self.fused_gate_up_gptq(gpu,
+                        &self.state.normed,
+                        &expert.gate_proj_qweight, &expert.gate_proj_scales,
+                        &expert.up_proj_qweight, &expert.up_proj_scales,
+                        &self.state.gate_out, &self.state.up_out, inter, p_gu);
+                    self.fused_silu_gptq_down(gpu,
+                        &self.state.gate_out, &self.state.up_out,
+                        &expert.down_proj_qweight, &expert.down_proj_scales,
+                        &self.state.mlp_output, h, p_down);
+                    #[cfg(feature = "jit-lora")]
+                    if self.lora.as_ref().map_or(false, |l| l.config.targets[3]) {
+                        self.lora_apply_down_proj(gpu, i);
+                    }
+                }
+                crate::weights::MlpWeights::Moe { router_weight, experts } => {
+                    self.dispatch_moe(gpu, router_weight, experts, h, inter);
+                }
             }
 
         }
@@ -1846,17 +1982,24 @@ impl Model {
                 log::debug!("[gpu-decoder] L{i} after attn+res (seq={}): norm={norm:.4} first4={:?}", self.seq_len, &dv[..4]);
             }
 
-            let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
-            let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
-            self.fused_gate_up_gptq(gpu,
-                &self.state.normed,
-                &layer.gate_proj_qweight, &layer.gate_proj_scales,
-                &layer.up_proj_qweight, &layer.up_proj_scales,
-                &self.state.gate_out, &self.state.up_out, inter, p_gu);
-            self.fused_silu_gptq_down(gpu,
-                &self.state.gate_out, &self.state.up_out,
-                &layer.down_proj_qweight, &layer.down_proj_scales,
-                &self.state.mlp_output, h, p_down);
+            match &layer.mlp {
+                crate::weights::MlpWeights::Dense(expert) => {
+                    let p_gu = if self.bf16_mode { &self.state.p_bf16_gu } else { &self.state.p_gptq_gu };
+                    let p_down = if self.bf16_mode { &self.state.p_bf16_down } else { &self.state.p_gptq_down };
+                    self.fused_gate_up_gptq(gpu,
+                        &self.state.normed,
+                        &expert.gate_proj_qweight, &expert.gate_proj_scales,
+                        &expert.up_proj_qweight, &expert.up_proj_scales,
+                        &self.state.gate_out, &self.state.up_out, inter, p_gu);
+                    self.fused_silu_gptq_down(gpu,
+                        &self.state.gate_out, &self.state.up_out,
+                        &expert.down_proj_qweight, &expert.down_proj_scales,
+                        &self.state.mlp_output, h, p_down);
+                }
+                crate::weights::MlpWeights::Moe { router_weight, experts } => {
+                    self.dispatch_moe(gpu, router_weight, experts, h, inter);
+                }
+            }
 
             if self.seq_len == 0 && i < 3 {
                 gpu.flush();
@@ -2013,23 +2156,25 @@ impl Model {
                 &layer.post_attn_layernorm, &self.state.normed);
 
             // MLP: gate + up (INT4), then fused SiLU + down (INT4)
+            // MoE not supported in MLX path — only dense
+            let expert = layer.mlp.dense();
             gpu.dispatch("gate", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
-                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.gate_proj_qweight),
-                gpu::bind(2, &layer.gate_proj_scales), gpu::bind(3, &biases[4]),
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &expert.gate_proj_qweight),
+                gpu::bind(2, &expert.gate_proj_scales), gpu::bind(3, &biases[4]),
                 gpu::bind(4, &self.state.gate_out), gpu::bind(5, &self.state.p_gptq_gu),
             ], (inter.div_ceil(32), 1, 1));
 
             gpu.dispatch("up", if self.mlx_bf16_scales { shaders::INT4_MATVEC_MLX_BF16 } else { shaders::INT4_MATVEC_MLX }, &[
-                gpu::bind(0, &self.state.normed), gpu::bind(1, &layer.up_proj_qweight),
-                gpu::bind(2, &layer.up_proj_scales), gpu::bind(3, &biases[5]),
+                gpu::bind(0, &self.state.normed), gpu::bind(1, &expert.up_proj_qweight),
+                gpu::bind(2, &expert.up_proj_scales), gpu::bind(3, &biases[5]),
                 gpu::bind(4, &self.state.up_out), gpu::bind(5, &self.state.p_gptq_gu),
             ], (inter.div_ceil(32), 1, 1));
 
             // Fused SiLU(gate) * up → INT4 down_proj → mlp_output
             gpu.dispatch("silu_down", shaders::FUSED_SILU_INT4_MLX, &[
                 gpu::bind(0, &self.state.gate_out), gpu::bind(1, &self.state.up_out),
-                gpu::bind(2, &layer.down_proj_qweight),
-                gpu::bind(3, &layer.down_proj_scales), gpu::bind(4, &biases[6]),
+                gpu::bind(2, &expert.down_proj_qweight),
+                gpu::bind(3, &expert.down_proj_scales), gpu::bind(4, &biases[6]),
                 gpu::bind(5, &self.state.mlp_output), gpu::bind(6, &self.state.p_gptq_down),
             ], (h.div_ceil(32), 1, 1));
 
@@ -2256,12 +2401,14 @@ impl Model {
             ], (seq_len, 1, 1));
 
             // ── MLP: gate + up → SiLU → down ──
+            // MoE not supported in BF16 prefill path — only dense
+            let expert = layer.mlp.dense();
             gpu.flush();
             gpu.write_buffer(&params, 0, bytemuck::bytes_of(&GemmP {
                 d_in: h, d_out: inter, seq_len, has_bias: 0 }));
             gpu.dispatch("pf_gate", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
-                gpu::bind(1, &layer.gate_proj_qweight),
+                gpu::bind(1, &expert.gate_proj_qweight),
                 gpu::bind(2, &normed),
                 gpu::bind(3, &gate_buf),
                 gpu::bind(4, &params),
@@ -2272,7 +2419,7 @@ impl Model {
                 d_in: h, d_out: inter, seq_len, has_bias: 0 }));
             gpu.dispatch("pf_up", shaders::BF16_GEMM, &[
                 gpu::bind(0, &normed),
-                gpu::bind(1, &layer.up_proj_qweight),
+                gpu::bind(1, &expert.up_proj_qweight),
                 gpu::bind(2, &normed),
                 gpu::bind(3, &up_buf),
                 gpu::bind(4, &params),
@@ -2298,7 +2445,7 @@ impl Model {
                 d_in: inter, d_out: h, seq_len, has_bias: 0 }));
             gpu.dispatch("pf_down", shaders::BF16_GEMM, &[
                 gpu::bind(0, &silu_buf),
-                gpu::bind(1, &layer.down_proj_qweight),
+                gpu::bind(1, &expert.down_proj_qweight),
                 gpu::bind(2, &silu_buf),
                 gpu::bind(3, &mlp_out),
                 gpu::bind(4, &params),
@@ -2680,22 +2827,24 @@ impl Model {
             ], (seq_len, 1, 1));
 
             // ── MLP: gate + up (fused) ──
+            // MoE not supported in GPTQ prefill path — only dense
+            let expert = layer.mlp.dense();
             let gemm_gate_wg = inter.div_ceil(8);
             // The fused gate+up shader only supports seq=1 (no batch dim).
             // For batched prefill, fall back to two separate GPTQ GEMMs for gate and up.
             gpu.flush();
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
             gpu.dispatch("pg_gate", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &layer.gate_proj_qweight),
-                gpu::bind(2, &layer.gate_proj_scales), gpu::bind(3, &gate_buf),
+                gpu::bind(0, &normed), gpu::bind(1, &expert.gate_proj_qweight),
+                gpu::bind(2, &expert.gate_proj_scales), gpu::bind(3, &gate_buf),
                 gpu::bind(4, &pg_params),
             ], (gemm_gate_wg, seq_len, 1));
 
             gpu.flush();
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
             gpu.dispatch("pg_up", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &layer.up_proj_qweight),
-                gpu::bind(2, &layer.up_proj_scales), gpu::bind(3, &up_buf),
+                gpu::bind(0, &normed), gpu::bind(1, &expert.up_proj_qweight),
+                gpu::bind(2, &expert.up_proj_scales), gpu::bind(3, &up_buf),
                 gpu::bind(4, &pg_params),
             ], (gemm_gate_wg, seq_len, 1));
 
@@ -2705,7 +2854,7 @@ impl Model {
             gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: inter, n: h, group_size: gs, _pad: 0 }));
             gpu.dispatch("pg_down", fused_down_shader, &[
                 gpu::bind(0, &gate_buf), gpu::bind(1, &up_buf),
-                gpu::bind(2, &layer.down_proj_qweight), gpu::bind(3, &layer.down_proj_scales),
+                gpu::bind(2, &expert.down_proj_qweight), gpu::bind(3, &expert.down_proj_scales),
                 gpu::bind(4, &mlp_out), gpu::bind(5, &pg_params),
             ], (wg_h, seq_len, 1));
 
