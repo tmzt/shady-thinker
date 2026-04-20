@@ -733,11 +733,9 @@ impl InferenceSession {
         let mut generated = Vec::new();
         let bf16 = self.model.bf16_mode;
         let hybrid = self.model.is_hybrid_attn();
-        // Batched GPTQ prefill: only when NOT using think-injection.
-        // Think-injection uses generate_with_epiphanies which manages its own
-        // prefix restoration + per-token decode loop. Mixing with batched prefill
-        // corrupts the KV cache state.
-        let use_gptq = !bf16 && !inject_think;
+        // Batched GPTQ prefill works with think-injection:
+        // prefill_gptq builds KV cache, then think tokens injected via forward().
+        let use_gptq = !bf16;
         log::info!("[shady-thinker] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
             input_ids.len(), bf16, inject_think, hybrid,
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });
