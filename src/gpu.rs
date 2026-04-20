@@ -326,6 +326,59 @@ impl GpuContext {
         self.pending_dispatches += 1;
     }
 
+    /// Dispatch with buffer sub-ranges (offset + optional size).
+    /// Used for packed MoE expert buffers where each expert is at a different offset.
+    /// Bind groups with offsets are NOT cached (each expert dispatch is unique).
+    /// Dispatch with buffer sub-ranges (offset + optional size).
+    /// Used for packed MoE expert buffers where each expert is at a different offset.
+    pub fn dispatch_with_offsets(
+        &mut self,
+        pipeline_name: &str,
+        shader_src: &str,
+        buffers: &[(u32, &wgpu::Buffer, u64, Option<u64>)],
+        workgroups: (u32, u32, u32),
+    ) {
+        self.ensure_pipeline(pipeline_name, shader_src);
+
+        // Create bind group with sub-buffer ranges (not cached — each expert is unique)
+        let bg = {
+            let pipeline = &self.pipelines[pipeline_name];
+            let layout = pipeline.get_bind_group_layout(0);
+            let entries: Vec<wgpu::BindGroupEntry> = buffers
+                .iter()
+                .map(|(binding, buffer, offset, size)| wgpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: *offset,
+                        size: size.map(|s| std::num::NonZeroU64::new(s).unwrap()),
+                    }),
+                })
+                .collect();
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &entries,
+            })
+        };
+
+        self.ensure_encoder();
+        let encoder = self.encoder.as_mut().unwrap();
+        let pipeline = &self.pipelines[pipeline_name];
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(pipeline_name),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        }
+
+        self.pending_dispatches += 1;
+    }
+
     /// Flush all pending dispatches to the GPU.
     pub fn flush(&mut self) {
         if let Some(encoder) = self.encoder.take() {

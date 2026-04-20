@@ -694,6 +694,11 @@ pub fn load_weights(
                 oversized_raw.insert(name.to_string(), bytes.to_vec());
                 continue;
             }
+            // Defer MoE expert weights for packed buffer upload
+            if config.num_experts > 0 && name.contains(".mlp.experts.") {
+                raw_bytes_map.insert(name.to_string(), bytes.to_vec());
+                continue;
+            }
             let buffer = gpu.upload_buffer(&name, bytes);
             tensor_map.insert(name.to_string(), buffer);
         }
@@ -809,23 +814,47 @@ pub fn load_weights(
         };
 
         let mlp = if config.num_experts > 0 {
-            // MoE: load router + per-expert weights
+            // MoE: load router + pack all expert weights into contiguous buffers.
             let router_weight = take(&mut tensor_map, &format!("{pfx}.mlp.gate.weight"));
             let num_experts = config.num_experts as usize;
-            let mut experts = Vec::with_capacity(num_experts);
-            for e in 0..num_experts {
-                experts.push(ExpertWeights {
-                    gate_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.gate_proj.qweight")),
-                    gate_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.gate_proj.scales")),
-                    up_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.up_proj.qweight")),
-                    up_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.up_proj.scales")),
-                    down_proj_qweight: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.down_proj.qweight")),
-                    down_proj_scales: take(&mut tensor_map, &format!("{pfx}.mlp.experts.{e}.down_proj.scales")),
-                });
+
+            // Pack expert weights: concatenate raw bytes for each projection type
+            fn pack_experts(
+                raw: &mut HashMap<String, Vec<u8>>,
+                gpu: &GpuContext,
+                pfx: &str, num_experts: usize, proj: &str, label: &str,
+            ) -> (wgpu::Buffer, u32) {
+                let mut packed = Vec::new();
+                let mut stride = 0u32;
+                for e in 0..num_experts {
+                    let key = format!("{pfx}.mlp.experts.{e}.{proj}");
+                    let bytes = raw.remove(&key).unwrap_or_else(|| panic!("missing: {key}"));
+                    if stride == 0 { stride = (bytes.len() / 4) as u32; } // u32 elements per expert
+                    packed.extend_from_slice(&bytes);
+                }
+                let buf = gpu.upload_buffer(label, &packed);
+                (buf, stride)
             }
-            log::info!("Layer {i}: MoE with {} experts", num_experts);
-            // TODO: pack expert buffers into MlpWeights::MoePacked for stall-free dispatch
-            MlpWeights::Moe { router_weight, experts }
+
+            let (gate_qw, gate_qw_stride) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "gate_proj.qweight", &format!("L{i}.moe.gate_qw"));
+            let (gate_sc, gate_sc_stride) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "gate_proj.scales", &format!("L{i}.moe.gate_sc"));
+            let (up_qw, _) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "up_proj.qweight", &format!("L{i}.moe.up_qw"));
+            let (up_sc, _) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "up_proj.scales", &format!("L{i}.moe.up_sc"));
+            let (down_qw, down_qw_stride) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "down_proj.qweight", &format!("L{i}.moe.down_qw"));
+            let (down_sc, down_sc_stride) = pack_experts(&mut raw_bytes_map, gpu, &pfx, num_experts, "down_proj.scales", &format!("L{i}.moe.down_sc"));
+
+            log::info!("Layer {i}: MoE packed {num_experts} experts (gate_stride={gate_qw_stride}, down_stride={down_qw_stride})");
+
+            MlpWeights::MoePacked {
+                router_weight,
+                packed: PackedExpertWeights {
+                    gate_proj_qweight: gate_qw, gate_proj_scales: gate_sc,
+                    up_proj_qweight: up_qw, up_proj_scales: up_sc,
+                    down_proj_qweight: down_qw, down_proj_scales: down_sc,
+                    gate_qw_stride, gate_sc_stride, down_qw_stride, down_sc_stride,
+                },
+                num_experts: config.num_experts,
+            }
         } else {
             // Dense FFN
             MlpWeights::Dense(ExpertWeights {
