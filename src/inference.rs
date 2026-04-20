@@ -738,11 +738,11 @@ impl InferenceSession {
         let mut generated = Vec::new();
         let bf16 = self.model.bf16_mode;
         let hybrid = self.model.is_hybrid_attn();
-        // Batched GPTQ prefill only for non-think-injection paths.
-        // With think-injection, input_ids includes full system prompt but prefix
-        // cache already has it — kv-only appends after prefix correctly, while
-        // batched prefill overwrites prefix KV and zeroes DeltaNet state.
-        let use_gptq = !bf16 && !inject_think;
+        // Batched GPTQ prefill: processes all input tokens in one GPU pass per layer.
+        // Works with think-injection now that escalate() uses the full system prompt
+        // (matching the prefix cache), so input_ids > prefix_len and DeltaNet gets
+        // the full token stream from scratch.
+        let use_gptq = !bf16;
         log::info!("[shady-thinker] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
             input_ids.len(), bf16, inject_think, hybrid,
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });
