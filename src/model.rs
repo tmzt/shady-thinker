@@ -52,6 +52,8 @@ pub(crate) mod shaders {
 
     // MoE weighted accumulation (grad[i] += lambda * anchor[i])
     pub const GRAD_FMA: &str = include_str!("shaders/grad_fma.wgsl");
+    // MoE top-k router (softmax + top-k on GPU, no CPU readback)
+    pub const MOE_TOPK: &str = include_str!("shaders/moe_topk.wgsl");
 
     // Sampling shader (combined penalty + gate + top-K in one pass)
     pub const FUSED_ROPE_KVSTORE: &str = include_str!("shaders/fused_rope_kvstore.wgsl");
@@ -328,8 +330,10 @@ pub struct InferenceState {
 
     // MoE state buffers (only used when num_experts > 0)
     pub moe_router_logits: wgpu::Buffer,  // [num_experts] f32
+    pub moe_selected: wgpu::Buffer,       // [k*2] u32 — expert_id, weight pairs from GPU top-k
     pub moe_accum: wgpu::Buffer,          // [hidden_size] f32 — weighted expert output accumulator
     pub p_moe_router: wgpu::Buffer,       // params for router bf16_matvec {hidden, num_experts}
+    pub p_moe_topk: wgpu::Buffer,         // params for moe_topk {num_experts, k}
     pub p_moe_gu: wgpu::Buffer,           // params for expert gate+up {hidden, expert_inter, gs}
     pub p_moe_down: wgpu::Buffer,         // params for expert SiLU+down {expert_inter, hidden, gs}
     pub p_moe_fma: wgpu::Buffer,          // params for weighted accumulation {n, lambda}
@@ -786,11 +790,22 @@ impl Model {
                 let ne = if config.num_experts > 0 { config.num_experts } else { 1 };
                 gpu.create_storage_buffer("moe_router_logits", ne as u64 * f)
             },
+            moe_selected: {
+                let k = if config.num_experts_per_tok > 0 { config.num_experts_per_tok } else { 8 };
+                gpu.create_storage_buffer("moe_selected", k as u64 * 2 * f) // k * (expert_id + weight)
+            },
             moe_accum: gpu.create_storage_buffer("moe_accum", h as u64 * f),
             p_moe_router: {
                 let ne = if config.num_experts > 0 { config.num_experts } else { 1 };
                 let buf = gpu.create_buffer("p_moe_router", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
                 gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[h, ne, 0u32, 0u32]));
+                buf
+            },
+            p_moe_topk: {
+                let ne = if config.num_experts > 0 { config.num_experts } else { 1 };
+                let k = if config.num_experts_per_tok > 0 { config.num_experts_per_tok } else { 8 };
+                let buf = gpu.create_buffer("p_moe_topk", 64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+                gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&[ne, k]));
                 buf
             },
             p_moe_gu: {
@@ -1100,15 +1115,22 @@ impl Model {
             gpu::bind(3, &self.state.p_moe_router),
         ], (num_experts.div_ceil(32), 1, 1));
 
-        // 2. GPU flush + readback router logits
-        log::info!("[moe] router dispatch done, flushing ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
-        gpu.flush_and_wait();
-        log::info!("[moe] flush_and_wait done ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
-        let logit_bytes = gpu.read_buffer(&self.state.moe_router_logits, num_experts as u64 * 4);
-        let logits: &[f32] = bytemuck::cast_slice(&logit_bytes);
+        // 2. GPU-side top-k: softmax + select top-K experts (no CPU readback of full logits)
+        gpu.dispatch("moe_topk", shaders::MOE_TOPK, &[
+            gpu::bind(0, &self.state.moe_router_logits),
+            gpu::bind(1, &self.state.moe_selected),
+            gpu::bind(2, &self.state.p_moe_topk),
+        ], (1, 1, 1));
 
-        // 3. CPU softmax + top-k selection
-        let selected = route_top_k(logits, k);
+        // 3. Read back only K expert_id+weight pairs (64 bytes for K=8)
+        gpu.flush_and_wait();
+        let selected_bytes = gpu.read_buffer(&self.state.moe_selected, k as u64 * 2 * 4);
+        let selected_u32: &[u32] = bytemuck::cast_slice(&selected_bytes);
+        let selected: Vec<(usize, f32)> = (0..k).map(|i| {
+            let expert_id = selected_u32[i * 2] as usize;
+            let weight = f32::from_bits(selected_u32[i * 2 + 1]);
+            (expert_id, weight)
+        }).collect();
 
         // 4. Zero the accumulator
         gpu.write_buffer(&self.state.moe_accum, 0, &vec![0u8; h as usize * 4]);
