@@ -2944,37 +2944,60 @@ impl Model {
                 gpu::bind(4, &pg_params),
             ], (seq_len, 1, 1));
 
-            // ── MLP: gate + up (fused) ──
-            // MoE not supported in GPTQ prefill path — only dense
-            let expert = layer.mlp.dense();
-            let gemm_gate_wg = inter.div_ceil(8);
-            // The fused gate+up shader only supports seq=1 (no batch dim).
-            // For batched prefill, fall back to two separate GPTQ GEMMs for gate and up.
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
-            gpu.dispatch("pg_gate", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &expert.gate_proj_qweight),
-                gpu::bind(2, &expert.gate_proj_scales), gpu::bind(3, &gate_buf),
-                gpu::bind(4, &pg_params),
-            ], (gemm_gate_wg, seq_len, 1));
+            // ── MLP ──
+            match &layer.mlp {
+                crate::weights::MlpWeights::Dense(expert) => {
+                    let gemm_gate_wg = inter.div_ceil(8);
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
+                    gpu.dispatch("pg_gate", gemm_shader, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &expert.gate_proj_qweight),
+                        gpu::bind(2, &expert.gate_proj_scales), gpu::bind(3, &gate_buf),
+                        gpu::bind(4, &pg_params),
+                    ], (gemm_gate_wg, seq_len, 1));
 
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
-            gpu.dispatch("pg_up", gemm_shader, &[
-                gpu::bind(0, &normed), gpu::bind(1, &expert.up_proj_qweight),
-                gpu::bind(2, &expert.up_proj_scales), gpu::bind(3, &up_buf),
-                gpu::bind(4, &pg_params),
-            ], (gemm_gate_wg, seq_len, 1));
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: h, n: inter, group_size: gs, _pad: 0 }));
+                    gpu.dispatch("pg_up", gemm_shader, &[
+                        gpu::bind(0, &normed), gpu::bind(1, &expert.up_proj_qweight),
+                        gpu::bind(2, &expert.up_proj_scales), gpu::bind(3, &up_buf),
+                        gpu::bind(4, &pg_params),
+                    ], (gemm_gate_wg, seq_len, 1));
 
-            // ── Fused SiLU(gate) × up × down: [seq, inter] → [seq, h] ──
-            let fused_down_shader = shaders::FUSED_SILU_GPTQ_GEMM_4T;
-            gpu.flush();
-            gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: inter, n: h, group_size: gs, _pad: 0 }));
-            gpu.dispatch("pg_down", fused_down_shader, &[
-                gpu::bind(0, &gate_buf), gpu::bind(1, &up_buf),
-                gpu::bind(2, &expert.down_proj_qweight), gpu::bind(3, &expert.down_proj_scales),
-                gpu::bind(4, &mlp_out), gpu::bind(5, &pg_params),
-            ], (wg_h, seq_len, 1));
+                    let fused_down_shader = shaders::FUSED_SILU_GPTQ_GEMM_4T;
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP { k: inter, n: h, group_size: gs, _pad: 0 }));
+                    gpu.dispatch("pg_down", fused_down_shader, &[
+                        gpu::bind(0, &gate_buf), gpu::bind(1, &up_buf),
+                        gpu::bind(2, &expert.down_proj_qweight), gpu::bind(3, &expert.down_proj_scales),
+                        gpu::bind(4, &mlp_out), gpu::bind(5, &pg_params),
+                    ], (wg_h, seq_len, 1));
+                }
+                crate::weights::MlpWeights::MoePacked { router_weight, packed, num_experts } => {
+                    // MoE prefill: per-token dispatch through the MoE pipeline.
+                    // Each token gets its own routing + expert dispatch.
+                    // Batched attention is already done; only MLP is per-token.
+                    gpu.flush_and_wait();
+                    for tok_idx in 0..seq_len {
+                        let offset = tok_idx as u64 * h as u64 * f;
+                        // Copy this token's normed hidden to state.normed
+                        gpu.copy_buffer_offset(&normed, offset, &self.state.normed, 0, h as u64 * f);
+                        // Run single-token MoE dispatch
+                        self.dispatch_moe_packed(gpu, router_weight, packed, *num_experts, h, inter);
+                        // Copy result back to mlp_out batch buffer
+                        gpu.copy_buffer_offset(&self.state.mlp_output, 0, &mlp_out, offset, h as u64 * f);
+                    }
+                }
+                crate::weights::MlpWeights::Moe { router_weight, experts } => {
+                    gpu.flush_and_wait();
+                    for tok_idx in 0..seq_len {
+                        let offset = tok_idx as u64 * h as u64 * f;
+                        gpu.copy_buffer_offset(&normed, offset, &self.state.normed, 0, h as u64 * f);
+                        self.dispatch_moe(gpu, router_weight, experts, h, inter);
+                        gpu.copy_buffer_offset(&self.state.mlp_output, 0, &mlp_out, offset, h as u64 * f);
+                    }
+                }
+            }
 
             if (layer_idx + 1) % 7 == 0 {
                 log::info!("[prefill_gptq] layer {}/{}", layer_idx + 1, self.config.num_hidden_layers);
