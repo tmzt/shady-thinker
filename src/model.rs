@@ -54,6 +54,10 @@ pub(crate) mod shaders {
     pub const GRAD_FMA: &str = include_str!("shaders/grad_fma.wgsl");
     // MoE top-k router (softmax + top-k on GPU, no CPU readback)
     pub const MOE_TOPK: &str = include_str!("shaders/moe_topk.wgsl");
+    // MoE expert dispatch with packed buffers (reads expert_id from GPU buffer)
+    pub const FUSED_GATE_UP_GPTQ_4T_MOE: &str = include_str!("shaders/fused_gate_up_gptq_4t_moe.wgsl");
+    pub const FUSED_SILU_GPTQ_4T_MOE: &str = include_str!("shaders/fused_silu_gptq_4t_moe.wgsl");
+    pub const MOE_ACCUM: &str = include_str!("shaders/moe_accum.wgsl");
 
     // Sampling shader (combined penalty + gate + top-K in one pass)
     pub const FUSED_ROPE_KVSTORE: &str = include_str!("shaders/fused_rope_kvstore.wgsl");
@@ -1167,9 +1171,9 @@ impl Model {
         log::info!("[moe] layer done: {k} experts dispatched ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    /// MoE dispatch with packed expert buffers.
-    /// Same algorithm as dispatch_moe but uses sub-buffer slices from packed buffers.
-    /// Reduces buffer count from 768/layer to 6/layer.
+    /// MoE dispatch with packed expert buffers — NO CPU readback.
+    /// Router + top-k run on GPU, expert indices stay on GPU.
+    /// Each expert dispatch reads expert_id from moe_selected buffer.
     fn dispatch_moe_packed(
         &self, gpu: &mut GpuContext,
         router_weight: &wgpu::Buffer,
@@ -1177,10 +1181,10 @@ impl Model {
         num_experts: u32,
         h: u32, inter: u32,
     ) {
-        let k = self.config.num_experts_per_tok as usize;
-        let t_start = std::time::Instant::now();
+        let k = self.config.num_experts_per_tok;
+        let gs = self.quant_config.group_size;
 
-        // 1. Router + GPU top-k
+        // 1. Router matvec → logits
         gpu.dispatch("moe_router", shaders::BF16_MATVEC, &[
             gpu::bind(0, &self.state.normed),
             gpu::bind(1, router_weight),
@@ -1188,69 +1192,65 @@ impl Model {
             gpu::bind(3, &self.state.p_moe_router),
         ], (num_experts.div_ceil(32), 1, 1));
 
+        // 2. GPU top-k selection (no readback!)
         gpu.dispatch("moe_topk", shaders::MOE_TOPK, &[
             gpu::bind(0, &self.state.moe_router_logits),
             gpu::bind(1, &self.state.moe_selected),
             gpu::bind(2, &self.state.p_moe_topk),
         ], (1, 1, 1));
 
-        gpu.flush_and_wait();
-        let selected_bytes = gpu.read_buffer(&self.state.moe_selected, k as u64 * 2 * 4);
-        let selected_u32: &[u32] = bytemuck::cast_slice(&selected_bytes);
-        let selected: Vec<(usize, f32)> = (0..k).map(|i| {
-            (selected_u32[i * 2] as usize, f32::from_bits(selected_u32[i * 2 + 1]))
-        }).collect();
-
-        // 2. Zero accumulator
+        // 3. Zero accumulator
         gpu.write_buffer(&self.state.moe_accum, 0, &vec![0u8; h as usize * 4]);
 
-        // 3. For each selected expert: gate+up → SiLU+down → weighted accumulate
-        // Use packed buffers with offset-based sub-buffer views.
-        for &(expert_id, weight) in &selected {
-            let gqw_offset = expert_id as u64 * packed.gate_qw_stride as u64 * 4;
-            let gsc_offset = expert_id as u64 * packed.gate_sc_stride as u64 * 4;
-            let dqw_offset = expert_id as u64 * packed.down_qw_stride as u64 * 4;
-            let dsc_offset = expert_id as u64 * packed.down_sc_stride as u64 * 4;
+        // 4. For each of K expert slots: dispatch gate+up and silu+down using MoE shaders
+        // that read expert_id from moe_selected on GPU. No flush_and_wait!
+        for ki in 0..k {
+            // Update params with expert_idx (which slot of the K selected)
+            gpu.write_buffer(&self.state.p_moe_gu, 0,
+                bytemuck::cast_slice(&[h, inter, gs, ki,
+                    packed.gate_qw_stride, packed.gate_sc_stride]));
 
-            let gqw_size = packed.gate_qw_stride as u64 * 4;
-            let gsc_size = packed.gate_sc_stride as u64 * 4;
-            let dqw_size = packed.down_qw_stride as u64 * 4;
-            let dsc_size = packed.down_sc_stride as u64 * 4;
-
-            // gate+up projection from packed buffers
-            gpu.dispatch_with_offsets("gate_up_moe", shaders::FUSED_GATE_UP_GPTQ_4T, &[
-                (0, &self.state.normed, 0, None),
-                (1, &packed.gate_proj_qweight, gqw_offset, Some(gqw_size)),
-                (2, &packed.gate_proj_scales, gsc_offset, Some(gsc_size)),
-                (3, &packed.up_proj_qweight, gqw_offset, Some(gqw_size)),
-                (4, &packed.up_proj_scales, gsc_offset, Some(gsc_size)),
-                (5, &self.state.gate_out, 0, None),
-                (6, &self.state.up_out, 0, None),
-                (7, &self.state.p_moe_gu, 0, None),
+            // gate+up: reads expert_id from moe_selected[ki*2], indexes packed buffer
+            gpu.dispatch("gate_up_moe", shaders::FUSED_GATE_UP_GPTQ_4T_MOE, &[
+                gpu::bind(0, &self.state.normed),
+                gpu::bind(1, &packed.gate_proj_qweight),
+                gpu::bind(2, &packed.gate_proj_scales),
+                gpu::bind(3, &packed.up_proj_qweight),
+                gpu::bind(4, &packed.up_proj_scales),
+                gpu::bind(5, &self.state.gate_out),
+                gpu::bind(6, &self.state.up_out),
+                gpu::bind(7, &self.state.p_moe_gu),
+                gpu::bind(8, &self.state.moe_selected),
             ], (inter.div_ceil(8), 1, 1));
 
-            // SiLU + down projection from packed buffers
-            gpu.dispatch_with_offsets("silu_down_moe", shaders::FUSED_SILU_GPTQ_4T, &[
-                (0, &self.state.gate_out, 0, None),
-                (1, &self.state.up_out, 0, None),
-                (2, &packed.down_proj_qweight, dqw_offset, Some(dqw_size)),
-                (3, &packed.down_proj_scales, dsc_offset, Some(dsc_size)),
-                (4, &self.state.mlp_output, 0, None),
-                (5, &self.state.p_moe_down, 0, None),
+            // silu+down: reads expert_id from moe_selected[ki*2]
+            gpu.write_buffer(&self.state.p_moe_down, 0,
+                bytemuck::cast_slice(&[inter, h, gs, ki,
+                    packed.down_qw_stride, packed.down_sc_stride]));
+
+            gpu.dispatch("silu_down_moe", shaders::FUSED_SILU_GPTQ_4T_MOE, &[
+                gpu::bind(0, &self.state.gate_out),
+                gpu::bind(1, &self.state.up_out),
+                gpu::bind(2, &packed.down_proj_qweight),
+                gpu::bind(3, &packed.down_proj_scales),
+                gpu::bind(4, &self.state.mlp_output),
+                gpu::bind(5, &self.state.p_moe_down),
+                gpu::bind(6, &self.state.moe_selected),
             ], (h.div_ceil(8), 1, 1));
 
-            // Weighted accumulation
+            // Weighted accumulation: moe_accum += weight * mlp_output
+            // Weight read from moe_selected on GPU — no CPU readback!
             gpu.write_buffer(&self.state.p_moe_fma, 0,
-                bytemuck::cast_slice(&[h, weight.to_bits()]));
-            gpu.dispatch("moe_accum", shaders::GRAD_FMA, &[
+                bytemuck::cast_slice(&[h, ki]));
+            gpu.dispatch("moe_accum_gpu", shaders::MOE_ACCUM, &[
                 gpu::bind(0, &self.state.moe_accum),
                 gpu::bind(1, &self.state.mlp_output),
                 gpu::bind(2, &self.state.p_moe_fma),
+                gpu::bind(3, &self.state.moe_selected),
             ], (h.div_ceil(256), 1, 1));
         }
 
         gpu.copy_buffer(&self.state.moe_accum, &self.state.mlp_output, h as u64 * 4);
-        log::info!("[moe-packed] layer done: {k} experts ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
     }
 
     pub fn add_rmsnorm(
