@@ -1684,6 +1684,10 @@ impl Model {
                 crate::weights::MlpWeights::Moe { router_weight, experts } => {
                     self.dispatch_moe(gpu, router_weight, experts, h, inter);
                 }
+                crate::weights::MlpWeights::MoePacked { .. } => {
+                    // TODO: fused MoE dispatch with packed expert buffers
+                    panic!("MoePacked dispatch not yet implemented");
+                }
             }
 
         }
@@ -2024,6 +2028,10 @@ impl Model {
                 }
                 crate::weights::MlpWeights::Moe { router_weight, experts } => {
                     self.dispatch_moe(gpu, router_weight, experts, h, inter);
+                }
+                crate::weights::MlpWeights::MoePacked { .. } => {
+                    // TODO: fused MoE dispatch with packed expert buffers
+                    panic!("MoePacked dispatch not yet implemented");
                 }
             }
 

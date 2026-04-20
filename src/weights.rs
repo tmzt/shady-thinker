@@ -142,6 +142,22 @@ pub struct ExpertWeights {
     pub down_proj_scales: wgpu::Buffer,
 }
 
+/// Packed expert weights for MoE — all experts concatenated into single buffers.
+/// Each projection type has one buffer: `packed[expert_id * stride .. (expert_id+1) * stride]`.
+pub struct PackedExpertWeights {
+    pub gate_proj_qweight: wgpu::Buffer,  // [num_experts * packed_rows, inter]
+    pub gate_proj_scales: wgpu::Buffer,   // [num_experts * n_groups, inter]
+    pub up_proj_qweight: wgpu::Buffer,
+    pub up_proj_scales: wgpu::Buffer,
+    pub down_proj_qweight: wgpu::Buffer,  // [num_experts * inter_packed_rows, hidden]
+    pub down_proj_scales: wgpu::Buffer,
+    /// Stride in u32 elements for gate/up qweight per expert
+    pub gate_qw_stride: u32,
+    pub gate_sc_stride: u32,
+    pub down_qw_stride: u32,
+    pub down_sc_stride: u32,
+}
+
 /// MLP weights — either a single dense FFN or MoE with router + experts
 pub enum MlpWeights {
     /// Standard dense FFN (single expert)
@@ -150,8 +166,14 @@ pub enum MlpWeights {
     Moe {
         /// Router weight [num_experts, hidden_size] BF16
         router_weight: wgpu::Buffer,
-        /// Per-expert MLP weights
+        /// Per-expert MLP weights (individual buffers — legacy, slow on Metal)
         experts: Vec<ExpertWeights>,
+    },
+    /// Packed MoE: all experts in contiguous buffers (fast, fewer GPU buffers)
+    MoePacked {
+        router_weight: wgpu::Buffer,
+        packed: PackedExpertWeights,
+        num_experts: u32,
     },
 }
 
@@ -169,12 +191,12 @@ impl MlpWeights {
     pub fn dense(&self) -> &ExpertWeights {
         match self {
             MlpWeights::Dense(e) => e,
-            MlpWeights::Moe { .. } => panic!("expected Dense MLP, got MoE"),
+            MlpWeights::Moe { .. } | MlpWeights::MoePacked { .. } => panic!("expected Dense MLP, got MoE"),
         }
     }
 
     pub fn is_moe(&self) -> bool {
-        matches!(self, MlpWeights::Moe { .. })
+        matches!(self, MlpWeights::Moe { .. } | MlpWeights::MoePacked { .. })
     }
 }
 
@@ -802,6 +824,7 @@ pub fn load_weights(
                 });
             }
             log::info!("Layer {i}: MoE with {} experts", num_experts);
+            // TODO: pack expert buffers into MlpWeights::MoePacked for stall-free dispatch
             MlpWeights::Moe { router_weight, experts }
         } else {
             // Dense FFN
