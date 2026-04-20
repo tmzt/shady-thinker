@@ -17,6 +17,8 @@ pub struct GpuContext {
     /// Pre-allocated probe buffers for Poll-mode flush_and_wait (avoids per-call allocation).
     flush_probe_src: Option<wgpu::Buffer>,
     flush_probe_dst: Option<wgpu::Buffer>,
+    /// Whether flush_probe_dst is currently in a mapped state.
+    flush_probe_mapped: bool,
 }
 
 impl GpuContext {
@@ -41,6 +43,7 @@ impl GpuContext {
             has_pipeline_cache_feature: false,
             flush_probe_src: None,
             flush_probe_dst: None,
+            flush_probe_mapped: false,
         };
         ctx.init_flush_probe();
         ctx
@@ -114,6 +117,7 @@ impl GpuContext {
             has_pipeline_cache_feature: has_pc,
             flush_probe_src: None,
             flush_probe_dst: None,
+            flush_probe_mapped: false,
         };
         ctx.init_flush_probe();
         ctx
@@ -397,6 +401,13 @@ impl GpuContext {
         // probe_dst fires only after this fence — i.e., after all prior work is done.
         let probe_src = self.flush_probe_src.as_ref().expect("flush_probe_src not init");
         let probe_dst = self.flush_probe_dst.as_ref().expect("flush_probe_dst not init");
+
+        // Unmap probe_dst if it's still mapped from a previous call
+        if self.flush_probe_mapped {
+            probe_dst.unmap();
+            self.flush_probe_mapped = false;
+        }
+
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("flush_probe"),
         });
@@ -406,15 +417,20 @@ impl GpuContext {
         let slice = probe_dst.slice(..);
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.flush_probe_mapped = true;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let _ = self.device.poll(wgpu::PollType::Poll);
             match rx.try_recv() {
-                Ok(_) => { probe_dst.unmap(); return; }
+                Ok(_) => {
+                    probe_dst.unmap();
+                    self.flush_probe_mapped = false;
+                    return;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= deadline {
                         log::warn!("[gpu] flush_and_wait: timed out after 30s — GPU may be hung");
-                        return;
+                        return; // leave mapped — next call will unmap
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
