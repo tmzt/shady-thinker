@@ -2984,14 +2984,18 @@ impl Model {
                     // 1. Router: batched BF16 GEMM for all positions
                     let router_logits_batch = gpu.create_storage_buffer(
                         "pg_moe_router", sl * ne as u64 * f);
+                    // BF16 GEMM params: {d_in, d_out, seq_len, has_bias}
                     gpu.flush();
-                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP {
-                        k: h, n: ne, group_size: 0, _pad: 0 }));
-                    // BF16 GEMM: [seq_len, H] × [H, ne] → [seq_len, ne]
+                    #[repr(C)]
+                    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+                    struct BF16GemmP { d_in: u32, d_out: u32, seq_len: u32, has_bias: u32 }
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&BF16GemmP {
+                        d_in: h, d_out: ne, seq_len, has_bias: 0 }));
+                    // BF16 GEMM: [seq_len, H] × [ne, H]^T → [seq_len, ne]
                     gpu.dispatch("pg_moe_router", shaders::BF16_GEMM, &[
                         gpu::bind(0, &normed),
                         gpu::bind(1, router_weight),
-                        gpu::bind(2, &normed), // dummy (BF16_GEMM needs 5 bindings)
+                        gpu::bind(2, &normed), // dummy bias (has_bias=0)
                         gpu::bind(3, &router_logits_batch),
                         gpu::bind(4, &pg_params),
                     ], (ne.div_ceil(32), seq_len, 1));
