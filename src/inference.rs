@@ -132,6 +132,8 @@ pub struct InferenceSession {
     pub prefix_len: u32,
     /// In-memory snapshot captured after set_prefix() completes.
     pub(crate) prefix_snapshot: Option<PrefixSnapshot>,
+    /// Optional ASR encoder for audio input (Qwen3-ASR models).
+    pub asr_encoder: Option<crate::asr_encoder::AsrEncoder>,
 }
 
 impl InferenceSession {
@@ -199,7 +201,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu, config, think_config: None, prefix_len: 0, prefix_snapshot: None };
+        let mut session = Self { model, gpu, config, think_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -221,6 +223,80 @@ impl InferenceSession {
 
     pub fn set_think_config(&mut self, config: ThinkConfig) {
         self.think_config = Some(config);
+    }
+
+    /// Load the ASR audio encoder from the model directory.
+    /// Call after new() for ASR-capable models (Qwen3-ASR).
+    pub fn load_asr_encoder(&mut self, model_dir: &std::path::Path) {
+        let enc_gpu = GpuContext::from_device_queue(
+            self.gpu.device.clone(), self.gpu.queue.clone(),
+        );
+        self.asr_encoder = Some(crate::asr_encoder::AsrEncoder::load(enc_gpu, model_dir));
+        log::info!("[shady-thinker] ASR encoder loaded");
+    }
+
+    /// Run ASR inference: mel spectrogram → token IDs.
+    ///
+    /// `mel_data` is mel-bin-major: [128 × n_frames] f32.
+    /// Returns token IDs — caller decodes with tokenizer.
+    pub fn infer_mel(&mut self, mel_data: &[f32], mel_frames: u32) -> Vec<u32> {
+        let encoder = match self.asr_encoder.as_mut() {
+            Some(e) => e,
+            None => {
+                log::error!("[shady-thinker] infer_mel called without ASR encoder loaded");
+                return Vec::new();
+            }
+        };
+
+        let t0 = std::time::Instant::now();
+
+        // Encoder: mel → hidden states
+        let (encoder_output, enc_seq_len, _conv_ms, _transformer_ms) =
+            encoder.forward_mel(mel_data, mel_frames);
+        let enc_ms = t0.elapsed().as_millis();
+        log::info!("[asr] encoder: {} frames → {} tokens in {}ms",
+            mel_frames, enc_seq_len, enc_ms);
+
+        // Restore prefix (decoder system prompt KV cache)
+        if self.prefix_snapshot.is_some() {
+            self.restore_prefix_snapshot();
+        } else {
+            self.model.seq_len = self.prefix_len;
+        }
+        self.model.generated_tokens.clear();
+
+        // Inject encoder output embeddings into decoder KV cache.
+        // All except last via kv_only, last via full forward (produces first decode token).
+        let h = self.config.hidden_size as usize;
+        let n_enc = enc_seq_len as usize;
+        for (i, chunk) in encoder_output.chunks_exact(h).enumerate() {
+            if i < n_enc - 1 {
+                self.model.forward_embed_kv_only(&mut self.gpu, chunk);
+                if (i + 1) % 4 == 0 { self.gpu.flush_and_wait(); }
+            }
+        }
+        self.gpu.flush_and_wait();
+
+        // Decode: autoregressive token generation
+        let t1 = std::time::Instant::now();
+        let last_embed = &encoder_output[(n_enc - 1) * h..n_enc * h];
+        let mut token = self.model.forward_embed(&mut self.gpu, last_embed);
+        let eos_ids = [151643u32, 151645]; // <|endoftext|>, <|im_end|>
+
+        let mut token_ids = Vec::new();
+        let max_tokens = 448u32;
+        for _ in 0..max_tokens {
+            if eos_ids.contains(&token) { break; }
+            token_ids.push(token);
+            token = self.model.forward(&mut self.gpu, token);
+        }
+
+        let dec_ms = t1.elapsed().as_millis();
+        log::info!("[asr] decode: {} tokens in {}ms ({:.1} tok/s)",
+            token_ids.len(), dec_ms,
+            token_ids.len() as f64 / (dec_ms as f64 / 1000.0).max(0.001));
+
+        token_ids
     }
 
     /// Enable JSON-constrained sampling for subsequent generate calls.
