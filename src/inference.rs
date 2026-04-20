@@ -733,10 +733,11 @@ impl InferenceSession {
         let mut generated = Vec::new();
         let bf16 = self.model.bf16_mode;
         let hybrid = self.model.is_hybrid_attn();
-        // Use batched GPTQ prefill for dense models (even with think-injection).
-        // MoE batched prefill has output quality bug — use per-token for now.
-        let has_moe = self.model.config.num_experts > 0;
-        let use_gptq = !bf16 && !has_moe;
+        // Batched GPTQ prefill: only when NOT using think-injection.
+        // Think-injection uses generate_with_epiphanies which manages its own
+        // prefix restoration + per-token decode loop. Mixing with batched prefill
+        // corrupts the KV cache state.
+        let use_gptq = !bf16 && !inject_think;
         log::info!("[shady-thinker] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
             input_ids.len(), bf16, inject_think, hybrid,
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });
