@@ -1090,6 +1090,7 @@ impl Model {
     ) {
         let num_experts = self.config.num_experts;
         let k = self.config.num_experts_per_tok as usize;
+        let t_start = std::time::Instant::now();
 
         // 1. Router: bf16_matvec(normed, router_weight) → router_logits
         gpu.dispatch("moe_router", shaders::BF16_MATVEC, &[
@@ -1100,7 +1101,9 @@ impl Model {
         ], (num_experts.div_ceil(32), 1, 1));
 
         // 2. GPU flush + readback router logits
+        log::info!("[moe] router dispatch done, flushing ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
         gpu.flush_and_wait();
+        log::info!("[moe] flush_and_wait done ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
         let logit_bytes = gpu.read_buffer(&self.state.moe_router_logits, num_experts as u64 * 4);
         let logits: &[f32] = bytemuck::cast_slice(&logit_bytes);
 
@@ -1139,6 +1142,7 @@ impl Model {
 
         // 6. Copy accumulator to mlp_output
         gpu.copy_buffer(&self.state.moe_accum, &self.state.mlp_output, h as u64 * 4);
+        log::info!("[moe] layer done: {k} experts dispatched ({:.1}ms)", t_start.elapsed().as_secs_f64() * 1000.0);
     }
 
     pub fn add_rmsnorm(
