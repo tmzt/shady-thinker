@@ -892,16 +892,24 @@ impl InferenceSession {
                                         let response = format!("\n<tool_response>\n{}\n</tool_response>\n", result.response);
                                         let response_ids = dispatcher.tokenize(&response);
 
-                                        log::info!("[epiphany] instant: injecting {} tokens", response_ids.len());
-                                        for &inj_tok in &response_ids {
+                                        // Truncate to avoid blowing context window — max 512 tokens per tool response.
+                                        let max_inject = 512;
+                                        let inject_ids = if response_ids.len() > max_inject {
+                                            log::warn!("[epiphany] truncating tool response: {} → {} tokens", response_ids.len(), max_inject);
+                                            &response_ids[..max_inject]
+                                        } else {
+                                            &response_ids[..]
+                                        };
+                                        log::info!("[epiphany] instant: injecting {} tokens", inject_ids.len());
+                                        for &inj_tok in inject_ids {
                                             self.model.forward(&mut self.gpu, inj_tok);
                                         }
-                                        generated.extend_from_slice(&response_ids);
+                                        generated.extend_from_slice(inject_ids);
                                         epiphany_count += 1;
 
                                         // Continue decode from last injected token
                                         token = self.model.forward(&mut self.gpu,
-                                            *response_ids.last().unwrap_or(&token));
+                                            *inject_ids.last().unwrap_or(&token));
                                         continue;
                                     }
                                     ToolCost::Async => {
