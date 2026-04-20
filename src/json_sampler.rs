@@ -87,6 +87,14 @@ impl JsonSampler {
         Self { sm: JsonSM::new(), schema: None, token_bytes, eos_ids }
     }
 
+    /// Create an unconstrained sampler (no token_bytes filtering, no schema).
+    /// Used for dynamic activation mid-generation (e.g. after <tool_call>).
+    /// The sampler enforces JSON structure via the state machine but does not
+    /// mask individual tokens (token_bytes is empty → all tokens pass).
+    pub fn new_unconstrained() -> Self {
+        Self { sm: JsonSM::new(), schema: None, token_bytes: Vec::new(), eos_ids: Vec::new() }
+    }
+
     /// Enable schema-guided decoding with tool definitions.
     pub fn enable_schema(&mut self) {
         self.schema = Some(crate::json_schema::SchemaFST::new());

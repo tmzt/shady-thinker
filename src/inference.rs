@@ -110,6 +110,24 @@ pub struct ThinkConfig {
     pub think_end_ids: Vec<u32>,
 }
 
+/// Tool call detection config for Qwen3.5 native function calling.
+/// Enables a state machine: free thinking → JSON-constrained tool call → stop.
+pub struct ToolCallConfig {
+    pub tool_call_start_ids: Vec<u32>, // <tool_call> token sequence
+    pub tool_call_end_ids: Vec<u32>,   // </tool_call> token sequence
+}
+
+/// Generation state for think-then-tool models.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum GenState {
+    /// Free generation inside <think> block (no constraints)
+    Thinking,
+    /// After </think>, waiting for <tool_call> or text
+    AwaitTool,
+    /// Inside <tool_call>, JSON sampler active
+    JsonConstrained,
+}
+
 /// In-memory snapshot of GPU state after system prompt prefill.
 /// Allows each generate() to restore the prefix state and run only
 /// the query tokens, instead of re-running the full context.
@@ -127,6 +145,8 @@ pub struct InferenceSession {
     pub gpu: GpuContext,
     pub config: ModelConfig,
     pub think_config: Option<ThinkConfig>,
+    /// Tool call detection for think-then-constrain models (Qwen3.5 Fast).
+    pub tool_call_config: Option<ToolCallConfig>,
     /// KV cache position after prefix prefill. Each generate() call resets
     /// seq_len to this value so the cached system prompt is never re-run.
     pub prefix_len: u32,
@@ -201,7 +221,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu, config, think_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None };
+        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -223,6 +243,10 @@ impl InferenceSession {
 
     pub fn set_think_config(&mut self, config: ThinkConfig) {
         self.think_config = Some(config);
+    }
+
+    pub fn set_tool_call_config(&mut self, config: ToolCallConfig) {
+        self.tool_call_config = Some(config);
     }
 
     /// Load the ASR audio encoder from the model directory.
@@ -940,12 +964,60 @@ impl InferenceSession {
         let marker = dispatcher.map(|d| d.tool_call_end_marker().to_vec());
         let marker_len = marker.as_ref().map(|m| m.len()).unwrap_or(0);
 
+        // Tool call state machine (think-then-constrain for Fast thinker)
+        let mut gen_state = if self.think_config.is_some() {
+            GenState::Thinking
+        } else {
+            GenState::AwaitTool
+        };
+        let tc_config_start = self.tool_call_config.as_ref().map(|c| c.tool_call_start_ids.clone());
+        let tc_config_end = self.tool_call_config.as_ref().map(|c| c.tool_call_end_ids.clone());
+        let think_end = self.think_config.as_ref().map(|c| c.think_end_ids.clone());
+
         for _ in 0..max_tokens {
             if eos_ids.contains(&token) { break; }
             if let Some(flag) = cancel {
                 if flag.load(Ordering::Relaxed) { state = GenerateState::Interrupted; break; }
             }
             generated.push(token);
+
+            // ── Tool call state machine ──
+            if self.tool_call_config.is_some() {
+                match gen_state {
+                    GenState::Thinking => {
+                        if let Some(ref end_ids) = think_end {
+                            if ends_with_ids(&generated, end_ids) {
+                                gen_state = GenState::AwaitTool;
+                                log::info!("[gen-state] Thinking → AwaitTool (</think> detected)");
+                            }
+                        }
+                    }
+                    GenState::AwaitTool => {
+                        if let Some(ref start_ids) = tc_config_start {
+                            if ends_with_ids(&generated, start_ids) {
+                                // Enable JSON constraint dynamically
+                                if self.model.json_sampler.is_none() {
+                                    // Re-use the pre-built first_bytes_buf (uploaded at enable_json_mode time)
+                                    // For dynamic enable, we just need to set the sampler
+                                    let sampler = crate::json_sampler::JsonSampler::new_unconstrained();
+                                    self.model.json_sampler = Some(sampler);
+                                }
+                                gen_state = GenState::JsonConstrained;
+                                log::info!("[gen-state] AwaitTool → JsonConstrained (<tool_call> detected)");
+                            }
+                        }
+                    }
+                    GenState::JsonConstrained => {
+                        if let Some(ref end_ids) = tc_config_end {
+                            if ends_with_ids(&generated, end_ids) {
+                                // Tool call complete — stop immediately, free GPU
+                                log::info!("[gen-state] JsonConstrained → Done (</tool_call>, stopping)");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Check for tool call end marker
             if let (Some(ref marker), Some(dispatcher)) = (&marker, dispatcher) {
@@ -1049,4 +1121,12 @@ impl InferenceSession {
             epiphany_count,
         }
     }
+}
+
+/// Check if the last N tokens of `generated` match `marker` exactly.
+fn ends_with_ids(generated: &[u32], marker: &[u32]) -> bool {
+    if marker.is_empty() || generated.len() < marker.len() {
+        return false;
+    }
+    &generated[generated.len() - marker.len()..] == marker
 }
