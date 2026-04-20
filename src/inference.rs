@@ -333,11 +333,19 @@ impl InferenceSession {
         self.gpu.write_buffer(&self.model.state.seen_bitmap, 0, &zero_bitmap);
 
         let t0 = std::time::Instant::now();
-        if !self.model.bf16_mode {
-            // Batched GPTQ prefill: processes all tokens in one GPU pass per layer.
-            // Handles both self-attn and DeltaNet linear-attn layers.
-            self.model.prefill_gptq(&mut self.gpu, ids);
-        } else {
+        let has_moe = self.model.config.num_experts > 0;
+        if has_moe {
+            // MoE prefill: per-token forward (no batched prefill for MoE yet).
+            // Use forward_argmax which doesn't set prefill_kv_only flag.
+            log::info!("[shady-thinker] MoE per-token prefill: {} tokens", ids.len());
+            for (i, &tok) in ids.iter().enumerate() {
+                self.model.forward_kv_only(&mut self.gpu, tok);
+                if (i + 1) % 10 == 0 {
+                    log::info!("[shady-thinker] MoE prefill: {}/{} tokens", i + 1, ids.len());
+                }
+            }
+            self.gpu.flush_and_wait();
+        } else if self.model.bf16_mode {
             for (i, &tok) in ids.iter().enumerate() {
                 self.model.forward_kv_only(&mut self.gpu, tok);
                 if (i + 1) % 4 == 0 {
@@ -345,6 +353,10 @@ impl InferenceSession {
                 }
             }
             self.gpu.flush_and_wait();
+        } else {
+            // Batched GPTQ prefill: processes all tokens in one GPU pass per layer.
+            // Handles both self-attn and DeltaNet linear-attn layers.
+            self.model.prefill_gptq(&mut self.gpu, ids);
         }
 
         self.prefix_len = self.model.seq_len;
