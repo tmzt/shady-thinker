@@ -2974,18 +2974,151 @@ impl Model {
                     ], (wg_h, seq_len, 1));
                 }
                 crate::weights::MlpWeights::MoePacked { router_weight, packed, num_experts } => {
-                    // MoE prefill: per-token dispatch through the MoE pipeline.
-                    // Each token gets its own routing + expert dispatch.
-                    // Batched attention is already done; only MLP is per-token.
+                    // Batched MoE prefill:
+                    // 1. Batched router GEMM: [seq_len, H] × [H, num_experts] → [seq_len, num_experts]
+                    // 2. CPU top-k per position (read back all logits)
+                    // 3. Group tokens by expert, batch GEMM per expert
+                    let ne = *num_experts;
+                    let k = self.config.num_experts_per_tok as usize;
+
+                    // 1. Router: batched BF16 GEMM for all positions
+                    let router_logits_batch = gpu.create_storage_buffer(
+                        "pg_moe_router", sl * ne as u64 * f);
+                    gpu.flush();
+                    gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP {
+                        k: h, n: ne, group_size: 0, _pad: 0 }));
+                    // BF16 GEMM: [seq_len, H] × [H, ne] → [seq_len, ne]
+                    gpu.dispatch("pg_moe_router", shaders::BF16_GEMM, &[
+                        gpu::bind(0, &normed),
+                        gpu::bind(1, router_weight),
+                        gpu::bind(2, &normed), // dummy (BF16_GEMM needs 5 bindings)
+                        gpu::bind(3, &router_logits_batch),
+                        gpu::bind(4, &pg_params),
+                    ], (ne.div_ceil(32), seq_len, 1));
+
+                    // 2. Read back all router logits and do CPU top-k per position
                     gpu.flush_and_wait();
-                    for tok_idx in 0..seq_len {
-                        let offset = tok_idx as u64 * h as u64 * f;
-                        // Copy this token's normed hidden to state.normed
-                        gpu.copy_buffer_offset(&normed, offset, &self.state.normed, 0, h as u64 * f);
-                        // Run single-token MoE dispatch
-                        self.dispatch_moe_packed(gpu, router_weight, packed, *num_experts, h, inter);
-                        // Copy result back to mlp_out batch buffer
-                        gpu.copy_buffer_offset(&self.state.mlp_output, 0, &mlp_out, offset, h as u64 * f);
+                    let logit_bytes = gpu.read_buffer(&router_logits_batch,
+                        sl * ne as u64 * f);
+                    let all_logits: &[f32] = bytemuck::cast_slice(&logit_bytes);
+
+                    // Per-position top-k → build expert→token assignment
+                    // expert_tokens[expert_id] = vec of (token_idx, weight)
+                    let mut expert_tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne as usize];
+                    for pos in 0..seq_len as usize {
+                        let logits = &all_logits[pos * ne as usize..(pos + 1) * ne as usize];
+                        let selected = route_top_k(logits, k);
+                        for (expert_id, weight) in selected {
+                            expert_tokens[expert_id].push((pos as u32, weight));
+                        }
+                    }
+
+                    // 3. Zero output
+                    let zero_buf = vec![0u8; seq_len as usize * h as usize * 4];
+                    gpu.write_buffer(&mlp_out, 0, &zero_buf);
+
+                    // 4. For each expert with assigned tokens: gather → batch GEMM → scatter
+                    for expert_id in 0..ne as usize {
+                        let tokens = &expert_tokens[expert_id];
+                        if tokens.is_empty() { continue; }
+                        let batch = tokens.len() as u32;
+
+                        // Gather: collect assigned tokens' normed hidden into a contiguous buffer
+                        let gathered = gpu.create_storage_buffer(
+                            &format!("pg_moe_gather_{expert_id}"),
+                            batch as u64 * h as u64 * f);
+                        for (i, &(tok_idx, _)) in tokens.iter().enumerate() {
+                            gpu.copy_buffer_offset(
+                                &normed, tok_idx as u64 * h as u64 * f,
+                                &gathered, i as u64 * h as u64 * f,
+                                h as u64 * f);
+                        }
+
+                        // Expert gate+up GEMM: [batch, H] × expert's [H/8, inter] → [batch, inter]
+                        let expert_gate = gpu.create_storage_buffer(
+                            &format!("pg_moe_egate_{expert_id}"), batch as u64 * inter as u64 * f);
+                        let expert_up = gpu.create_storage_buffer(
+                            &format!("pg_moe_eup_{expert_id}"), batch as u64 * inter as u64 * f);
+
+                        let gqw_offset = expert_id as u64 * packed.gate_qw_stride as u64 * 4;
+                        let gsc_offset = expert_id as u64 * packed.gate_sc_stride as u64 * 4;
+                        let gqw_size = packed.gate_qw_stride as u64 * 4;
+                        let gsc_size = packed.gate_sc_stride as u64 * 4;
+
+                        gpu.flush();
+                        gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP {
+                            k: h, n: inter, group_size: gs, _pad: 0 }));
+                        gpu.dispatch_with_offsets("pg_moe_gate", shaders::GPTQ_GEMM_4T, &[
+                            (0, &gathered, 0, None),
+                            (1, &packed.gate_proj_qweight, gqw_offset, Some(gqw_size)),
+                            (2, &packed.gate_proj_scales, gsc_offset, Some(gsc_size)),
+                            (3, &expert_gate, 0, None),
+                            (4, &pg_params, 0, None),
+                        ], (inter.div_ceil(8), batch, 1));
+
+                        gpu.flush();
+                        gpu.dispatch_with_offsets("pg_moe_up", shaders::GPTQ_GEMM_4T, &[
+                            (0, &gathered, 0, None),
+                            (1, &packed.up_proj_qweight, gqw_offset, Some(gqw_size)),
+                            (2, &packed.up_proj_scales, gsc_offset, Some(gsc_size)),
+                            (3, &expert_up, 0, None),
+                            (4, &pg_params, 0, None),
+                        ], (inter.div_ceil(8), batch, 1));
+
+                        // SiLU + down GEMM
+                        let expert_down = gpu.create_storage_buffer(
+                            &format!("pg_moe_edown_{expert_id}"), batch as u64 * h as u64 * f);
+
+                        let dqw_offset = expert_id as u64 * packed.down_qw_stride as u64 * 4;
+                        let dsc_offset = expert_id as u64 * packed.down_sc_stride as u64 * 4;
+                        let dqw_size = packed.down_qw_stride as u64 * 4;
+                        let dsc_size = packed.down_sc_stride as u64 * 4;
+
+                        gpu.flush();
+                        gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&GemmP {
+                            k: inter, n: h, group_size: gs, _pad: 0 }));
+                        gpu.dispatch_with_offsets("pg_moe_down", shaders::FUSED_SILU_GPTQ_GEMM_4T, &[
+                            (0, &expert_gate, 0, None),
+                            (1, &expert_up, 0, None),
+                            (2, &packed.down_proj_qweight, dqw_offset, Some(dqw_size)),
+                            (3, &packed.down_proj_scales, dsc_offset, Some(dsc_size)),
+                            (4, &expert_down, 0, None),
+                            (5, &pg_params, 0, None),
+                        ], (wg_h, batch, 1));
+
+                        // Scatter: weighted accumulate back to original positions
+                        gpu.flush_and_wait();
+                        for (i, &(tok_idx, weight)) in tokens.iter().enumerate() {
+                            let src_offset = i as u64 * h as u64 * f;
+                            let dst_offset = tok_idx as u64 * h as u64 * f;
+                            // Read expert output for this token, scale by weight, add to mlp_out
+                            // For now: copy to state.mlp_output, use grad_fma to accumulate
+                            gpu.copy_buffer_offset(
+                                &expert_down, src_offset,
+                                &self.state.mlp_output, 0,
+                                h as u64 * f);
+                            gpu.write_buffer(&self.state.p_moe_fma, 0,
+                                bytemuck::cast_slice(&[h, weight.to_bits()]));
+                            // Accumulate: mlp_out[tok_idx*H..(tok_idx+1)*H] += weight * expert_result
+                            // Need offset-aware accumulation — use copy + fma at offset
+                            gpu.copy_buffer_offset(
+                                &mlp_out, dst_offset,
+                                &self.state.moe_accum, 0,
+                                h as u64 * f);
+                            gpu.dispatch("pg_moe_accum", shaders::GRAD_FMA, &[
+                                gpu::bind(0, &self.state.moe_accum),
+                                gpu::bind(1, &self.state.mlp_output),
+                                gpu::bind(2, &self.state.p_moe_fma),
+                            ], (h.div_ceil(256), 1, 1));
+                            gpu.copy_buffer_offset(
+                                &self.state.moe_accum, 0,
+                                &mlp_out, dst_offset,
+                                h as u64 * f);
+                        }
+                    }
+
+                    if (layer_idx + 1) % 7 == 0 {
+                        log::info!("[prefill_gptq] MoE layer {}/{}", layer_idx + 1, self.config.num_hidden_layers);
                     }
                 }
                 crate::weights::MlpWeights::Moe { router_weight, experts } => {
