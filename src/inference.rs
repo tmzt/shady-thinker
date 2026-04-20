@@ -712,7 +712,12 @@ impl InferenceSession {
             input_ids.len(), max_tokens);
 
         // Reset KV cache to prefix boundary (0 if no prefix is set) and clear sampling state.
-        self.model.seq_len = self.prefix_len;
+        // Always restore prefix snapshot when available — ensures DeltaNet state is clean.
+        if self.prefix_snapshot.is_some() {
+            self.restore_prefix_snapshot();
+        } else {
+            self.model.seq_len = self.prefix_len;
+        }
         self.model.generated_tokens.clear();
         if let Some(ref mut js) = self.model.json_sampler {
             js.reset();
