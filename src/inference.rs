@@ -397,7 +397,7 @@ impl InferenceSession {
         self.gpu.write_buffer(&self.model.state.first_bytes_buf, 0, &fb_bytes);
         let mut sampler = crate::json_sampler::JsonSampler::new(token_bytes, eos_ids);
         sampler.set_min_keys(2);
-        sampler.enable_schema(); // Schema-guided decoding for tool calls
+        sampler.enable_schema();
         self.model.json_sampler = Some(sampler);
     }
 
@@ -866,15 +866,17 @@ impl InferenceSession {
             };
         }
 
-        log::info!("[shady-thinker] generate: {} input tokens, max_tokens={}",
-            input_ids.len(), max_tokens);
+        log::info!("[shady-thinker] generate: {} input tokens, max_tokens={}, prefix_snap={}, prefix_len={}",
+            input_ids.len(), max_tokens, self.prefix_snapshot.is_some(), self.prefix_len);
 
         // Reset KV cache to prefix boundary (0 if no prefix is set) and clear sampling state.
         // Always restore prefix snapshot when available — ensures DeltaNet state is clean.
         if self.prefix_snapshot.is_some() {
             self.restore_prefix_snapshot();
+            log::info!("[shady-thinker] prefix restored, seq_len={}", self.model.seq_len);
         } else {
             self.model.seq_len = self.prefix_len;
+            log::info!("[shady-thinker] no snapshot, seq_len reset to {}", self.prefix_len);
         }
         self.model.generated_tokens.clear();
         if let Some(ref mut js) = self.model.json_sampler {

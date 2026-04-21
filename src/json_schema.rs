@@ -15,16 +15,13 @@ const WILD: u8 = 0x00;
 /// where `\x00` positions accept any printable byte.
 pub fn build_templates() -> Vec<Vec<u8>> {
     vec![
-        template(r#"{"tool": "dispatch_task", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "submit_project_ticket", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "create_coder_project", "name": ""#, &[WILD], r#""}"#, &[], r#""#),
-        template(r#"{"tool": "plan_coder_task", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "refine_coder_plan", "project": ""#, &[WILD], r#"", "prompt": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "execute_coder_plan", "project": ""#, &[WILD], r#""}"#, &[], r#""#),
+        template(r#"{"tool": "gmail_search", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
+        template(r#"{"tool": "calendar_events", "days": ""#, &[WILD], r#""}"#, &[], r#""#),
+        template(r#"{"tool": "calendar_search", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
+        template(r#"{"tool": "drive_list"}"#, &[], r#""#, &[], r#""#),
+        template(r#"{"tool": "drive_search", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
-        template(r#"{"tool": "find_entity", "name": ""#, &[WILD], r#"", "type": ""#, &[WILD], r#""}"#),
-        template(r#"{"tool": "escalate_to_oracle", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
-        // NOTE: context_entities removed — just "query" field for now
+        template(r#"{"tool": "escalate", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
     ]
 }
 
