@@ -154,6 +154,8 @@ pub struct InferenceSession {
     pub(crate) prefix_snapshot: Option<PrefixSnapshot>,
     /// Optional ASR encoder for audio input (Qwen3-ASR models).
     pub asr_encoder: Option<crate::asr_encoder::AsrEncoder>,
+    /// ASR-specific prefix cache (built by asr_decoder, not from system prompt text).
+    pub asr_prefix_cache: Option<crate::asr_decoder::PrefixCache>,
 }
 
 impl InferenceSession {
@@ -221,7 +223,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None };
+        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None, asr_prefix_cache: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -261,9 +263,8 @@ impl InferenceSession {
 
     /// Run ASR inference: mel → encoder → asr_decoder (proven path).
     ///
-    /// Delegates to `asr_decoder::gpu_asr_decode_tokens` which uses
-    /// `forward_embed_argmax` — the same path that produced correct
-    /// transcriptions previously.
+    /// Uses the `asr_prefix_cache` (built by `asr_decoder::precompute_prefix_cache`)
+    /// and delegates to `gpu_asr_decode_tokens` which uses `forward_embed_argmax`.
     pub fn infer_mel(&mut self, mel_data: &[f32], mel_frames: u32) -> Vec<u32> {
         let encoder = match self.asr_encoder.as_mut() {
             Some(e) => e,
@@ -278,24 +279,16 @@ impl InferenceSession {
         log::info!("[asr] encoder: {} frames → {} tokens in {}ms",
             mel_frames, enc_seq_len, t0.elapsed().as_millis());
 
-        // Build PrefixCache from our snapshot for the asr_decoder
-        let snap = match self.prefix_snapshot.as_ref() {
-            Some(s) => s,
+        let prefix_cache = match self.asr_prefix_cache.as_ref() {
+            Some(c) => c,
             None => {
-                log::error!("[asr] no prefix snapshot");
+                log::error!("[asr] no asr_prefix_cache — call precompute_prefix_cache first");
                 return Vec::new();
             }
         };
-        let prefix_cache = crate::asr_decoder::PrefixCache {
-            prefix_len: self.prefix_len,
-            kv_snapshots: snap.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            prefix_embeds: Vec::new(),
-            embed_scales: None,
-            embed_biases: None,
-        };
 
         crate::asr_decoder::gpu_asr_decode_tokens(
-            &mut self.gpu, &mut self.model, &prefix_cache,
+            &mut self.gpu, &mut self.model, prefix_cache,
             &encoder_output, enc_seq_len,
         )
     }
