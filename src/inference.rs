@@ -275,8 +275,13 @@ impl InferenceSession {
         };
 
         let t0 = std::time::Instant::now();
-        let (encoder_output, enc_seq_len, _, _) = encoder.forward_mel(mel_data, mel_frames);
-        log::info!("[asr] encoder: {} frames → {} tokens in {}ms",
+
+        // Run encoder on real mel frames only (conv stem can't handle 3000 frames on 24GB).
+        // Pass n_real_frames so attention masking works at the token level.
+        let (encoder_output, enc_seq_len, _, _) = encoder.forward_mel_masked(
+            mel_data, mel_frames, Some(mel_frames),
+        );
+        log::info!("[asr] encoder: {} mel frames → {} tokens in {}ms",
             mel_frames, enc_seq_len, t0.elapsed().as_millis());
 
         let prefix_cache = match self.asr_prefix_cache.as_ref() {
