@@ -301,22 +301,23 @@ impl InferenceSession {
         }
         self.gpu.flush_and_wait();
 
+        // Inject <|audio_start|> token before audio embeddings
+        self.model.forward_kv_only(&mut self.gpu, 151669); // <|audio_start|>
+
         // Inject last encoder embedding
         let last_embed = &encoder_output[(n_enc - 1) * h..n_enc * h];
         self.model.forward_embed_kv_only(&mut self.gpu, last_embed);
         self.gpu.flush_and_wait();
 
-        // Inject suffix tokens: <|audio_eos|>\nPlease transcribe...<|im_end|>\n<|im_start|>assistant\n
-        // These are hardcoded token IDs for Qwen3-ASR tokenizer
+        // Suffix: <|audio_end|><|im_end|>\n<|im_start|>assistant\n<asr_text>
         let suffix_ids: &[u32] = &[
-            151648,  // <|audio_eos|>
-            198,     // \n
-            12730, 1356, 3114, 279, 7699, 3403, 13,  // Please transcribe the audio above.
+            151670,  // <|audio_end|>
             151645,  // <|im_end|>
             198,     // \n
             151644,  // <|im_start|>
             77091,   // assistant
             198,     // \n
+            151704,  // <asr_text>
         ];
         for &tok in &suffix_ids[..suffix_ids.len() - 1] {
             self.model.forward_kv_only(&mut self.gpu, tok);
