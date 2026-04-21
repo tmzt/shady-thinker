@@ -259,11 +259,52 @@ impl InferenceSession {
         log::info!("[shady-thinker] ASR encoder loaded");
     }
 
-    /// Run ASR inference: mel spectrogram → token IDs.
+    /// Run ASR inference: mel → encoder → asr_decoder (proven path).
     ///
-    /// `mel_data` is mel-bin-major: [128 × n_frames] f32.
-    /// Returns token IDs — caller decodes with tokenizer.
+    /// Delegates to `asr_decoder::gpu_asr_decode_tokens` which uses
+    /// `forward_embed_argmax` — the same path that produced correct
+    /// transcriptions previously.
     pub fn infer_mel(&mut self, mel_data: &[f32], mel_frames: u32) -> Vec<u32> {
+        let encoder = match self.asr_encoder.as_mut() {
+            Some(e) => e,
+            None => {
+                log::error!("[shady-thinker] infer_mel: no ASR encoder");
+                return Vec::new();
+            }
+        };
+
+        let t0 = std::time::Instant::now();
+        let (encoder_output, enc_seq_len, _, _) = encoder.forward_mel(mel_data, mel_frames);
+        log::info!("[asr] encoder: {} frames → {} tokens in {}ms",
+            mel_frames, enc_seq_len, t0.elapsed().as_millis());
+
+        // Build PrefixCache from our snapshot for the asr_decoder
+        let snap = match self.prefix_snapshot.as_ref() {
+            Some(s) => s,
+            None => {
+                log::error!("[asr] no prefix snapshot");
+                return Vec::new();
+            }
+        };
+        let prefix_cache = crate::asr_decoder::PrefixCache {
+            prefix_len: self.prefix_len,
+            kv_snapshots: snap.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            prefix_embeds: Vec::new(),
+            embed_scales: None,
+            embed_biases: None,
+        };
+
+        crate::asr_decoder::gpu_asr_decode_tokens(
+            &mut self.gpu, &mut self.model, &prefix_cache,
+            &encoder_output, enc_seq_len,
+        )
+    }
+
+    /// Run Omni-style inference: mel → encoder → embed injection → decode.
+    ///
+    /// Uses forward_embed_kv_only for audio embeddings then standard
+    /// forward() decode loop. For Qwen2.5-Omni multimodal models.
+    pub fn omni_infer_mel(&mut self, mel_data: &[f32], mel_frames: u32) -> Vec<u32> {
         let encoder = match self.asr_encoder.as_mut() {
             Some(e) => e,
             None => {

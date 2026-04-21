@@ -277,7 +277,7 @@ pub fn gpu_asr_decode(
 /// Cached prefix KV state — computed once, restored before each decode.
 pub struct PrefixCache {
     /// KV cache snapshot: Vec of (k_data, v_data) per layer
-    kv_snapshots: Vec<(Vec<u8>, Vec<u8>)>,
+    pub kv_snapshots: Vec<(Vec<u8>, Vec<u8>)>,
     /// Number of prefix tokens cached
     pub prefix_len: u32,
     /// Pre-computed prefix embeddings [prefix_len, hidden]
