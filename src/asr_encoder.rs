@@ -15,7 +15,6 @@ mod shaders {
     pub const LAYERNORM: &str = include_str!("shaders/layernorm.wgsl");
     pub const GELU_MUL: &str = include_str!("shaders/gelu_mul.wgsl");
     pub const BIDIR_ATTN: &str = include_str!("shaders/qwen_asr_bidir_attn.wgsl");
-    pub const BIDIR_ATTN_MASKED: &str = include_str!("shaders/qwen_asr_bidir_attn_masked.wgsl");
     pub const ADD: &str = include_str!("shaders/add.wgsl");
 }
 
@@ -252,32 +251,14 @@ impl AsrEncoder {
     /// Full pipeline: mel → conv stem (GPU) → transformer (GPU).
     /// Input: mel data `[128, mel_frames]` as f32.
     /// Returns `(output, n_tokens, conv_ms, enc_ms)`.
-    /// If `n_real_frames` is set, creates an attention mask for padded mel input.
     pub fn forward_mel(&mut self, mel: &[f32], mel_frames: u32) -> (Vec<f32>, u32, u128, u128) {
-        self.forward_mel_masked(mel, mel_frames, None)
-    }
-
-    /// Forward with optional attention mask for padded mel.
-    /// `n_real_frames`: number of actual (non-padded) mel frames. If None, no masking.
-    pub fn forward_mel_masked(&mut self, mel: &[f32], mel_frames: u32, n_real_frames: Option<u32>) -> (Vec<f32>, u32, u128, u128) {
+        // Invalidate bind group cache — temporary buffers from previous call may
+        // have been deallocated and their addresses reused by the allocator.
         let t0 = std::time::Instant::now();
         let (conv_out, n_tokens) = self.conv_stem_gpu(mel, mel_frames);
         let conv_ms = t0.elapsed().as_millis();
-
-        // Build attention mask if we have padded input
-        let attn_mask = n_real_frames.map(|n_real| {
-            // Conv stem downsamples by 8x (3 conv layers, stride 2 each)
-            let n_real_tokens = ((n_real + 7) / 8) as usize;
-            let mut mask = vec![0u32; n_tokens as usize];
-            for i in 0..n_real_tokens.min(mask.len()) {
-                mask[i] = 1;
-            }
-            log::info!("[asr-encoder] attn mask: {}/{} real tokens", n_real_tokens, n_tokens);
-            mask
-        });
-
         let t1 = std::time::Instant::now();
-        let output = self.forward_with_mask(&conv_out, n_tokens, attn_mask.as_deref());
+        let output = self.forward(&conv_out, n_tokens);
         let enc_ms = t1.elapsed().as_millis();
         (output, n_tokens, conv_ms, enc_ms)
     }
@@ -395,14 +376,10 @@ impl AsrEncoder {
         (result, n_tokens)
     }
 
-    /// Run the encoder transformer on GPU (no mask).
+    /// Run the encoder transformer on GPU.
+    /// Input: token embeddings from conv stem [seq_len, d_model] as f32.
+    /// Output: encoder output [seq_len, output_dim] as f32.
     pub fn forward(&mut self, token_embeddings: &[f32], seq_len: u32) -> Vec<f32> {
-        self.forward_with_mask(token_embeddings, seq_len, None)
-    }
-
-    /// Run the encoder transformer on GPU with optional attention mask.
-    /// `attn_mask`: if Some, [seq_len] u32 array (1=real, 0=padded).
-    pub fn forward_with_mask(&mut self, token_embeddings: &[f32], seq_len: u32, attn_mask: Option<&[u32]>) -> Vec<f32> {
         use crate::gpu::bind;
 
         let d = self.config.d_model;
@@ -443,11 +420,6 @@ impl AsrEncoder {
         // ── Split borrows for transformer layers + output projection ──
         let Self { gpu, layers, conv: _, ln_post_w, ln_post_b, proj1_w, proj1_b, proj2_w, proj2_b, config: _ } = self;
 
-        // Upload attention mask if provided
-        let mask_buf = attn_mask.map(|mask| {
-            gpu.upload_buffer("enc_attn_mask", bytemuck::cast_slice(mask))
-        });
-
         let x_cur = gpu.create_storage_buffer("enc_x_cur", buf_size);
         gpu.copy_buffer(&x, &x_cur, buf_size);
 
@@ -466,14 +438,9 @@ impl AsrEncoder {
             dispatch_bf16_gemm(gpu, &x_norm, &layer.wv, &layer.bv, &v_buf, &params_buf,
                 seq_len, d, d, true);
 
-            // 5. Bidirectional windowed attention (masked if padding present)
-            if let Some(ref mask) = mask_buf {
-                dispatch_bidir_attn_masked(gpu, &q_buf, &k_buf, &v_buf, &attn_out, &params_buf,
-                    mask, seq_len, num_heads, head_dim, 0, seq_len);
-            } else {
-                dispatch_bidir_attn(gpu, &q_buf, &k_buf, &v_buf, &attn_out, &params_buf,
-                    seq_len, num_heads, head_dim, 0, seq_len);
-            }
+            // 5. Bidirectional windowed attention
+            dispatch_bidir_attn(gpu, &q_buf, &k_buf, &v_buf, &attn_out, &params_buf,
+                seq_len, num_heads, head_dim, 0, seq_len);
 
             // 6. Output projection
             dispatch_bf16_gemm(gpu, &attn_out, &layer.wo, &layer.bo, &o_out, &params_buf,
@@ -649,26 +616,6 @@ fn dispatch_bidir_attn(
     }));
     gpu.dispatch("qwen_asr_bidir_attn", shaders::BIDIR_ATTN, &[
         bind(0, q), bind(1, k), bind(2, v), bind(3, output), bind(4, params),
-    ], (num_heads, seq_len, 1));
-}
-
-fn dispatch_bidir_attn_masked(
-    gpu: &mut GpuContext, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer,
-    output: &wgpu::Buffer, params: &wgpu::Buffer, mask: &wgpu::Buffer,
-    seq_len: u32, num_heads: u32, head_dim: u32,
-    window_start: u32, window_end: u32,
-) {
-    use crate::gpu::bind;
-    #[repr(C)]
-    #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-    struct P { seq_len: u32, head_dim: u32, num_heads: u32,
-               window_start: u32, window_end: u32, _pad: [u32; 3] }
-    gpu.flush();
-    gpu.write_buffer(params, 0, bytemuck::bytes_of(&P {
-        seq_len, head_dim, num_heads, window_start, window_end, _pad: [0; 3],
-    }));
-    gpu.dispatch("qwen_asr_bidir_attn_masked", shaders::BIDIR_ATTN_MASKED, &[
-        bind(0, q), bind(1, k), bind(2, v), bind(3, output), bind(4, params), bind(5, mask),
     ], (num_heads, seq_len, 1));
 }
 
