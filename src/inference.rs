@@ -131,7 +131,7 @@ enum GenState {
 /// In-memory snapshot of GPU state after system prompt prefill.
 /// Allows each generate() to restore the prefix state and run only
 /// the query tokens, instead of re-running the full context.
-pub(crate) struct PrefixSnapshot {
+pub struct PrefixSnapshot {
     /// Per self-attn layer (indexed by global layer index): (k_bytes, v_bytes).
     /// Only SA layer indices have non-empty vecs.
     pub(crate) kv: Vec<(Vec<u8>, Vec<u8>)>,
@@ -151,7 +151,7 @@ pub struct InferenceSession {
     /// seq_len to this value so the cached system prompt is never re-run.
     pub prefix_len: u32,
     /// In-memory snapshot captured after set_prefix() completes.
-    pub(crate) prefix_snapshot: Option<PrefixSnapshot>,
+    pub prefix_snapshot: Option<PrefixSnapshot>,
     /// Optional ASR encoder for audio input (Qwen3-ASR models).
     pub asr_encoder: Option<crate::asr_encoder::AsrEncoder>,
     /// ASR-specific prefix cache (built by asr_decoder, not from system prompt text).
