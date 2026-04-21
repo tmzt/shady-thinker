@@ -20,7 +20,6 @@ pub fn build_templates() -> Vec<Vec<u8>> {
         template(r#"{"tool": "calendar_search", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "drive_list"}"#, &[], r#""#, &[], r#""#),
         template(r#"{"tool": "drive_search", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
-        template(r#"{"tool": "list_entities", "type": ""#, &[WILD], r#""}"#, &[], r#""#),
         template(r#"{"tool": "escalate", "query": ""#, &[WILD], r#""}"#, &[], r#""#),
     ]
 }
