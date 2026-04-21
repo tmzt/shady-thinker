@@ -301,10 +301,31 @@ impl InferenceSession {
         }
         self.gpu.flush_and_wait();
 
-        // Decode: autoregressive token generation
-        let t1 = std::time::Instant::now();
+        // Inject last encoder embedding
         let last_embed = &encoder_output[(n_enc - 1) * h..n_enc * h];
-        let mut token = self.model.forward_embed(&mut self.gpu, last_embed);
+        self.model.forward_embed_kv_only(&mut self.gpu, last_embed);
+        self.gpu.flush_and_wait();
+
+        // Inject suffix tokens: <|audio_eos|>\nPlease transcribe...<|im_end|>\n<|im_start|>assistant\n
+        // These are hardcoded token IDs for Qwen3-ASR tokenizer
+        let suffix_ids: &[u32] = &[
+            151648,  // <|audio_eos|>
+            198,     // \n
+            12730, 1356, 3114, 279, 7699, 3403, 13,  // Please transcribe the audio above.
+            151645,  // <|im_end|>
+            198,     // \n
+            151644,  // <|im_start|>
+            77091,   // assistant
+            198,     // \n
+        ];
+        for &tok in &suffix_ids[..suffix_ids.len() - 1] {
+            self.model.forward_kv_only(&mut self.gpu, tok);
+        }
+        self.gpu.flush_and_wait();
+
+        // Last suffix token through full forward to produce first decode token
+        let t1 = std::time::Instant::now();
+        let mut token = self.model.forward(&mut self.gpu, suffix_ids[suffix_ids.len() - 1]);
         let eos_ids = [151643u32, 151645]; // <|endoftext|>, <|im_end|>
 
         let mut token_ids = Vec::new();
