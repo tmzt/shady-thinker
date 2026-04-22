@@ -92,6 +92,18 @@ pub trait EpiphanyDispatcher: Send {
     /// trimmed). Default no-op — implementations that record
     /// transcripts override this.
     fn record_injection(&self, _body: &str) {}
+
+    /// Periodic progress hook for incremental output. `generated` is
+    /// every token produced so far in this generation, in order
+    /// (cumulative). Implementations that drive a streaming wire
+    /// (SSE, websocket, channel) decode this and forward deltas;
+    /// implementations that only care about the final result
+    /// override the default no-op with nothing.
+    ///
+    /// Called by the backend at its own cadence — currently every
+    /// few tokens during decode. Should return quickly (try_send,
+    /// not blocking I/O) since it runs on the GPU thread.
+    fn record_progress(&self, _generated: &[u32]) {}
 }
 
 /// Generation outcome.
@@ -1178,6 +1190,14 @@ impl InferenceSession {
                     generated.len(),
                     generated.len() as f64 / (ms as f64 / 1000.0).max(0.001),
                     self.model.seq_len);
+                // Stream tick — let the dispatcher forward the
+                // cumulative-tokens-so-far slice to whatever
+                // streaming sink it carries (e.g. an SSE channel).
+                // Default impl is a no-op so non-streaming callers
+                // pay nothing.
+                if let Some(d) = dispatcher {
+                    d.record_progress(&generated);
+                }
             }
         }
 
