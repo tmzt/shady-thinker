@@ -19,6 +19,9 @@ pub struct GpuContext {
     flush_probe_dst: Option<wgpu::Buffer>,
     /// Whether flush_probe_dst is currently in a mapped state.
     flush_probe_mapped: bool,
+    /// Active model role for logging ("fast" | "deep" | "asr" | "omni" | "?").
+    /// Set by thinker_impl at request dispatch and on slot swap.
+    pub role_tag: &'static str,
 }
 
 impl GpuContext {
@@ -44,6 +47,7 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
+            role_tag: "?",
         };
         ctx.init_flush_probe();
         ctx
@@ -118,6 +122,7 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
+            role_tag: "?",
         };
         ctx.init_flush_probe();
         ctx

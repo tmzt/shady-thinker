@@ -269,7 +269,7 @@ impl InferenceSession {
         let encoder = match self.asr_encoder.as_mut() {
             Some(e) => e,
             None => {
-                log::error!("[shady-thinker] infer_mel: no ASR encoder");
+                log::error!("[shady-thinker:{}] infer_mel: no ASR encoder", self.gpu.role_tag);
                 return Vec::new();
             }
         };
@@ -278,13 +278,13 @@ impl InferenceSession {
 
         // Run encoder on real mel frames (no padding, no mask needed).
         let (encoder_output, enc_seq_len, _, _) = encoder.forward_mel(mel_data, mel_frames);
-        log::info!("[asr] encoder: {} mel frames → {} tokens in {}ms",
-            mel_frames, enc_seq_len, t0.elapsed().as_millis());
+        log::info!("[shady-thinker:{}][asr] encoder: {} mel frames → {} tokens in {}ms",
+            self.gpu.role_tag, mel_frames, enc_seq_len, t0.elapsed().as_millis());
 
         let prefix_cache = match self.asr_prefix_cache.as_ref() {
             Some(c) => c,
             None => {
-                log::error!("[asr] no asr_prefix_cache — call precompute_prefix_cache first");
+                log::error!("[shady-thinker:{}][asr] no asr_prefix_cache — call precompute_prefix_cache first", self.gpu.role_tag);
                 return Vec::new();
             }
         };
@@ -303,7 +303,7 @@ impl InferenceSession {
         let encoder = match self.asr_encoder.as_mut() {
             Some(e) => e,
             None => {
-                log::error!("[shady-thinker] infer_mel called without ASR encoder loaded");
+                log::error!("[shady-thinker:{}] infer_mel called without ASR encoder loaded", self.gpu.role_tag);
                 return Vec::new();
             }
         };
@@ -314,8 +314,8 @@ impl InferenceSession {
         let (encoder_output, enc_seq_len, _conv_ms, _transformer_ms) =
             encoder.forward_mel(mel_data, mel_frames);
         let enc_ms = t0.elapsed().as_millis();
-        log::info!("[asr] encoder: {} frames → {} tokens in {}ms",
-            mel_frames, enc_seq_len, enc_ms);
+        log::info!("[shady-thinker:{}][asr] encoder: {} frames → {} tokens in {}ms",
+            self.gpu.role_tag, mel_frames, enc_seq_len, enc_ms);
 
         // Restore prefix (decoder system prompt KV cache)
         if self.prefix_snapshot.is_some() {
@@ -374,8 +374,8 @@ impl InferenceSession {
         }
 
         let dec_ms = t1.elapsed().as_millis();
-        log::info!("[asr] decode: {} tokens in {}ms ({:.1} tok/s)",
-            token_ids.len(), dec_ms,
+        log::info!("[shady-thinker:{}][asr] decode: {} tokens in {}ms ({:.1} tok/s)",
+            self.gpu.role_tag, token_ids.len(), dec_ms,
             token_ids.len() as f64 / (dec_ms as f64 / 1000.0).max(0.001));
 
         token_ids
@@ -454,8 +454,8 @@ impl InferenceSession {
         }
 
         self.prefix_snapshot = Some(PrefixSnapshot { kv, dn });
-        log::info!("[shady-thinker] prefix snapshot captured (sa={} la={})",
-            attn_layers.len(), num_linear);
+        log::info!("[shady-thinker:{}] prefix snapshot captured (sa={} la={})",
+            self.gpu.role_tag, attn_layers.len(), num_linear);
     }
 
     /// Restore the prefix snapshot to GPU buffers and reset seq_len to prefix_len.
@@ -506,8 +506,8 @@ impl InferenceSession {
         }
 
         self.prefix_len = self.model.seq_len;
-        log::info!("[shady-thinker] prefix cached: {} tokens in {:.1}s (seq_len={})",
-            ids.len(), t0.elapsed().as_secs_f32(), self.prefix_len);
+        log::info!("[shady-thinker:{}] prefix cached: {} tokens in {:.1}s (seq_len={})",
+            self.gpu.role_tag, ids.len(), t0.elapsed().as_secs_f32(), self.prefix_len);
 
         // Ensure all GPU writes are complete before reading back for snapshot.
         self.gpu.flush_and_wait();
@@ -628,8 +628,8 @@ impl InferenceSession {
         }
 
         std::fs::write(path, &buf)?;
-        log::info!("[shady-thinker] saved prefix cache v2: {} ({} bytes, {} sa + {} la layers)",
-            path.display(), buf.len(), attn_layers.len(), num_linear);
+        log::info!("[shady-thinker:{}] saved prefix cache v2: {} ({} bytes, {} sa + {} la layers)",
+            self.gpu.role_tag, path.display(), buf.len(), attn_layers.len(), num_linear);
         Ok(())
     }
 
@@ -699,8 +699,8 @@ impl InferenceSession {
         }
 
         std::fs::write(path, &buf)?;
-        log::info!("[shady-thinker] saved session cache: {} ({} bytes, seq_len={}, {} sa + {} la layers)",
-            path.display(), buf.len(), self.model.seq_len, attn_layers.len(), num_linear);
+        log::info!("[shady-thinker:{}] saved session cache: {} ({} bytes, seq_len={}, {} sa + {} la layers)",
+            self.gpu.role_tag, path.display(), buf.len(), self.model.seq_len, attn_layers.len(), num_linear);
         Ok(())
     }
 
@@ -866,17 +866,17 @@ impl InferenceSession {
             };
         }
 
-        log::info!("[shady-thinker] generate: {} input tokens, max_tokens={}, prefix_snap={}, prefix_len={}",
-            input_ids.len(), max_tokens, self.prefix_snapshot.is_some(), self.prefix_len);
+        log::info!("[shady-thinker:{}] generate: {} input tokens, max_tokens={}, prefix_snap={}, prefix_len={}",
+            self.gpu.role_tag, input_ids.len(), max_tokens, self.prefix_snapshot.is_some(), self.prefix_len);
 
         // Reset KV cache to prefix boundary (0 if no prefix is set) and clear sampling state.
         // Always restore prefix snapshot when available — ensures DeltaNet state is clean.
         if self.prefix_snapshot.is_some() {
             self.restore_prefix_snapshot();
-            log::info!("[shady-thinker] prefix restored, seq_len={}", self.model.seq_len);
+            log::info!("[shady-thinker:{}] prefix restored, seq_len={}", self.gpu.role_tag, self.model.seq_len);
         } else {
             self.model.seq_len = self.prefix_len;
-            log::info!("[shady-thinker] no snapshot, seq_len reset to {}", self.prefix_len);
+            log::info!("[shady-thinker:{}] no snapshot, seq_len reset to {}", self.gpu.role_tag, self.prefix_len);
         }
         self.model.generated_tokens.clear();
         if let Some(ref mut js) = self.model.json_sampler {
@@ -903,8 +903,8 @@ impl InferenceSession {
         // (matching the prefix cache), so input_ids > prefix_len and DeltaNet gets
         // the full token stream from scratch.
         let use_gptq = !bf16;
-        log::info!("[shady-thinker] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
-            input_ids.len(), bf16, inject_think, hybrid,
+        log::info!("[shady-thinker:{}] prefill-path: {} tokens, bf16={} inject_think={} hybrid={} → {}",
+            self.gpu.role_tag, input_ids.len(), bf16, inject_think, hybrid,
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });
         let first_decode_token = if use_gptq {
             // ── Phase 1: prefill ──
@@ -929,15 +929,15 @@ impl InferenceSession {
                 // Dispatch lm_head onto the last token's hidden state (in state.normed).
                 self.model.dispatch_lm_head(&mut self.gpu);
                 let prefill_ms = prefill_start.elapsed().as_millis();
-                log::info!("[shady-thinker] incremental prefill: {} query tokens in {}ms ({:.1} tok/s)",
-                    n_query, prefill_ms,
+                log::info!("[shady-thinker:{}] incremental prefill: {} query tokens in {}ms ({:.1} tok/s)",
+                    self.gpu.role_tag, n_query, prefill_ms,
                     n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
             } else {
                 // Full prefill from scratch (no prefix snapshot or first run).
                 self.model.prefill_gptq(&mut self.gpu, input_ids);
                 let prefill_ms = prefill_start.elapsed().as_millis();
-                log::info!("[shady-thinker] prefill_gptq: {} tokens in {}ms ({:.1} tok/s)",
-                    input_ids.len(), prefill_ms,
+                log::info!("[shady-thinker:{}] prefill_gptq: {} tokens in {}ms ({:.1} tok/s)",
+                    self.gpu.role_tag, input_ids.len(), prefill_ms,
                     input_ids.len() as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
             }
 
@@ -983,7 +983,7 @@ impl InferenceSession {
             // The last batch may have fewer than 4 tokens with no flush_and_wait yet.
             self.gpu.flush_and_wait();
             let prefill_ms = prefill_start.elapsed().as_millis();
-            log::info!("[shady-thinker] prefill: {} tokens in {}ms", input_ids.len() - 1, prefill_ms);
+            log::info!("[shady-thinker:{}] prefill: {} tokens in {}ms", self.gpu.role_tag, input_ids.len() - 1, prefill_ms);
 
             if inject_think {
                 if let Some(ref tc) = self.think_config {
@@ -1012,9 +1012,9 @@ impl InferenceSession {
 
         // Decode loop with epiphany support
         let decode_start = std::time::Instant::now();
-        log::info!("[shady-thinker] decode: starting first forward (seq={})", self.model.seq_len);
+        log::info!("[shady-thinker:{}] decode: starting first forward (seq={})", self.gpu.role_tag, self.model.seq_len);
         let mut token = self.model.forward(&mut self.gpu, first_decode_token);
-        log::info!("[shady-thinker] decode: first token={} ({:.0}ms)", token, decode_start.elapsed().as_millis());
+        log::info!("[shady-thinker:{}] decode: first token={} ({:.0}ms)", self.gpu.role_tag, token, decode_start.elapsed().as_millis());
         let mut state = GenerateState::Complete;
         let mut epiphany_count = 0u32;
         let mut next_async_id = 1u32;
@@ -1160,7 +1160,8 @@ impl InferenceSession {
             token = self.model.forward(&mut self.gpu, token);
             if generated.len() % 4 == 0 {
                 let ms = decode_start.elapsed().as_millis();
-                log::info!("[shady-thinker] decode: {} tokens, {:.1} tok/s, seq={}",
+                log::info!("[shady-thinker:{}] decode: {} tokens, {:.1} tok/s, seq={}",
+                    self.gpu.role_tag,
                     generated.len(),
                     generated.len() as f64 / (ms as f64 / 1000.0).max(0.001),
                     self.model.seq_len);
@@ -1170,8 +1171,8 @@ impl InferenceSession {
         let elapsed = decode_start.elapsed();
         let count = generated.len();
         let tps = if count > 0 { count as f64 / elapsed.as_secs_f64() } else { 0.0 };
-        log::info!("[shady-thinker] decode: {} tokens in {:.0}ms ({:.1} tok/s), {} epiphanies",
-            count, elapsed.as_millis(), tps, epiphany_count);
+        log::info!("[shady-thinker:{}] decode: {} tokens in {:.0}ms ({:.1} tok/s), {} epiphanies",
+            self.gpu.role_tag, count, elapsed.as_millis(), tps, epiphany_count);
 
         GenerateResult {
             token_ids: generated,
