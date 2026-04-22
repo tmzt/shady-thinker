@@ -85,6 +85,13 @@ pub trait EpiphanyDispatcher: Send {
 
     /// Token IDs that form the `</tool_call>` marker.
     fn tool_call_end_marker(&self) -> &[u32];
+
+    /// Observe a tool-response payload that was just injected into the
+    /// generation stream. `body` is the raw text between the
+    /// `<tool_response>` markers (no wrapping tags, no extra whitespace
+    /// trimmed). Default no-op — implementations that record
+    /// transcripts override this.
+    fn record_injection(&self, _body: &str) {}
 }
 
 /// Generation outcome.
@@ -1109,6 +1116,11 @@ impl InferenceSession {
                                             &response_ids[..]
                                         };
                                         log::info!("[epiphany] instant: injecting {} tokens", inject_ids.len());
+                                        // Forward the injection payload to whatever transcript
+                                        // sink the dispatcher carries (Conversation JSONL in
+                                        // the chitin path; default no-op elsewhere). Pass the
+                                        // raw response body — wrapping tags add no info.
+                                        dispatcher.record_injection(&result.response);
                                         for &inj_tok in inject_ids {
                                             self.model.forward(&mut self.gpu, inj_tok);
                                         }
@@ -1144,6 +1156,7 @@ impl InferenceSession {
                         let response_ids = dispatcher.tokenize(&response);
 
                         log::info!("[epiphany] async result: call_id={}, injecting {} tokens", call_id, response_ids.len());
+                        dispatcher.record_injection(&result.response);
                         for &inj_tok in &response_ids {
                             self.model.forward(&mut self.gpu, inj_tok);
                         }
