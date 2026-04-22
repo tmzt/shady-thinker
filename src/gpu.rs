@@ -22,6 +22,19 @@ pub struct GpuContext {
     /// Active model role for logging ("fast" | "deep" | "asr" | "omni" | "?").
     /// Set by thinker_impl at request dispatch and on slot swap.
     pub role_tag: &'static str,
+    /// Optional per-token streaming sink. Set per-request from
+    /// `ThinkerRequest.stream_tx`; cleared at the end of the request.
+    /// When Some alongside `stream_tokenizer`, the decode loop
+    /// (inference.rs) decodes each newly-generated token and pushes
+    /// a `StreamChunk { delta_text, finish_reason: None }`. Cleared
+    /// after generation so the channel sender drops and SSE writers
+    /// can detect end-of-stream.
+    pub stream_tx: Option<async_channel::Sender<common::handles::StreamChunk>>,
+    /// Tokenizer used to decode tokens for streaming. Wrapped in Arc
+    /// so we don't fight the borrow checker when swapping it across
+    /// requests on the same long-lived GPU thread. None means "skip
+    /// streaming even if `stream_tx` is set".
+    pub stream_tokenizer: Option<std::sync::Arc<common::tokenizer::Tokenizer>>,
 }
 
 impl GpuContext {
@@ -48,6 +61,8 @@ impl GpuContext {
             flush_probe_dst: None,
             flush_probe_mapped: false,
             role_tag: "?",
+            stream_tx: None,
+            stream_tokenizer: None,
         };
         ctx.init_flush_probe();
         ctx
@@ -123,6 +138,8 @@ impl GpuContext {
             flush_probe_dst: None,
             flush_probe_mapped: false,
             role_tag: "?",
+            stream_tx: None,
+            stream_tokenizer: None,
         };
         ctx.init_flush_probe();
         ctx
