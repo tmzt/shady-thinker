@@ -19,6 +19,12 @@ pub struct GpuContext {
     flush_probe_dst: Option<wgpu::Buffer>,
     /// Whether flush_probe_dst is currently in a mapped state.
     flush_probe_mapped: bool,
+}
+
+/// Per-request GPU context wrapper.
+/// Wraps the stable GpuContext in Arc and adds request-specific state.
+pub struct GpuRequestContext {
+    pub gpu: std::sync::Arc<GpuContext>,
     /// Active model role for logging ("fast" | "deep" | "asr" | "omni" | "?").
     /// Set by thinker_impl at request dispatch and on slot swap.
     pub role_tag: &'static str,
@@ -65,10 +71,6 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
-            role_tag: "?",
-            stream_tx: None,
-            stream_tokenizer: None,
-            disable_think_injection: false,
         };
         ctx.init_flush_probe();
         ctx
@@ -143,10 +145,6 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
-            role_tag: "?",
-            stream_tx: None,
-            stream_tokenizer: None,
-            disable_think_injection: false,
         };
         ctx.init_flush_probe();
         ctx
