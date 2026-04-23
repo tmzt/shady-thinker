@@ -174,6 +174,14 @@ pub struct InferenceSession {
 
 impl InferenceSession {
     pub fn new(model_dir: PathBuf, max_seq_len: u32) -> Self {
+        let gpu = GpuContext::new();
+        Self::with_gpu(gpu, model_dir, max_seq_len)
+    }
+
+    /// Create an InferenceSession with an externally-provided GpuContext.
+    /// Useful when multiple models share a GPU device or when request-specific
+    /// context (stream_tx, disable_think_injection) needs to be set before loading.
+    pub fn with_gpu(mut gpu: GpuContext, model_dir: PathBuf, max_seq_len: u32) -> Self {
         let t0 = std::time::Instant::now();
         log::info!("[shady-thinker] loading model from {:?} (max_seq={})", model_dir, max_seq_len);
 
@@ -199,9 +207,7 @@ impl InferenceSession {
             config.num_hidden_layers, config.num_attention_heads, config.hidden_size,
             weight_format, quant_config.bits, t0.elapsed().as_secs_f32());
 
-        log::info!("[shady-thinker] step 3/6: creating GPU context");
-        let mut gpu = GpuContext::new();
-        log::info!("[shady-thinker] GPU context ready ({:.1}s)", t0.elapsed().as_secs_f32());
+        log::info!("[shady-thinker] step 3/6: GPU context ready ({:.1}s)", t0.elapsed().as_secs_f32());
 
         let _ = shader_cache_key;
 
@@ -961,24 +967,9 @@ impl InferenceSession {
                     n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
             } else {
                 // Full prefill from scratch (no prefix snapshot or first run).
-                // Same guard as set_prefix: huge batches stall the wgpu
-                // queue past 30s, so for inputs over the limit we fall
-                // back to the per-token path.
-                const FULL_PREFILL_BATCH_LIMIT: usize = 1024;
-                if input_ids.len() > FULL_PREFILL_BATCH_LIMIT {
-                    log::info!("[shady-thinker:{}] full prefill: {} tokens > {} limit — using per-token path",
-                        self.gpu.role_tag, input_ids.len(), FULL_PREFILL_BATCH_LIMIT);
-                    for (i, &tok) in input_ids[..input_ids.len() - 1].iter().enumerate() {
-                        self.model.forward_kv_only(&mut self.gpu, tok);
-                        if (i + 1) % 4 == 0 { self.gpu.flush_and_wait(); }
-                    }
-                    self.gpu.flush_and_wait();
-                    // Last token through full forward to populate lm_head logits.
-                    self.model.forward(&mut self.gpu, input_ids[input_ids.len() - 1]);
-                    self.gpu.flush_and_wait();
-                } else {
-                    self.model.prefill_gptq(&mut self.gpu, input_ids);
-                }
+                // prefill_gptq now handles arbitrary lengths by chunking internally,
+                // so we don't need a per-token fallback anymore.
+                self.model.prefill_gptq(&mut self.gpu, input_ids);
                 let prefill_ms = prefill_start.elapsed().as_millis();
                 log::info!("[shady-thinker:{}] prefill_gptq: {} tokens in {}ms ({:.1} tok/s)",
                     self.gpu.role_tag, input_ids.len(), prefill_ms,
