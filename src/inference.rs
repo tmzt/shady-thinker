@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gpu::GpuContext;
+use crate::gpu::{GpuContext, GpuRequestContext};
 use crate::model::{shaders, Model};
 use crate::weights;
 use crate::weights::ModelConfig;
@@ -243,7 +243,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
+        let mut session = Self { model, gpu: GpuRequestContext::new(gpu), config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).

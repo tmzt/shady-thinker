@@ -49,6 +49,32 @@ pub struct GpuRequestContext {
     pub disable_think_injection: bool,
 }
 
+impl std::ops::Deref for GpuRequestContext {
+    type Target = GpuContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gpu
+    }
+}
+
+impl std::ops::DerefMut for GpuRequestContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::get_mut(&mut self.gpu).expect("GpuRequestContext wraps shared GpuContext; expected exclusive access")
+    }
+}
+
+impl GpuRequestContext {
+    pub fn new(gpu: GpuContext) -> Self {
+        Self {
+            gpu: Arc::new(gpu),
+            role_tag: "?",
+            stream_tx: None,
+            stream_tokenizer: None,
+            disable_think_injection: false,
+        }
+    }
+}
+
 impl GpuContext {
     pub fn new() -> Self {
         pollster::block_on(Self::init())
@@ -207,7 +233,7 @@ impl GpuContext {
         usage: wgpu::BufferUsages,
     ) -> wgpu::Buffer {
         let aligned = (size + 3) & !3;
-        self.create_buffer(&wgpu::BufferDescriptor {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: aligned,
             usage,

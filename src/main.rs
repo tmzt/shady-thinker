@@ -148,7 +148,7 @@ fn cmd_query(args: &[String]) {
             session.model.dispatch_lm_head(&mut session.gpu);
         }
         session.gpu.flush_and_wait();
-        let normed_bytes = session.self.gpu.read_buffer(&session.model.state.normed, h * 4);
+        let normed_bytes = session.gpu.read_buffer(&session.model.state.normed, h * 4);
         let normed: Vec<f32> = normed_bytes.chunks(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         println!("[debug-normed n={}] seq={} first_16: {:?}", use_ids.len(), session.model.seq_len,
