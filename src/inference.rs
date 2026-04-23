@@ -278,7 +278,7 @@ impl InferenceSession {
             self.gpu.device.clone(), self.gpu.queue.clone(),
         );
         self.asr_encoder = Some(crate::asr_encoder::AsrEncoder::load(enc_gpu, model_dir));
-        log::info!("[shady-thinker] ASR encoder loaded");
+        log::info!("[shady-thinker:{}] ASR encoder loaded", self.gpu.role_tag);
     }
 
     /// Run ASR inference: mel → encoder → asr_decoder (proven path).
@@ -747,11 +747,11 @@ impl InferenceSession {
         let mmap = match unsafe { memmap2::Mmap::map(&file) } {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("[shady-thinker] mmap failed for {:?}: {e}", path);
+                log::warn!("[shady-thinker:{}] mmap failed for {:?}: {e}", self.gpu.role_tag, path);
                 return false;
             }
         };
-        log::info!("[shady-thinker] loaded prefix cache file: {} ({} bytes)", path.display(), mmap.len());
+        log::info!("[shady-thinker:{}] loaded prefix cache file: {} ({} bytes)", self.gpu.role_tag, path.display(), mmap.len());
         self.try_load_prefix_cache_bytes(&mmap)
     }
 
@@ -762,11 +762,11 @@ impl InferenceSession {
         let magic   = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
 
-        if magic != 0xCA5E_CAFE { log::warn!("[shady-thinker] prefix cache: bad magic"); return false; }
+        if magic != 0xCA5E_CAFE { log::warn!("[shady-thinker:{}] prefix cache: bad magic", self.gpu.role_tag); return false; }
 
         match version {
             2 => self.try_load_prefix_cache_v2(data),
-            v => { log::warn!("[shady-thinker] prefix cache: unsupported version {v}"); false }
+            v => { log::warn!("[shady-thinker:{}] prefix cache: unsupported version {v}", self.gpu.role_tag); false }
         }
     }
 
@@ -784,8 +784,8 @@ impl InferenceSession {
 
         // Validate self-attn dimensions
         if nkv != self.config.num_key_value_heads || hd != self.config.head_dim {
-            log::warn!("[shady-thinker] prefix cache v2: KV dim mismatch ({nkv}×{hd} vs {}×{})",
-                self.config.num_key_value_heads, self.config.head_dim);
+            log::warn!("[shady-thinker:{}] prefix cache v2: KV dim mismatch ({nkv}×{hd} vs {}×{})",
+                self.gpu.role_tag, self.config.num_key_value_heads, self.config.head_dim);
             return false;
         }
         // Validate DeltaNet dimensions
@@ -795,7 +795,7 @@ impl InferenceSession {
         let exp_nkh = self.config.linear_num_key_heads;
         let exp_ch  = exp_nkh * exp_kd * 2 + exp_nhv * exp_vd;
         if dn_nhv != exp_nhv || dn_kd != exp_kd || dn_vd != exp_vd || dn_total_ch != exp_ch {
-            log::warn!("[shady-thinker] prefix cache v2: DeltaNet dim mismatch");
+            log::warn!("[shady-thinker:{}] prefix cache v2: DeltaNet dim mismatch", self.gpu.role_tag);
             return false;
         }
 
@@ -812,13 +812,13 @@ impl InferenceSession {
         // ── Self-attn KV caches ──
         for _ in 0..n_sa_layers {
             if pos + 4 + 2 * sa_stride > data.len() {
-                log::warn!("[shady-thinker] prefix cache v2: truncated (sa section)");
+                log::warn!("[shady-thinker:{}] prefix cache v2: truncated (sa section)", self.gpu.role_tag);
                 return false;
             }
             let li = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
             pos += 4;
             if li >= self.model.state.k_cache.len() {
-                log::warn!("[shady-thinker] prefix cache v2: sa layer {li} out of range");
+                log::warn!("[shady-thinker:{}] prefix cache v2: sa layer {li} out of range", self.gpu.role_tag);
                 return false;
             }
             self.gpu.write_buffer(&self.model.state.k_cache[li], 0, &data[pos..pos+sa_stride]);
@@ -833,13 +833,13 @@ impl InferenceSession {
         let num_linear = self.model.state.deltanet_hist.len();
         for lin_idx in 0..(n_la_layers as usize) {
             if pos + 4 + hist_bytes + state_bytes > data.len() {
-                log::warn!("[shady-thinker] prefix cache v2: truncated (la section)");
+                log::warn!("[shady-thinker:{}] prefix cache v2: truncated (la section)", self.gpu.role_tag);
                 return false;
             }
             let _layer_idx = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
             pos += 4;
             if lin_idx >= num_linear {
-                log::warn!("[shady-thinker] prefix cache v2: lin_idx {lin_idx} out of range");
+                log::warn!("[shady-thinker:{}] prefix cache v2: lin_idx {lin_idx} out of range", self.gpu.role_tag);
                 return false;
             }
             self.gpu.write_buffer(&self.model.state.deltanet_hist[lin_idx],  0, &data[pos..pos+hist_bytes]);
@@ -855,8 +855,8 @@ impl InferenceSession {
         self.model.seq_len = plen;
         self.prefix_len = plen;
         self.prefix_snapshot = Some(PrefixSnapshot { kv: snap_kv, dn: snap_dn });
-        log::info!("[shady-thinker] loaded prefix cache v2: prefix_len={plen} \
-            ({n_sa_layers} sa + {n_la_layers} la layers, {} bytes)", data.len());
+        log::info!("[shady-thinker:{}] loaded prefix cache v2: prefix_len={plen} \
+            ({n_sa_layers} sa + {n_la_layers} la layers, {} bytes)", self.gpu.role_tag, data.len());
         true
     }
 
