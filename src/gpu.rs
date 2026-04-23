@@ -156,7 +156,7 @@ impl GpuContext {
     }
 
     fn init_flush_probe(&mut self) {
-        let src = self.create_buffer(&wgpu::BufferDescriptor {
+        let src = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("flush_probe_src"),
             size: 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
@@ -173,7 +173,7 @@ impl GpuContext {
         // SAFETY: data was previously returned by get_pipeline_cache_data from the same device family.
         // We use fallback=true so an incompatible cache is silently ignored.
         let cache = unsafe {
-            self.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                 label: Some("shady-thinker"),
                 data: Some(data),
                 fallback: true,
@@ -186,7 +186,7 @@ impl GpuContext {
     /// Create an empty pipeline cache (for first-run, enables saving after compilation).
     pub fn create_pipeline_cache(&mut self) {
         let cache = unsafe {
-            self.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                 label: Some("shady-thinker"),
                 data: None,
                 fallback: true,

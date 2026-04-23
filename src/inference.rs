@@ -149,7 +149,7 @@ pub struct PrefixSnapshot {
 /// Pure inference session: model + GPU context.
 pub struct InferenceSession {
     pub model: Model,
-    pub gpu: GpuContext,
+    pub gpu: GpuRequestContext,
     pub config: ModelConfig,
     pub think_config: Option<ThinkConfig>,
     /// Tool call detection for think-then-constrain models (Qwen3.5 Fast).
