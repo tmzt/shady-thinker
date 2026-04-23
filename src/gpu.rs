@@ -583,7 +583,7 @@ impl GpuContext {
     }
 
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        self.write_buffer(buffer, offset, data);
+        self.queue.write_buffer(buffer, offset, data);
     }
 }
 
