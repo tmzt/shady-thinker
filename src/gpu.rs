@@ -35,6 +35,11 @@ pub struct GpuContext {
     /// requests on the same long-lived GPU thread. None means "skip
     /// streaming even if `stream_tx` is set".
     pub stream_tokenizer: Option<std::sync::Arc<common::tokenizer::Tokenizer>>,
+    /// Whether to disable think-injection for the current request.
+    /// Set per-request from `ThinkerRequest.disable_think_injection`.
+    /// When true, forces the batched GPTQ chunked prefill path instead
+    /// of the per-token fallback (used for OpenAI API compatibility).
+    pub disable_think_injection: bool,
 }
 
 impl GpuContext {
@@ -63,6 +68,7 @@ impl GpuContext {
             role_tag: "?",
             stream_tx: None,
             stream_tokenizer: None,
+            disable_think_injection: false,
         };
         ctx.init_flush_probe();
         ctx
@@ -140,6 +146,7 @@ impl GpuContext {
             role_tag: "?",
             stream_tx: None,
             stream_tokenizer: None,
+            disable_think_injection: false,
         };
         ctx.init_flush_probe();
         ctx
