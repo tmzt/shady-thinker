@@ -21,3 +21,5 @@ pub mod weights;
 pub mod wordpiece;
 #[cfg(feature = "chat")]
 pub mod chat;
+
+pub use gpu::{GpuContext, GpuRequestContext};

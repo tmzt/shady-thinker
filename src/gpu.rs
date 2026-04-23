@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// Cached bind group keyed by a string built from pipeline name + buffer pointer addresses
@@ -155,13 +156,13 @@ impl GpuContext {
     }
 
     fn init_flush_probe(&mut self) {
-        let src = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let src = self.self.gpu.create_buffer(&wgpu::BufferDescriptor {
             label: Some("flush_probe_src"),
             size: 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let dst = self.create_readback_buffer("flush_probe_dst", 4);
+        let dst = self.gpu.create_readback_buffer("flush_probe_dst", 4);
         self.flush_probe_src = Some(src);
         self.flush_probe_dst = Some(dst);
     }
@@ -172,7 +173,7 @@ impl GpuContext {
         // SAFETY: data was previously returned by get_pipeline_cache_data from the same device family.
         // We use fallback=true so an incompatible cache is silently ignored.
         let cache = unsafe {
-            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            self.self.gpu.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                 label: Some("shady-thinker"),
                 data: Some(data),
                 fallback: true,
@@ -185,7 +186,7 @@ impl GpuContext {
     /// Create an empty pipeline cache (for first-run, enables saving after compilation).
     pub fn create_pipeline_cache(&mut self) {
         let cache = unsafe {
-            self.device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            self.self.gpu.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                 label: Some("shady-thinker"),
                 data: None,
                 fallback: true,
@@ -206,7 +207,7 @@ impl GpuContext {
         usage: wgpu::BufferUsages,
     ) -> wgpu::Buffer {
         let aligned = (size + 3) & !3;
-        self.device.create_buffer(&wgpu::BufferDescriptor {
+        self.self.gpu.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: aligned,
             usage,
@@ -215,7 +216,7 @@ impl GpuContext {
     }
 
     pub fn create_storage_buffer(&self, label: &str, size: u64) -> wgpu::Buffer {
-        self.create_buffer(
+        self.gpu.create_buffer(
             label,
             size,
             wgpu::BufferUsages::STORAGE
@@ -230,7 +231,7 @@ impl GpuContext {
         let chunk_size = 64 * 1024 * 1024; // 64MB chunks
         for (i, chunk) in data.chunks(chunk_size).enumerate() {
             let offset = (i * chunk_size) as u64;
-            self.queue.write_buffer(&buffer, offset, chunk);
+            self.self.gpu.write_buffer(&buffer, offset, chunk);
         }
         // Submit staging writes without blocking (no device.poll).
         // Vulkan in-order queue guarantees these copies complete before any
@@ -241,7 +242,7 @@ impl GpuContext {
     }
 
     pub fn create_readback_buffer(&self, label: &str, size: u64) -> wgpu::Buffer {
-        self.create_buffer(
+        self.gpu.create_buffer(
             label,
             size,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -422,7 +423,7 @@ impl GpuContext {
     /// Uses Poll-mode loop with a cached COPY_SRC → MAP_READ probe to avoid
     /// the PowerVR Vulkan driver hang in vkWaitForFences(wait_indefinitely).
     pub fn flush_and_wait(&mut self) {
-        self.flush();
+        self.gpu.flush();
         // Submit a copy of the cached probe_src → probe_dst. Vulkan in-order queue
         // guarantees this completes after all prior submitted work. map_async on
         // probe_dst fires only after this fence — i.e., after all prior work is done.
@@ -492,8 +493,8 @@ impl GpuContext {
 
     /// Read a sub-range of a buffer to CPU.
     pub fn read_buffer_offset(&mut self, buffer: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
-        self.flush();
-        let staging = self.create_readback_buffer("readback_off", size);
+        self.gpu.flush();
+        let staging = self.gpu.create_readback_buffer("readback_off", size);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("readback_off"),
         });
@@ -519,8 +520,8 @@ impl GpuContext {
         size: u64,
         timeout: std::time::Duration,
     ) -> Option<Vec<u8>> {
-        self.flush();
-        let staging = self.create_readback_buffer("readback_timed", size);
+        self.gpu.flush();
+        let staging = self.gpu.create_readback_buffer("readback_timed", size);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("readback_timed"),
         });
@@ -556,7 +557,7 @@ impl GpuContext {
     }
 
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        self.queue.write_buffer(buffer, offset, data);
+        self.self.gpu.write_buffer(buffer, offset, data);
     }
 }
 
