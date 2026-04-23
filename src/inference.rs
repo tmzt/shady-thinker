@@ -159,6 +159,13 @@ pub struct InferenceSession {
     pub prefix_len: u32,
     /// In-memory snapshot captured after set_prefix() completes.
     pub prefix_snapshot: Option<PrefixSnapshot>,
+    /// Identifier of the prefix currently loaded in `prefix_snapshot`.
+    /// `Some("static")` when the on-startup system-prompt cache is
+    /// active; `Some("openai-<hash>")` when a per-request prefix is
+    /// installed; `None` until any prefix is set. Used by the GPU
+    /// loop to skip a re-load when the next request's prefix key
+    /// matches what's already in memory.
+    pub current_prefix_key: Option<String>,
     /// Optional ASR encoder for audio input (Qwen3-ASR models).
     pub asr_encoder: Option<crate::asr_encoder::AsrEncoder>,
     /// ASR-specific prefix cache (built by asr_decoder, not from system prompt text).
@@ -230,7 +237,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, asr_encoder: None, asr_prefix_cache: None };
+        let mut session = Self { model, gpu, config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -497,8 +504,20 @@ impl InferenceSession {
         let zero_bitmap = vec![0u8; self.model.seen_bitmap_cpu.len() * 4];
         self.gpu.write_buffer(&self.model.state.seen_bitmap, 0, &zero_bitmap);
 
+        // Above this threshold the batched gptq prefill submits a
+        // single huge command list that the wgpu queue can't drain
+        // within its 30s flush_and_wait budget on integrated GPUs
+        // (Apple Metal in particular). Falling through to per-token
+        // forward_kv_only is much slower wall-clock but completes
+        // reliably on any input length.
+        const PREFILL_BATCH_LIMIT: usize = 1024;
+
         let t0 = std::time::Instant::now();
-        if self.model.bf16_mode {
+        let use_per_token = self.model.bf16_mode || ids.len() > PREFILL_BATCH_LIMIT;
+        if use_per_token {
+            log::info!("[shady-thinker:{}] set_prefix: {} tokens, per-token path (bf16={}, over_batch_limit={})",
+                self.gpu.role_tag, ids.len(), self.model.bf16_mode,
+                ids.len() > PREFILL_BATCH_LIMIT);
             for (i, &tok) in ids.iter().enumerate() {
                 self.model.forward_kv_only(&mut self.gpu, tok);
                 if (i + 1) % 4 == 0 {
@@ -726,6 +745,7 @@ impl InferenceSession {
                 return false;
             }
         };
+        log::info!("[shady-thinker] loaded prefix cache file: {} ({} bytes)", path.display(), mmap.len());
         self.try_load_prefix_cache_bytes(&mmap)
     }
 
@@ -941,7 +961,24 @@ impl InferenceSession {
                     n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
             } else {
                 // Full prefill from scratch (no prefix snapshot or first run).
-                self.model.prefill_gptq(&mut self.gpu, input_ids);
+                // Same guard as set_prefix: huge batches stall the wgpu
+                // queue past 30s, so for inputs over the limit we fall
+                // back to the per-token path.
+                const FULL_PREFILL_BATCH_LIMIT: usize = 1024;
+                if input_ids.len() > FULL_PREFILL_BATCH_LIMIT {
+                    log::info!("[shady-thinker:{}] full prefill: {} tokens > {} limit — using per-token path",
+                        self.gpu.role_tag, input_ids.len(), FULL_PREFILL_BATCH_LIMIT);
+                    for (i, &tok) in input_ids[..input_ids.len() - 1].iter().enumerate() {
+                        self.model.forward_kv_only(&mut self.gpu, tok);
+                        if (i + 1) % 4 == 0 { self.gpu.flush_and_wait(); }
+                    }
+                    self.gpu.flush_and_wait();
+                    // Last token through full forward to populate lm_head logits.
+                    self.model.forward(&mut self.gpu, input_ids[input_ids.len() - 1]);
+                    self.gpu.flush_and_wait();
+                } else {
+                    self.model.prefill_gptq(&mut self.gpu, input_ids);
+                }
                 let prefill_ms = prefill_start.elapsed().as_millis();
                 log::info!("[shady-thinker:{}] prefill_gptq: {} tokens in {}ms ({:.1} tok/s)",
                     self.gpu.role_tag, input_ids.len(), prefill_ms,
@@ -1171,6 +1208,13 @@ impl InferenceSession {
             }
 
             token = self.model.forward(&mut self.gpu, token);
+
+
+            log::info!("[shady-thinker:{}] stream_tx: {:?}, stream_tokenizer: {:?}",
+                self.gpu.role_tag,
+                self.gpu.stream_tx.is_some(),
+                self.gpu.stream_tokenizer.is_some());
+
             // Per-token streaming: if a sink + tokenizer were
             // installed on the GpuContext for this generation, decode
             // the new token and push its text. Fires every token (not
@@ -1179,6 +1223,7 @@ impl InferenceSession {
             if let (Some(ref tx), Some(ref tok)) = (&self.gpu.stream_tx, &self.gpu.stream_tokenizer) {
                 let text = tok.decode(&[token], true).unwrap_or_default();
                 if !text.is_empty() {
+                    log::info!("[shady-thinker:{}] streaming token: {} → '{}'", self.gpu.role_tag, token, text);
                     let _ = tx.try_send(common::handles::StreamChunk {
                         delta_text: text,
                         finish_reason: None,
