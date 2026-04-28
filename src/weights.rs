@@ -494,15 +494,109 @@ fn detect_layer_prefix(tensor_map: &HashMap<String, wgpu::Buffer>) -> String {
     "model.layers".to_string()
 }
 
+/// Cross-check the on-disk shard files against `model.safetensors.index.json`
+/// and log any missing shards or `.partial` artifacts before we even
+/// open them. Cheap, runs once per load. Surfaces the most common
+/// load failure (interrupted download / stale rsync) before it shows
+/// up later as a cryptic "missing tensor: …" panic.
+fn check_shards(model_dir: &Path, shard_files: &[std::path::PathBuf]) {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        log::info!("[weights] no model.safetensors.index.json (single-shard model?)");
+    } else {
+        match std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(idx) => {
+                let mut expected: std::collections::BTreeSet<String> = Default::default();
+                if let Some(map) = idx.get("weight_map").and_then(|v| v.as_object()) {
+                    for v in map.values() {
+                        if let Some(s) = v.as_str() { expected.insert(s.to_string()); }
+                    }
+                }
+                let present: std::collections::BTreeSet<String> = shard_files.iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                log::info!(
+                    "[weights] index lists {} expected shard(s); {} present on disk",
+                    expected.len(), present.len(),
+                );
+                let missing: Vec<&String> = expected.difference(&present).collect();
+                if !missing.is_empty() {
+                    log::error!(
+                        "[weights] MISSING {} shard(s) listed in index — load WILL panic on first \
+                         tensor that lives in a missing shard:\n  {:?}",
+                        missing.len(), missing,
+                    );
+                }
+                let extra: Vec<&String> = present.difference(&expected).collect();
+                if !extra.is_empty() {
+                    log::warn!("[weights] extra shard files not in index: {extra:?}");
+                }
+            }
+            None => {
+                log::warn!("[weights] could not parse {}", index_path.display());
+            }
+        }
+    }
+    // .partial = an interrupted download. The .safetensors filter drops
+    // it from shard_files, so the model would silently load incomplete.
+    if let Ok(entries) = std::fs::read_dir(model_dir) {
+        let partials: Vec<String> = entries.flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|n| n.ends_with(".partial"))
+            .collect();
+        if !partials.is_empty() {
+            log::warn!(
+                "[weights] {} .partial file(s) in model dir (interrupted download?) — \
+                 these are skipped by the loader: {:?}",
+                partials.len(), partials,
+            );
+        }
+    }
+}
+
 fn detect_model_prefix(tensor_map: &HashMap<String, wgpu::Buffer>, oversized_raw: &HashMap<String, Vec<u8>>) -> (&'static str, &'static str, &'static str) {
     let has_key = |k: &str| tensor_map.contains_key(k) || oversized_raw.contains_key(k);
-    if has_key("thinker.model.embed_tokens.weight") {
-        ("thinker.model.embed_tokens.weight", "thinker.model.norm.weight", "thinker.lm_head")
-    } else if has_key("model.language_model.embed_tokens.weight") {
-        ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "model.language_model.lm_head")
-    } else {
-        ("model.embed_tokens.weight", "model.norm.weight", "lm_head")
+
+    // Each candidate is the full (embed, norm, lm_head) triple that
+    // must agree — picking a prefix from `embed_tokens` alone would
+    // commit us to a `norm.weight` key that may not exist at that
+    // prefix (e.g. a shard didn't load and the embed survived in
+    // oversized_raw but norm was on the missing shard).
+    let candidates: &[(&'static str, &'static str, &'static str)] = &[
+        ("thinker.model.embed_tokens.weight", "thinker.model.norm.weight", "thinker.lm_head"),
+        ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight", "model.language_model.lm_head"),
+        ("model.embed_tokens.weight", "model.norm.weight", "lm_head"),
+    ];
+    for &(embed, norm, lm_head) in candidates {
+        if has_key(embed) && has_key(norm) {
+            log::info!("[weights] detected prefix: embed={embed}, norm={norm}");
+            return (embed, norm, lm_head);
+        }
     }
+
+    // No prefix has both embed_tokens and norm — surface what we
+    // *did* find so the operator can tell whether this is a
+    // partial-download (missing shard) or a wholly unrecognized
+    // architecture.
+    let mut sample: Vec<&str> = tensor_map.keys()
+        .map(String::as_str)
+        .filter(|k| k.ends_with("embed_tokens.weight") || k.ends_with(".norm.weight") || k.contains("lm_head"))
+        .collect();
+    sample.sort();
+    sample.truncate(12);
+    panic!(
+        "could not detect model prefix: no candidate has both embed_tokens and norm.\n\
+         Tried (embed, norm) pairs:\n  \
+           thinker.model.*\n  \
+           model.language_model.*\n  \
+           model.*\n\
+         Matching keys actually present (up to 12):\n  {sample:?}\n\
+         Likely cause: incomplete or corrupted safetensors shards \
+         (rsync `--size-only` may have skipped a stale shard).",
+    );
 }
 
 /// Detect whether a layer is self-attention or DeltaNet linear attention.
@@ -602,7 +696,8 @@ pub fn load_weights(
         .collect();
     shard_files.sort();
 
-    log::info!("Loading {} safetensors shard(s)", shard_files.len());
+    log::info!("Loading {} safetensors shard(s) from {}", shard_files.len(), model_dir.display());
+    check_shards(model_dir, &shard_files);
 
     let mut tensor_map: HashMap<String, wgpu::Buffer> = HashMap::new();
     let mut raw_bytes_map: HashMap<String, Vec<u8>> = HashMap::new();
@@ -980,6 +1075,7 @@ pub fn load_weights_bf16(
     shard_files.sort();
 
     log::info!("[bf16] loading {} shard(s) from {:?}", shard_files.len(), model_dir);
+    check_shards(model_dir, &shard_files);
 
     // Memory-map shards to avoid loading entire files into RAM.
     // On Android this reduces peak RSS from ~6.9GB to ~2GB.
@@ -1159,6 +1255,7 @@ pub fn load_weights_int4(
         .map(|e| e.path()).collect();
     sf.sort();
     log::info!("[int4] {} shard(s), group_size={}", sf.len(), group_size);
+    check_shards(model_dir, &sf);
     let mm: Vec<memmap2::Mmap> = sf.iter()
         .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
     let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();
@@ -1244,6 +1341,7 @@ pub fn load_weights_mlx_int4(
         .map(|e| e.path()).collect();
     sf.sort();
     log::info!("[mlx-int4] {} shard(s)", sf.len());
+    check_shards(model_dir, &sf);
     let mm: Vec<memmap2::Mmap> = sf.iter()
         .map(|p| unsafe { memmap2::Mmap::map(&std::fs::File::open(p).unwrap()).unwrap() }).collect();
     let st: Vec<SafeTensors> = mm.iter().map(|m| SafeTensors::deserialize(m).unwrap()).collect();

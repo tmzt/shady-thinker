@@ -1069,12 +1069,86 @@ impl InferenceSession {
         let tc_config_end = self.tool_call_config.as_ref().map(|c| c.tool_call_end_ids.clone());
         let think_end = self.think_config.as_ref().map(|c| c.think_end_ids.clone());
 
-        for _ in 0..max_tokens {
-            if eos_ids.contains(&token) { break; }
+        // Track whether `</think>` has been emitted naturally so we
+        // can force-inject it before the budget runs out — otherwise
+        // think-injection turns "ran out of tokens" into a wholly empty
+        // assistant reply because the entire output is still inside
+        // the unclosed `<think>` block. We reserve up to 128 tokens
+        // (or 1/8 of `max_tokens`) at the tail end for the answer; if
+        // the model hasn't closed the think block by then, we feed
+        // `</think>\n` through forward() and let it generate the rest.
+        let mut think_closed = think_end.is_none();
+        let force_close_at: usize = if think_end.is_some() {
+            let reserve = ((max_tokens / 8) as usize).clamp(32, 128);
+            (max_tokens as usize).saturating_sub(reserve)
+        } else {
+            usize::MAX
+        };
+
+        for iter in 0..max_tokens as usize {
+            // EOS while still inside `<think>` would otherwise leave the
+            // entire output as unclosed reasoning. Append `</think>` to
+            // the generated stream (post-hoc; we're done with the
+            // model) so the post-processor can find the boundary and
+            // strip the preamble. The KV cache doesn't need updating
+            // because we're about to break.
+            if eos_ids.contains(&token) {
+                if !think_closed {
+                    if let Some(ref end_ids) = think_end {
+                        log::info!(
+                            "[shady-thinker:{}] EOS while in <think>; appending </think> to output",
+                            self.gpu.role_tag,
+                        );
+                        for &t in end_ids {
+                            generated.push(t);
+                        }
+                        think_closed = true;
+                    }
+                }
+                break;
+            }
             if let Some(flag) = cancel {
                 if flag.load(Ordering::Relaxed) { state = GenerateState::Interrupted; break; }
             }
             generated.push(token);
+
+            // Detect natural `</think>` close so we don't force-inject
+            // a duplicate end marker later.
+            if !think_closed {
+                if let Some(ref end_ids) = think_end {
+                    if ends_with_ids(&generated, end_ids) {
+                        think_closed = true;
+                    }
+                }
+            }
+
+            // Force-close `<think>` when the budget is nearly spent
+            // but the model is still reasoning. Inject end-marker
+            // tokens (and a newline) through forward() so the KV cache
+            // stays consistent, then continue the loop with whatever
+            // budget remains for the actual answer.
+            if !think_closed && iter >= force_close_at {
+                if let Some(ref end_ids) = think_end {
+                    log::info!(
+                        "[shady-thinker:{}] force-closing </think> at iter {}/{} (no natural close)",
+                        self.gpu.role_tag, iter, max_tokens,
+                    );
+                    for &t in end_ids {
+                        self.model.forward(&mut self.gpu, t);
+                        generated.push(t);
+                    }
+                    // Newline after `</think>` matches the prefix
+                    // convention (think_prefix_ids ends with `\n`).
+                    let nl: u32 = 198; // common '\n' token id; harmless if model encodes differently.
+                    self.model.forward(&mut self.gpu, nl);
+                    generated.push(nl);
+                    think_closed = true;
+                    // Drive the next sampled token off the injected
+                    // newline so the model writes the answer turn.
+                    token = self.model.forward(&mut self.gpu, nl);
+                    continue;
+                }
+            }
 
             // ── Tool call state machine ──
             if self.tool_call_config.is_some() {
@@ -1206,19 +1280,23 @@ impl InferenceSession {
                 self.gpu.stream_tx.is_some(),
                 self.gpu.stream_tokenizer.is_some());
 
-            // Per-token streaming: if a sink + tokenizer were
-            // installed on the GpuContext for this generation, decode
-            // the new token and push its text. Fires every token (not
-            // every 4) so SSE clients see motion at the model's
-            // natural pace.
-            if let (Some(ref tx), Some(ref tok)) = (&self.gpu.stream_tx, &self.gpu.stream_tokenizer) {
+            // Per-token streaming: when a tokenizer is installed on the
+            // GpuContext for this generation, decode the new token so
+            // its text is visible. The decoded text is always logged
+            // (great for debugging — confirms the model is producing
+            // something coherent without needing an SSE consumer).
+            // When `stream_tx` is also set we additionally push it as
+            // a `StreamChunk`; SSE / chat consumers drain that side.
+            if let Some(ref tok) = self.gpu.stream_tokenizer {
                 let text = tok.decode(&[token], true).unwrap_or_default();
                 if !text.is_empty() {
                     log::info!("[shady-thinker:{}] streaming token: {} → '{}'", self.gpu.role_tag, token, text);
-                    let _ = tx.try_send(common::handles::StreamChunk {
-                        delta_text: text,
-                        finish_reason: None,
-                    });
+                    if let Some(ref tx) = self.gpu.stream_tx {
+                        let _ = tx.try_send(common::handles::StreamChunk {
+                            delta_text: text,
+                            finish_reason: None,
+                        });
+                    }
                 }
             }
             if generated.len() % 4 == 0 {
