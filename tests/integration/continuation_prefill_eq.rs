@@ -105,4 +105,32 @@ fn continuation_matches_from_scratch_logits() {
     assert_eq!(tok_full, tok_cont,
         "argmax token disagrees between paths: full={tok_full} cont={tok_cont}");
     eprintln!("[eq] argmax agrees: token={tok_full}");
+
+    // ── Path C: a SECOND continuation prefill with the same shapes ──
+    // Repro for the cross-request gibberish snowball: the
+    // bind_group_cache key is `pipeline + buf_addr + buf_size`. Per-call
+    // local prefill buffers (`pg_residual` …) drop at function end, and
+    // wgpu can hand back the same Rust struct address with the same
+    // size for a same-shaped query in the next call. Without dropping
+    // the `pg_*` cache entries, the second call's dispatches read stale
+    // GPU memory from the first call's now-reused buffers, producing
+    // all-zero / gibberish output — but only when the buffer sizes
+    // match (different chunk lengths dodge it via size-key mismatch,
+    // which is why the original 3-file batch worked while a same-size
+    // 4th call snowballed).
+    session.restore_prefix_snapshot();
+    session.model.prefill_gptq(&mut session.gpu, &query_ids, session.prefix_len);
+    session.gpu.flush_and_wait();
+    session.model.dispatch_lm_head(&mut session.gpu);
+    let logits_cont2 = read_logits(&mut session);
+    let diff2 = linf(&logits_full, &logits_cont2);
+    eprintln!("[eq] ||full - cont2||_∞ = {:.6}", diff2);
+    assert!(
+        diff2 < 1e-2,
+        "second continuation diverges from from-scratch: ∞-norm = {diff2} (tolerance 1e-2)",
+    );
+    let tok_cont2 = argmax(&logits_cont2);
+    assert_eq!(tok_full, tok_cont2,
+        "argmax token disagrees on second continuation: full={tok_full} cont2={tok_cont2}");
+    eprintln!("[eq] second continuation argmax agrees: token={tok_full}");
 }

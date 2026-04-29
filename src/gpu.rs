@@ -462,6 +462,19 @@ impl GpuContext {
         }
     }
 
+    /// Drop all cached `BindGroup`s whose pipeline-name prefix matches.
+    /// The cache key (pipeline-name + per-binding `&Buffer` address + size)
+    /// collides whenever wgpu reuses a freshly-dropped Buffer's struct
+    /// address for a same-sized allocation in a later call — and serves
+    /// a `BindGroup` whose strong refs point at the previous call's GPU
+    /// memory. Long-lived buffers (`state.*`, weights) keep their
+    /// pointers, so their entries are safe to keep — but per-call
+    /// ephemeral buffers (`pg_*` from `prefill_gptq` and friends) need
+    /// their entries flushed at the end of each call.
+    pub fn drop_cached_bind_groups_with_prefix(&mut self, pipeline_prefix: &str) {
+        self.bind_group_cache.retain(|key, _| !key.starts_with(pipeline_prefix));
+    }
+
     /// Flush and block until the GPU has finished all submitted work.
     /// Uses Poll-mode loop with a cached COPY_SRC → MAP_READ probe to avoid
     /// the PowerVR Vulkan driver hang in vkWaitForFences(wait_indefinitely).

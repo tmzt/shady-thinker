@@ -3262,6 +3262,22 @@ impl Model {
         self.seq_len = pos_offset + seq_len;
         log::info!("[prefill_gptq] done, seq_len={} (pos_offset={} + new={})",
             self.seq_len, pos_offset, seq_len);
+        // Drop bind-group cache entries that referenced the per-call
+        // `pg_*` ephemeral buffers (`pg_residual`, `pg_normed`,
+        // `pg_q_*`, `pg_k`, `pg_v`, `pg_attn`, `pg_o`, `pg_gate`,
+        // `pg_up`, `pg_mlp`, `pg_dn_*`, `pg_norm0`, `pg_addnorm`,
+        // `pg_postnorm`, `pg_final_norm`, `pg_qknorm`, `pg_siggate`,
+        // `pg_moe_*`, …). These buffers go out of scope when the
+        // function returns, but their `BindGroup` clones in the
+        // cache hold strong references to their *previous* GPU
+        // memory — and the cache key (`&Buffer` address + size)
+        // collides whenever wgpu reuses the same Rust struct address
+        // for a same-sized buffer in the next call (e.g. uniform
+        // 1000-char chunks). Without this, the next call's same-key
+        // dispatches read stale data from the previous call's now-
+        // reused GPU memory and produce all-zero / gibberish output.
+        // The cross-request snowball regression at 17:42 today.
+        gpu.drop_cached_bind_groups_with_prefix("pg_");
         // Caller must call sample_first_decode_token() to obtain the first decode token.
         // This allows feature-gated think injection before sampling.
     }
