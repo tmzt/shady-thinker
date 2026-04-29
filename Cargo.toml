@@ -14,6 +14,11 @@ jit-lora = ["chat"]
 # Enable <think> token injection before decode (reasoning models).
 # Disabled by default — fast inference doesn't use it.
 think-injection = []
+# Gates integration tests that need a real GPU + model weights on
+# disk. Same convention the workspace uses (see Makefile
+# `cargo test --features gpu-test ...` invocations for fast/deep
+# thinker engine tests).
+gpu-test = []
 
 [[example]]
 name = "chat"
@@ -23,6 +28,11 @@ required-features = ["jit-lora"]
 name = "jit_lora_test"
 path = "tests/integration/jit_lora_test.rs"
 required-features = ["jit-lora"]
+
+[[test]]
+name = "continuation_prefill_eq"
+path = "tests/integration/continuation_prefill_eq.rs"
+required-features = ["gpu-test"]
 
 [dependencies]
 wgpu = { version = "29", features = ["vulkan"] }
@@ -42,3 +52,13 @@ common = { path = "../../common" }
 async-channel = "2"
 libc = "0.2"
 memmap2 = "0.9"
+
+# `common` (path dep above) depends on `network_transport` /
+# `network_mux` via crates.io version specifiers, but those crates
+# only exist inside this repo. The top-level workspace patches them
+# via `[patch.crates-io]`, but shady-thinker is `exclude`d from the
+# workspace so it doesn't inherit that patch — we have to repeat it
+# here for `cargo test`/`cargo build` from this directory to resolve.
+[patch.crates-io]
+network_transport = { path = "../chitin_connect_rs/deps/chitin_public/network_transport" }
+network_mux = { path = "../chitin_connect_rs/deps/chitin_public/network_mux" }

@@ -1,12 +1,20 @@
-// Causal GQA attention for prefill (batched Q/K/V, no KV cache).
-// Uses flash-attention online softmax so it correctly handles any sequence length.
+// Causal GQA attention for prefill (batched Q over current request,
+// K/V from the persistent KV cache).
 //
-// Each workgroup handles one Q head at one query position.
-// Each thread tid handles head_dim index tid (supports head_dim ≤ 256).
+// Q comes from the current prefill batch (q_proj, indexed by the local
+// `q_pos` ∈ [0, seq_len)). K and V come from the KV cache, which already
+// holds (a) the restored prefix snapshot in positions [0, pos_offset) and
+// (b) the new tokens just written by the qknorm+RoPE shader at positions
+// [pos_offset, pos_offset+seq_len). Each query at local position `q_pos`
+// attends to absolute cache positions [0, pos_offset + q_pos].
 //
-// Input: Q[seq_len, num_q_heads, head_dim], K[seq_len, num_kv_heads, head_dim],
-//        V[seq_len, num_kv_heads, head_dim]
-// Output: attn_output[seq_len, num_q_heads, head_dim]
+// From-scratch prefill passes pos_offset=0; the cache positions [0, seq_len)
+// are exactly the K/V the qknorm shader just wrote, so the math is
+// identical to the original "K/V from prefill batch" version.
+//
+// Each workgroup handles one Q head at one query position. Each thread tid
+// handles head_dim index tid (supports head_dim ≤ 256). Uses flash-attention
+// online softmax so it correctly handles any sequence length.
 //
 // Dispatch: (num_q_heads, seq_len, 1)
 
@@ -16,11 +24,12 @@ struct Params {
     num_kv_heads: u32,
     num_q_heads: u32,
     heads_per_kv: u32,
+    pos_offset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q_proj: array<f32>;
-@group(0) @binding(1) var<storage, read> k_proj: array<f32>;
-@group(0) @binding(2) var<storage, read> v_proj: array<f32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(2) var<storage, read> v_cache: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
@@ -43,7 +52,11 @@ fn main(
     if (q_head >= params.num_q_heads || q_pos >= seq_len) { return; }
 
     let q_base = q_pos * params.num_q_heads * head_dim + q_head * head_dim;
-    let causal_len = q_pos + 1u;  // attend to positions 0..q_pos (inclusive)
+    // Absolute query position in the global sequence; causal mask runs
+    // 0..=abs_q_pos so each new token attends to all cached prefix tokens
+    // plus prior new tokens.
+    let abs_q_pos = params.pos_offset + q_pos;
+    let causal_len = abs_q_pos + 1u;
     let scale = 1.0 / sqrt(f32(head_dim));
     let out_base = q_pos * params.num_q_heads * head_dim + q_head * head_dim;
 
@@ -64,7 +77,7 @@ fn main(
             let k_base = k_pos * params.num_kv_heads * head_dim + kv_head * head_dim;
             var dot: f32 = 0.0;
             for (var d = 0u; d < head_dim; d += 1u) {
-                dot += q_proj[q_base + d] * k_proj[k_base + d];
+                dot += q_proj[q_base + d] * k_cache[k_base + d];
             }
             score = dot * scale;
         }
@@ -85,7 +98,7 @@ fn main(
 
                 let kk_pos = tile_kv_start + kk;
                 let v_base = kk_pos * params.num_kv_heads * head_dim + kv_head * head_dim;
-                o = o * corr + e_s * v_proj[v_base + tid];
+                o = o * corr + e_s * v_cache[v_base + tid];
                 l = l * corr + e_s;
                 m = m_new;
             }

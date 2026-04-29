@@ -144,7 +144,7 @@ fn cmd_query(args: &[String]) {
             session.gpu.flush_and_wait();
             session.model.forward(&mut session.gpu, *use_ids.last().unwrap());
         } else {
-            session.model.prefill_gptq(&mut session.gpu, &use_ids);
+            session.model.prefill_gptq(&mut session.gpu, &use_ids, 0);
             session.model.dispatch_lm_head(&mut session.gpu);
         }
         session.gpu.flush_and_wait();

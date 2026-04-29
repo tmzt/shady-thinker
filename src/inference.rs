@@ -14,6 +14,14 @@ use crate::weights::ModelConfig;
 #[cfg(feature = "jit-lora")]
 use crate::lora::LoraState;
 
+/// Query-length threshold below which the incremental-prefill path stays on
+/// per-token `forward_kv_only` instead of switching to batched
+/// `prefill_gptq` continuation. For tiny queries (chat-style follow-ups
+/// like "hello, how are you?") the per-token loop's overhead is negligible
+/// and avoids the batched path's per-call buffer allocation; for sizable
+/// queries (notes_classifier chunks, etc.) the batched path wins by ~20×.
+pub const SMALL_QUERY_THRESHOLD: usize = 32;
+
 /// Hash of all dispatched shader sources — used to key the Vulkan pipeline cache file.
 /// Any shader change produces a new hash, a new cache filename, and a fresh compilation.
 fn shader_cache_key() -> u64 {
@@ -378,7 +386,15 @@ impl InferenceSession {
                 let mut sampler = crate::json_sampler::JsonSampler::new(
                     assets.token_bytes.clone(), assets.eos_ids.clone(),
                 );
-                sampler.enable_schema_with_keys(&["project", "topics", "summary"]);
+                // Cap each value at 200 bytes so a chatty model can't
+                // loop forever inside a single WILD slot. Classifier
+                // values (project, topics, summary) fit comfortably in
+                // that budget; once 200 bytes have been emitted the
+                // gate narrows to `"` and force-closes the value.
+                sampler.enable_schema_with_keys(
+                    &["project", "topics", "summary"],
+                    Some(200),
+                );
                 self.model.json_sampler = Some(sampler);
                 self.tool_call_config = None;
                 log::info!(
@@ -684,8 +700,9 @@ impl InferenceSession {
             self.gpu.flush_and_wait();
         } else {
             // Batched GPTQ prefill: processes all tokens in one GPU pass per layer.
-            // Handles both self-attn and DeltaNet linear-attn layers.
-            self.model.prefill_gptq(&mut self.gpu, ids);
+            // Handles both self-attn and DeltaNet linear-attn layers. pos_offset=0
+            // for from-scratch prefix construction.
+            self.model.prefill_gptq(&mut self.gpu, ids, 0);
         }
 
         self.prefix_len = self.model.seq_len;
@@ -1107,30 +1124,45 @@ impl InferenceSession {
                 && input_ids.len() > self.prefix_len as usize;
 
             if use_incremental {
-                // Restore prefix state, then run only the query tokens token-by-token.
-                // Much faster than re-running the full context (e.g., 12 tokens vs 552).
+                // Restore prefix snapshot, then prefill only the new query tail.
+                // For sizable queries (notes_classifier chunks etc.) use the
+                // batched `prefill_gptq` with `pos_offset = prefix_len`. For
+                // tiny queries (chat-style follow-ups like "hello, how are
+                // you?") fall back to the per-token forward path — its
+                // setup overhead is negligible there.
                 self.restore_prefix_snapshot();
                 let query_ids = &input_ids[self.prefix_len as usize..];
                 let n_query = query_ids.len();
-                // Use forward_kv_only for ALL query tokens to avoid double-sampling:
-                // forward() calls sample_token_gpu() which penalizes logits in-place;
-                // calling sample_first_decode_token() after would apply penalty twice.
-                for (i, &tok) in query_ids.iter().enumerate() {
-                    self.model.forward_kv_only(&mut self.gpu, tok);
-                    if (i + 1) % 4 == 0 { self.gpu.flush_and_wait(); }
+                if n_query <= SMALL_QUERY_THRESHOLD {
+                    // forward_kv_only is preferred for very short queries:
+                    // sample_token_gpu's in-place logit penalties don't apply
+                    // (kv-only doesn't sample), and the dispatch overhead per
+                    // token is dwarfed by total work.
+                    for (i, &tok) in query_ids.iter().enumerate() {
+                        self.model.forward_kv_only(&mut self.gpu, tok);
+                        if (i + 1) % 4 == 0 { self.gpu.flush_and_wait(); }
+                    }
+                    self.gpu.flush_and_wait();
+                    // Dispatch lm_head onto the last token's hidden state (in state.normed).
+                    self.model.dispatch_lm_head(&mut self.gpu);
+                    let prefill_ms = prefill_start.elapsed().as_millis();
+                    log::info!("[shady-thinker:{}] incremental prefill (per-token): {} query tokens in {}ms ({:.1} tok/s)",
+                        self.gpu.role_tag, n_query, prefill_ms,
+                        n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
+                } else {
+                    // Batched continuation: one GPU dispatch per layer for
+                    // the entire query tail, with `pos_offset = prefix_len`
+                    // so RoPE and KV-cache writes land in the right slots.
+                    self.model.prefill_gptq(&mut self.gpu, query_ids, self.prefix_len);
+                    let prefill_ms = prefill_start.elapsed().as_millis();
+                    log::info!("[shady-thinker:{}] continuation prefill: {} query tokens at pos_offset={} in {}ms ({:.1} tok/s)",
+                        self.gpu.role_tag, n_query, self.prefix_len, prefill_ms,
+                        n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
                 }
-                self.gpu.flush_and_wait();
-                // Dispatch lm_head onto the last token's hidden state (in state.normed).
-                self.model.dispatch_lm_head(&mut self.gpu);
-                let prefill_ms = prefill_start.elapsed().as_millis();
-                log::info!("[shady-thinker:{}] incremental prefill: {} query tokens in {}ms ({:.1} tok/s)",
-                    self.gpu.role_tag, n_query, prefill_ms,
-                    n_query as f64 / (prefill_ms as f64 / 1000.0).max(0.001));
             } else {
                 // Full prefill from scratch (no prefix snapshot or first run).
-                // prefill_gptq now handles arbitrary lengths by chunking internally,
-                // so we don't need a per-token fallback anymore.
-                self.model.prefill_gptq(&mut self.gpu, input_ids);
+                // pos_offset=0 — sequence starts at the beginning.
+                self.model.prefill_gptq(&mut self.gpu, input_ids, 0);
                 let prefill_ms = prefill_start.elapsed().as_millis();
                 log::info!("[shady-thinker:{}] prefill_gptq: {} tokens in {}ms ({:.1} tok/s)",
                     self.gpu.role_tag, input_ids.len(), prefill_ms,

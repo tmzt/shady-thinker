@@ -18,7 +18,11 @@ struct Params {
     head_dim: u32,
     _pad0: u32,
     seq_len: u32,
-    _pad1: u32,
+    // Continuation prefill offset: absolute position of the *first* new
+    // token in the global sequence. RoPE angles use `pos_offset + pos`,
+    // and the KV cache write lands at `(pos_offset + pos)`. From-scratch
+    // prefill passes 0, reproducing the original math.
+    pos_offset: u32,
     _pad2: u32,
     _pad3: u32,
 }
@@ -32,13 +36,13 @@ struct Params {
 
 var<workgroup> wg_vals: array<f32, 256>;
 
-fn apply_rope_interleaved(tid: u32, pos: u32) {
+fn apply_rope_interleaved(tid: u32, abs_pos: u32) {
     let partial_half = PARTIAL_DIM / 2u;
     if (MROPE_INTERLEAVED) {
         var d = tid;
         while (d < partial_half) {
             let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(d) / f32(PARTIAL_DIM));
-            let angle = f32(pos) * freq;
+            let angle = f32(abs_pos) * freq;
             let cos_a = cos(angle);
             let sin_a = sin(angle);
             let a = wg_vals[2u * d];
@@ -51,7 +55,7 @@ fn apply_rope_interleaved(tid: u32, pos: u32) {
         var d = tid;
         while (d < partial_half) {
             let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(d) / f32(PARTIAL_DIM));
-            let angle = f32(pos) * freq;
+            let angle = f32(abs_pos) * freq;
             let cos_a = cos(angle);
             let sin_a = sin(angle);
             let a = wg_vals[d];
@@ -71,6 +75,7 @@ fn main(
     let tid = lid.x;
     let head_idx = wg_id.x;
     let pos = wg_id.y;
+    let abs_pos = params.pos_offset + pos;
     let head_dim = params.head_dim;
     let num_q = params.num_q_heads;
     let num_kv = params.num_kv_heads;
@@ -90,7 +95,7 @@ fn main(
         workgroupBarrier();
 
         // RoPE
-        apply_rope_interleaved(tid, pos);
+        apply_rope_interleaved(tid, abs_pos);
         workgroupBarrier();
 
         // Write back
@@ -115,11 +120,12 @@ fn main(
         workgroupBarrier();
 
         // RoPE
-        apply_rope_interleaved(tid, pos);
+        apply_rope_interleaved(tid, abs_pos);
         workgroupBarrier();
 
-        // Write K to k_proj and k_cache, write V to v_cache
-        let cache_base = pos * num_kv * head_dim + kh * head_dim;
+        // Write K to k_proj (batch-local index `pos`) and k_cache /
+        // v_cache (absolute index `abs_pos`).
+        let cache_base = abs_pos * num_kv * head_dim + kh * head_dim;
         d = tid;
         while (d < head_dim) {
             let k_val = wg_vals[d];

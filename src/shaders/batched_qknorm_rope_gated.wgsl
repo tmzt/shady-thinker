@@ -22,7 +22,11 @@ struct Params {
     head_dim:     u32,
     eps:          f32,
     seq_len:      u32,
-    _pad0:        u32,
+    // Continuation prefill offset: absolute position of the *first* new
+    // token in the global sequence. RoPE angles use `pos_offset + pos`,
+    // and the KV cache write lands at `(pos_offset + pos)`. From-scratch
+    // prefill passes 0, reproducing the original math.
+    pos_offset:   u32,
     _pad1:        u32,
     _pad2:        u32,
     qk_norm_weight: array<vec4<u32>, 320>,
@@ -59,21 +63,21 @@ fn get_norm_weight(p: u32) -> f32 {
     return unpack_bf16(params.qk_norm_weight[vec_idx][u32_in_vec], bf16_in_u32);
 }
 
-fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32, pos: u32) -> vec2<f32> {
+fn apply_mrope(val_a: f32, val_b: f32, freq_idx: u32, abs_pos: u32) -> vec2<f32> {
     let freq  = 1.0 / pow(ROPE_THETA, 2.0 * f32(freq_idx) / f32(PARTIAL_DIM));
     // Text-only prefill: all three mRoPE coordinates equal the sequence position
-    let angle = f32(pos) * freq;
+    let angle = f32(abs_pos) * freq;
     let cos_a = cos(angle);
     let sin_a = sin(angle);
     return vec2<f32>(val_a * cos_a - val_b * sin_a, val_b * cos_a + val_a * sin_a);
 }
 
-fn apply_mrope_to_wg(tid: u32, pos: u32) {
+fn apply_mrope_to_wg(tid: u32, abs_pos: u32) {
     let partial_half = PARTIAL_DIM / 2u;
     if (MROPE_INTERLEAVED) {
         var d = tid;
         while (d < partial_half) {
-            let r = apply_mrope(wg_vals[2u * d], wg_vals[2u * d + 1u], d, pos);
+            let r = apply_mrope(wg_vals[2u * d], wg_vals[2u * d + 1u], d, abs_pos);
             wg_vals[2u * d]      = r.x;
             wg_vals[2u * d + 1u] = r.y;
             d += 256u;
@@ -81,7 +85,7 @@ fn apply_mrope_to_wg(tid: u32, pos: u32) {
     } else {
         var d = tid;
         while (d < partial_half) {
-            let r = apply_mrope(wg_vals[d], wg_vals[d + partial_half], d, pos);
+            let r = apply_mrope(wg_vals[d], wg_vals[d + partial_half], d, abs_pos);
             wg_vals[d]              = r.x;
             wg_vals[d + partial_half] = r.y;
             d += 256u;
@@ -97,6 +101,7 @@ fn main(
     let tid       = lid.x;
     let head_idx  = wg_id.x;
     let pos       = wg_id.y;   // sequence position in [0, seq_len)
+    let abs_pos   = params.pos_offset + pos;  // absolute position in cache / RoPE
 
     let num_heads    = params.num_heads;
     let num_kv_heads = params.num_kv_heads;
@@ -147,7 +152,7 @@ fn main(
         }
         workgroupBarrier();
 
-        apply_mrope_to_wg(tid, pos);
+        apply_mrope_to_wg(tid, abs_pos);
         workgroupBarrier();
 
         d = tid;
@@ -163,7 +168,9 @@ fn main(
         if (kh >= num_kv_heads) { return; }
 
         let kv_base   = pos * num_kv_heads * head_dim + kh * head_dim;
-        let cache_off = pos * num_kv_heads * head_dim + kh * head_dim;
+        // Cache write uses ABSOLUTE position so continuation prefill lands
+        // past the prefix. From-scratch prefill has pos_offset=0 → identical.
+        let cache_off = abs_pos * num_kv_heads * head_dim + kh * head_dim;
 
         var sum_sq: f32 = 0.0;
         var d = tid;
@@ -197,7 +204,7 @@ fn main(
         }
         workgroupBarrier();
 
-        apply_mrope_to_wg(tid, pos);
+        apply_mrope_to_wg(tid, abs_pos);
         workgroupBarrier();
 
         d = tid;

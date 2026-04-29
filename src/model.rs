@@ -835,16 +835,33 @@ impl Model {
 
         let tied_embeddings = config.tie_word_embeddings;
         let q_gated = config.attn_output_gate;
-        // Qwen3.5: gated Q + head-wise QK norm → qknorm shader
-        // Qwen2.5: no gated Q, no QK norm → rope-only shader (skip normalization)
+        let use_qk_norm = config.use_qk_norm;
+        // Three shader-selection cases for both the per-token (decode)
+        // and batched (prefill) paths:
+        //   gated + qk_norm   → qknorm + (1+w)*x norm    (Qwen3.5/Qwen3-Next)
+        //   non-gated + qk_norm → qknorm + plain w*x norm (Qwen3-14B and other dense Qwen3)
+        //   non-gated + no qk_norm → rope-only            (Qwen2.5)
+        // Gated-without-qknorm doesn't exist in any Qwen variant we
+        // load; if it ever appears, the gated shader's qknorm pass is
+        // a no-op when norm weights are bf16-1.0 fill, so falling
+        // through to that branch is safe-ish (matches the
+        // `bf16_ones` fallback in load_weights for missing q_norm).
+        // `norm_offset = 0.0` switches the qknorm shader from
+        // `(1 + w) * x` (Qwen3.5) to plain `w * x` (Qwen3 dense) — the
+        // same direct-norm convention `norm_direct = !q_gated` already
+        // uses for input/post-attn RMSNorm.
         let qknorm_shader_src = if q_gated {
             build_qknorm_shader_full(&config, true, 1.0) // (1+w)*x norm
+        } else if use_qk_norm {
+            build_qknorm_shader_full(&config, false, 0.0) // plain w*x norm
         } else {
             build_rope_kvstore_shader(&config, false) // RoPE only, no norm
         };
         let gqa_shader_src = build_gqa_shader(q_gated);
         let batched_qknorm_src = if q_gated {
             build_batched_qknorm_shader_gated(&config)
+        } else if use_qk_norm {
+            build_batched_qknorm_shader(&config)
         } else {
             build_batched_rope_shader(&config)
         };
@@ -1795,12 +1812,17 @@ impl Model {
         // Sync layers before lm_head to bound work per poll on PowerVR.
         // Poll #1: layers (32 layers × ~5 dispatches each)
         // Poll #2: lm_head chunks + penalty + topk (via read_buffer)
-        log::info!("[forward] seq={} polling layers...", self.seq_len);
+        let layers_t0 = std::time::Instant::now();
+        log::debug!("[forward] seq={} polling layers...", self.seq_len);
         gpu.flush_and_wait();
-        log::info!("[forward] seq={} layers done, dispatching lm_head", self.seq_len);
+        log::debug!("[forward] seq={} layers drain done in {:?}, dispatching lm_head",
+            self.seq_len, layers_t0.elapsed());
 
         // LM head
+        let lmh_t0 = std::time::Instant::now();
         self.dispatch_lm_head(gpu);
+        log::debug!("[forward] seq={} dispatch_lm_head enqueued in {:?}",
+            self.seq_len, lmh_t0.elapsed());
 
         #[cfg(feature = "jit-lora")]
         if self.training_mode {
@@ -1818,9 +1840,22 @@ impl Model {
     /// Reduces GPU→CPU transfer from 607KB (full logits) to 160 bytes.
     fn sample_token_gpu(&mut self, gpu: &mut GpuContext) -> u32 {
         let vocab = self.config.vocab_size;
-        let rep_penalty = 1.0f32;
-        let presence_penalty = 1.5f32;
-        let temperature = 0.7f32;
+        // Per-request sampling knobs, plumbed through GpuRequestContext
+        // from `common::handles::InferenceConfig`. Defaults match the
+        // historical hardcoded values when callers don't override.
+        //
+        // Temperature == 0 means argmax: take top-1 of whatever
+        // survives the penalty / gate / token-mask filtering. The
+        // shader's `v /= temperature` would NaN at 0, so we substitute
+        // 1.0 in the uniform (no rescaling, since softmax of survivors
+        // is irrelevant when we'll just take top-1) and force greedy
+        // top-1 selection on the CPU side via `force_greedy`.
+        let cfg = &gpu.inference_config;
+        let rep_penalty = cfg.rep_penalty;
+        let presence_penalty = cfg.presence_penalty;
+        let force_greedy = cfg.temperature <= f32::EPSILON;
+        let temperature = if force_greedy { 1.0 } else { cfg.temperature };
+        let top_p = cfg.top_p;
 
         // ── Hard-ban: compute up to 6 banned token IDs on CPU ──────────────
         let n = self.generated_tokens.len();
@@ -1909,9 +1944,15 @@ impl Model {
         );
 
         // ── Read back only the top-K candidates (24 bytes) ────────────────
-        log::info!("[forward] seq={} polling lm_head+topk...", self.seq_len);
+        // First decode-step readback after a prefill drains the rest of
+        // the LM-head GEMM; subsequent decode steps drain just one
+        // layer's worth of work. Either way, this is the per-step GPU
+        // sync point — log timing so per-token cost is visible.
+        let readback_t0 = std::time::Instant::now();
+        log::debug!("[forward] seq={} polling lm_head+topk...", self.seq_len);
         let topk_bytes = gpu.read_buffer(&self.state.topk_out, TOPK_K as u64 * 8);
-        log::info!("[forward] seq={} readback done", self.seq_len);
+        log::debug!("[forward] seq={} readback done in {:?}",
+            self.seq_len, readback_t0.elapsed());
         // Each candidate is {idx: u32, val: f32} = 8 bytes
         let mut candidates: Vec<(u32, f32)> = (0..TOPK_K as usize)
             .map(|i| {
@@ -1955,7 +1996,7 @@ impl Model {
 
         // ── At hard-gate positions, take top-1 (greedy) to avoid sampling valid-but-wrong tokens ──
         // e.g. at Root gate (requires '{'), greedy prevents selecting '{}_' over '{"'.
-        let at_hard_gate = self.json_sampler.as_ref()
+        let at_hard_gate = force_greedy || self.json_sampler.as_ref()
             .map(|js| !js.required_gate().is_any())
             .unwrap_or(false);
 
@@ -1968,7 +2009,7 @@ impl Model {
         for (_, p) in probs.iter_mut() { *p /= sum; }
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        let top_p = 0.80f32;
+        // top_p was read from `cfg.top_p` at the top of the function.
         let mut cumsum = 0.0f32;
         let mut nucleus: Vec<(u32, f32)> = Vec::new();
         for (idx, p) in &probs {
@@ -2632,7 +2673,21 @@ impl Model {
     /// Batched GPTQ prefill: process all N input tokens in one GPU submission.
     /// Only supports GPTQ INT4 weights with Q_GATED=true (Qwen3.5).
     /// Returns the first sampled decode token.
-    pub fn prefill_gptq(&mut self, gpu: &mut GpuContext, input_ids: &[u32]) {
+    /// Batched GPTQ prefill.
+    ///
+    /// `pos_offset` is the absolute position in the global sequence at
+    /// which the new tokens begin. Pass `0` for from-scratch prefill (the
+    /// default behaviour); pass the prefix snapshot's `seq_len` for
+    /// continuation prefill, where the cached prefix has already been
+    /// restored into the KV cache and DeltaNet hist/state and the only
+    /// thing to process is the query tail.
+    ///
+    /// The pos_offset is plumbed into the qknorm/RoPE shader (RoPE angles
+    /// + KV cache write index) and the causal-attention shader (causal
+    /// range + cache reads). DeltaNet hist/state are zeroed at the start
+    /// only when `pos_offset == 0` — for continuation, the snapshot's
+    /// restored values must survive.
+    pub fn prefill_gptq(&mut self, gpu: &mut GpuContext, input_ids: &[u32], pos_offset: u32) {
         assert!(!self.bf16_mode, "prefill_gptq requires GPTQ mode (use prefill() for bf16)");
         let seq_len = input_ids.len() as u32;
         let h = self.config.hidden_size;
@@ -2643,7 +2698,8 @@ impl Model {
         let f = 4u64;
         let sl = seq_len as u64;
 
-        log::info!("[prefill_gptq] seq_len={} hidden={} inter={}", seq_len, h, inter);
+        log::info!("[prefill_gptq] seq_len={} pos_offset={} hidden={} inter={}",
+            seq_len, pos_offset, h, inter);
 
         // ── Embed all input tokens into a flat [seq_len, hidden] f32 buffer ──
         let residual = gpu.create_storage_buffer("pg_residual", sl * h as u64 * f);
@@ -2709,13 +2765,18 @@ impl Model {
         // Separate params buffer for DeltaNet uniform (8 fields, 32 bytes)
         let pg_dn_params = gpu.create_buffer("pg_dn_params", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
 
-        // Zero all DeltaNet hist and state buffers so prefill always starts from a clean
-        // initial condition regardless of leftover state from previous generate() calls.
-        let hist_zeros  = vec![0u8; 3 * dn_total_ch as usize * 4];
-        let state_zeros = vec![0u8; (lnvh * lkd * lvd) as usize * 4];
-        for lin_idx in 0..self.state.deltanet_hist.len() {
-            gpu.write_buffer(&self.state.deltanet_hist[lin_idx],  0, &hist_zeros);
-            gpu.write_buffer(&self.state.deltanet_state[lin_idx], 0, &state_zeros);
+        // From-scratch only: zero DeltaNet hist + state so prefill starts
+        // clean regardless of leftover state from previous generate() calls.
+        // Continuation prefill (pos_offset > 0) must keep the snapshot's
+        // restored hist/state intact — that's exactly what makes the
+        // recurrence resume from the right place.
+        if pos_offset == 0 {
+            let hist_zeros  = vec![0u8; 3 * dn_total_ch as usize * 4];
+            let state_zeros = vec![0u8; (lnvh * lkd * lvd) as usize * 4];
+            for lin_idx in 0..self.state.deltanet_hist.len() {
+                gpu.write_buffer(&self.state.deltanet_hist[lin_idx],  0, &hist_zeros);
+                gpu.write_buffer(&self.state.deltanet_state[lin_idx], 0, &state_zeros);
+            }
         }
         gpu.flush();
 
@@ -2813,9 +2874,12 @@ impl Model {
 
                 // ── Batched Q_GATED qknorm + RoPE + KV cache write ──
                 // batched_qknorm_params[layer_idx] has header+weights pre-loaded.
-                // Write seq_len (4 bytes) at offset 16 (seq_len field in header).
+                // Write seq_len (4 bytes) at offset 16 and pos_offset (4 bytes)
+                // at offset 20 — those are the two header fields that change
+                // per call. The qk_norm_weight array starts at offset 32.
                 gpu.flush();
                 gpu.write_buffer(&self.state.batched_qknorm_params[layer_idx], 16, &seq_len.to_le_bytes());
+                gpu.write_buffer(&self.state.batched_qknorm_params[layer_idx], 20, &pos_offset.to_le_bytes());
                 if self.q_gated {
                     gpu.dispatch("pg_qknorm", &batched_qknorm_src, &[
                         gpu::bind(0, &q_raw),   // [seq, nh, hd*2]
@@ -2840,17 +2904,30 @@ impl Model {
                 }
 
                 // ── Causal attention (batched) ──
+                // K/V are read from the KV cache (`state.k_cache` /
+                // `state.v_cache`), which already holds the prefix snapshot
+                // for positions [0, pos_offset) and the new tokens just
+                // written by the qknorm shader at positions
+                // [pos_offset, pos_offset+seq_len). For from-scratch
+                // prefill (pos_offset=0) the cache slice [0, seq_len) is
+                // exactly what `k_buf`/`v_buf` would have held, so the
+                // result is unchanged.
                 {
                     #[repr(C)]
                     #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
-                    struct AttnP { seq_len: u32, head_dim: u32, num_kv_heads: u32, num_q_heads: u32, heads_per_kv: u32 }
+                    struct AttnP {
+                        seq_len: u32, head_dim: u32, num_kv_heads: u32,
+                        num_q_heads: u32, heads_per_kv: u32, pos_offset: u32,
+                    }
                     gpu.flush();
                     gpu.write_buffer(&pg_params, 0, bytemuck::bytes_of(&AttnP {
                         seq_len, head_dim: hd, num_kv_heads: nkv,
-                        num_q_heads: nh, heads_per_kv: nh / nkv }));
+                        num_q_heads: nh, heads_per_kv: nh / nkv, pos_offset }));
                     gpu.dispatch("pg_attn", shaders::CAUSAL_ATTENTION_PREFILL, &[
-                        gpu::bind(0, &q_proj), gpu::bind(1, &k_buf),
-                        gpu::bind(2, &v_buf),  gpu::bind(3, &attn_out),
+                        gpu::bind(0, &q_proj),
+                        gpu::bind(1, &self.state.k_cache[layer_idx]),
+                        gpu::bind(2, &self.state.v_cache[layer_idx]),
+                        gpu::bind(3, &attn_out),
                         gpu::bind(4, &pg_params),
                     ], (nh, seq_len, 1));
                 }
@@ -3158,18 +3235,34 @@ impl Model {
         }
 
         // ── Extract last position hidden state → state.normed for LM head ──
+        // The `read_buffer_offset` here is the FIRST GPU sync after the
+        // entire layer pipeline was enqueued — it has to drain every
+        // per-layer dispatch the loop above queued up. For sizable
+        // prefills (~1k tokens × 48 layers on a 14B int4) this is the
+        // dominant wall-clock segment and previously read as a "stall"
+        // in the trace because no logs fire while the GPU works through
+        // the queue. Bracket it with timing so the cost is visible.
         gpu.flush();
+        let drain_t0 = std::time::Instant::now();
+        log::debug!("[prefill_gptq] post-layer GPU drain start (seq_len={} pos_offset={})",
+            seq_len, pos_offset);
         {
             let last_off = (seq_len - 1) as u64 * h as u64 * f;
             let last_bytes = gpu.read_buffer_offset(&normed, last_off, h as u64 * f);
             gpu.write_buffer(&self.state.normed, 0, &last_bytes);
         }
+        log::info!("[prefill_gptq] post-layer GPU drain: {:?} (seq_len={} pos_offset={})",
+            drain_t0.elapsed(), seq_len, pos_offset);
 
         // ── LM head ──
+        let lmh_t0 = std::time::Instant::now();
         self.dispatch_lm_head(gpu);
+        log::debug!("[prefill_gptq] dispatch_lm_head enqueued in {:?}", lmh_t0.elapsed());
 
-        self.seq_len = seq_len;
-        log::info!("[prefill_gptq] done, seq_len={}", seq_len);
+        // For continuation prefill, advance seq_len past the prefix as well.
+        self.seq_len = pos_offset + seq_len;
+        log::info!("[prefill_gptq] done, seq_len={} (pos_offset={} + new={})",
+            self.seq_len, pos_offset, seq_len);
         // Caller must call sample_first_decode_token() to obtain the first decode token.
         // This allows feature-gated think injection before sampling.
     }

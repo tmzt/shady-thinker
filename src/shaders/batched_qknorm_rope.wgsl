@@ -17,7 +17,11 @@ struct Params {
     head_dim: u32,
     eps: f32,
     seq_len: u32,
-    _pad0: u32,
+    // Continuation prefill offset: absolute position of the *first* new
+    // token in the global sequence. RoPE angles use `pos_offset + pos`,
+    // and the KV cache write lands at `(pos_offset + pos)`. From-scratch
+    // prefill passes 0, reproducing the original math.
+    pos_offset: u32,
     _pad1: u32,
     _pad2: u32,
     qk_norm_weight: array<vec4<u32>, 320>,
@@ -45,14 +49,14 @@ fn get_norm_weight(p: u32) -> f32 {
     return unpack_bf16(params.qk_norm_weight[vec_idx][u32_in_vec], bf16_in_u32);
 }
 
-fn apply_rope_interleaved(tid: u32, pos: u32) {
+fn apply_rope_interleaved(tid: u32, abs_pos: u32) {
     let partial_half = PARTIAL_DIM / 2u;
     if (MROPE_INTERLEAVED) {
         var d = tid;
         while (d < partial_half) {
             let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(d) / f32(PARTIAL_DIM));
             // All positions use temporal (same pos for h/w in text-only decoder)
-            let angle = f32(pos) * freq;
+            let angle = f32(abs_pos) * freq;
             let cos_a = cos(angle);
             let sin_a = sin(angle);
             let a = wg_vals[2u * d];
@@ -65,7 +69,7 @@ fn apply_rope_interleaved(tid: u32, pos: u32) {
         var d = tid;
         while (d < partial_half) {
             let freq = 1.0 / pow(ROPE_THETA, 2.0 * f32(d) / f32(PARTIAL_DIM));
-            let angle = f32(pos) * freq;
+            let angle = f32(abs_pos) * freq;
             let cos_a = cos(angle);
             let sin_a = sin(angle);
             let a = wg_vals[d];
@@ -85,6 +89,7 @@ fn main(
     let tid = lid.x;
     let head_idx = wg_id.x;
     let pos = wg_id.y;
+    let abs_pos = params.pos_offset + pos;  // absolute position in cache / RoPE
     let head_dim = params.head_dim;
     let num_q = params.num_q_heads;
     let num_kv = params.num_kv_heads;
@@ -129,8 +134,8 @@ fn main(
         }
         workgroupBarrier();
 
-        // Apply RoPE
-        apply_rope_interleaved(tid, pos);
+        // Apply RoPE (uses absolute position for continuation prefill)
+        apply_rope_interleaved(tid, abs_pos);
         workgroupBarrier();
 
         // Write back to q_proj
@@ -180,12 +185,13 @@ fn main(
         }
         workgroupBarrier();
 
-        // Apply RoPE
-        apply_rope_interleaved(tid, pos);
+        // Apply RoPE (uses absolute position for continuation prefill)
+        apply_rope_interleaved(tid, abs_pos);
         workgroupBarrier();
 
-        // Write K back to k_proj and to k_cache
-        let cache_base = pos * num_kv * head_dim + kh * head_dim;
+        // Write K back to k_proj (batch-local index `pos`) and to k_cache
+        // (absolute index `abs_pos` so continuation lands past the prefix).
+        let cache_base = abs_pos * num_kv * head_dim + kh * head_dim;
         d = tid;
         while (d < head_dim) {
             let k_val = wg_vals[d];

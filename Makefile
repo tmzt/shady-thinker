@@ -10,6 +10,11 @@ test-unit:
 test-integration:
 	MODEL_DIR=$(MODEL_DIR) cargo test --features jit-lora --test jit_lora_test -- --nocapture --test-threads=1
 
+# Run the continuation-prefill numerical-equivalence test (GPU + model required).
+# Gated on the `gpu-test` feature so plain `cargo test` skips it.
+test-continuation-eq:
+	MODEL_DIR=$(MODEL_DIR) cargo test --features gpu-test --test continuation_prefill_eq -- --nocapture --test-threads=1
+
 # Run all tests
 test: test-unit test-integration
 

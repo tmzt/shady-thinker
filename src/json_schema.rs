@@ -43,13 +43,22 @@ pub struct SchemaFST {
     alive: Vec<bool>,
     /// Currently inside a WILD section (free value).
     in_wild: bool,
+    /// Maximum number of bytes a single WILD slot may consume before
+    /// the gate is narrowed to just `"` (force-close the value).
+    /// `None` = no cap (legacy behavior). Set on
+    /// `with_string_keys(_, max_wild_bytes)` so chatty models can't
+    /// loop forever inside a value slot.
+    max_wild_bytes: Option<u32>,
+    /// Bytes consumed in the current WILD slot. Reset when entering /
+    /// leaving wild.
+    wild_bytes: u32,
 }
 
 impl SchemaFST {
     pub fn new() -> Self {
         let templates = build_templates();
         let alive = vec![true; templates.len()];
-        Self { templates, pos: 0, alive, in_wild: false }
+        Self { templates, pos: 0, alive, in_wild: false, max_wild_bytes: None, wild_bytes: 0 }
     }
 
     /// Build a single-template schema for `{"k1":"<wild>","k2":"<wild>",…}`
@@ -62,7 +71,13 @@ impl SchemaFST {
     /// `{"k1": "\x00", "k2": "\x00", …, "kN": "\x00"}` with one WILD
     /// per key. JSON whitespace after each comma matches what
     /// `build_templates` already emits.
-    pub fn with_string_keys(keys: &[&str]) -> Self {
+    ///
+    /// `max_wild_bytes` caps how long any single value may run before
+    /// the gate is narrowed to just `"` (force-close). Pick a value
+    /// matching the longest plausible field; classifier-style fields
+    /// fit comfortably in 200 bytes. `None` disables the cap (chatty
+    /// models can loop forever inside a value).
+    pub fn with_string_keys(keys: &[&str], max_wild_bytes: Option<u32>) -> Self {
         let mut t: Vec<u8> = Vec::new();
         t.push(b'{');
         for (i, k) in keys.iter().enumerate() {
@@ -76,7 +91,7 @@ impl SchemaFST {
         t.push(b'}');
         let templates = vec![t];
         let alive = vec![true; templates.len()];
-        Self { templates, pos: 0, alive, in_wild: false }
+        Self { templates, pos: 0, alive, in_wild: false, max_wild_bytes, wild_bytes: 0 }
     }
 
     /// Allowed bytes inside WILD (value) sections: ASCII alphanumeric + safe special chars + closing quote.
@@ -91,6 +106,15 @@ impl SchemaFST {
     /// In wild sections, returns constrained ASCII set (not unconstrained).
     pub fn valid_next_bytes(&self) -> Option<Vec<u8>> {
         if self.in_wild {
+            // If a per-wild-slot cap is set and reached, force-close
+            // the value with `"`. Prevents the model from looping
+            // forever inside a value slot (e.g. emitting "the note: 1.
+            // the note: 2. ..." indefinitely).
+            if let Some(cap) = self.max_wild_bytes {
+                if self.wild_bytes >= cap {
+                    return Some(vec![b'"']);
+                }
+            }
             return Some(Self::wild_allowed().to_vec());
         }
 
@@ -151,23 +175,14 @@ impl SchemaFST {
             // In a free value section — exit when we see closing quote
             if b == b'"' {
                 self.in_wild = false;
+                self.wild_bytes = 0;
                 self.pos += 1; // skip past the WILD marker
-                // Now advance past the `"` in the template too
-                // The template has WILD followed by `"` — we consumed `"`, advance
-                // Filter alive templates at the new position
-                for (i, tmpl) in self.templates.iter().enumerate() {
-                    if !self.alive[i] { continue; }
-                    // After WILD, the next byte in template should be what follows WILD
-                    // We already advanced pos past WILD, check current pos
-                    if self.pos < tmpl.len() && tmpl[self.pos] != b'"' {
-                        // Mismatch — this template expected something else after the wild value
-                        // Actually the `"` closing the value is part of the template text after WILD
-                    }
-                }
-                // The `"` is the closing quote of the value — it's implicit after WILD
-                // Templates: ...WILD..."  — the `"` after WILD is in the template
-                // We need to skip past it in the template
+                // The `"` is the closing quote of the value — part of
+                // the template text after WILD. Advance templates
+                // through the closing quote.
                 self.advance_templates(b);
+            } else {
+                self.wild_bytes = self.wild_bytes.saturating_add(1);
             }
             return;
         }
@@ -184,6 +199,7 @@ impl SchemaFST {
                 } else {
                     // Enter wild mode — this byte is the start of a free value
                     self.in_wild = true;
+                    self.wild_bytes = 1;
                     // Don't advance pos — stay at WILD until closing quote
                 }
                 return;
@@ -503,7 +519,7 @@ mod tests {
     // ── with_string_keys (notes-classifier shape) ──────────────────────
 
     fn drive_keys(keys: &[&str], input: &[u8]) -> SchemaFST {
-        let mut fst = SchemaFST::with_string_keys(keys);
+        let mut fst = SchemaFST::with_string_keys(keys, None);
         for (i, &b) in input.iter().enumerate() {
             assert!(fst.is_active(), "FST died at pos {} byte {:?}", i, b as char);
             if let Some(ref v) = fst.valid_next_bytes() {
@@ -528,7 +544,7 @@ mod tests {
     #[test]
     fn with_keys_blocks_wrong_first_key() {
         // First literal byte after `{` must be `"`, then `p` (start of "project")
-        let fst = SchemaFST::with_string_keys(&["project", "topics", "summary"]);
+        let fst = SchemaFST::with_string_keys(&["project", "topics", "summary"], None);
         let mut fst2 = fst.clone();
         fst2.advance(b'{');
         let valid = fst2.valid_next_bytes().unwrap();
@@ -547,6 +563,56 @@ mod tests {
             br#"{"project": "anything goes here"#,
         );
         assert!(fst.in_wild, "should be inside wild value section");
+    }
+
+    #[test]
+    fn with_keys_wild_cap_forces_close_quote() {
+        // 5-byte cap; emit 5 bytes inside the value then check the
+        // gate narrows to just `"`.
+        let mut fst = SchemaFST::with_string_keys(
+            &["project", "topics", "summary"],
+            Some(5),
+        );
+        for &b in br#"{"project": "abcde"# {
+            fst.advance(b);
+        }
+        // 5 bytes of value (`a b c d e`) consumed — wild_bytes == cap
+        let valid = fst.valid_next_bytes().unwrap();
+        assert_eq!(valid, vec![b'"'],
+            "after wild cap, gate should narrow to closing quote only");
+
+        // Exactly one byte under the cap should still allow free chars
+        let mut fst2 = SchemaFST::with_string_keys(
+            &["project", "topics", "summary"],
+            Some(5),
+        );
+        for &b in br#"{"project": "abcd"# {
+            fst2.advance(b);
+        }
+        let valid = fst2.valid_next_bytes().unwrap();
+        assert!(valid.len() > 1,
+            "below cap, full wild_allowed set should be available");
+    }
+
+    #[test]
+    fn with_keys_wild_cap_resets_per_slot() {
+        // Each value slot has its own counter — emitting close to cap
+        // in slot 1 shouldn't poison slot 2.
+        let mut fst = SchemaFST::with_string_keys(
+            &["project", "topics", "summary"],
+            Some(10),
+        );
+        // Slot 1: 9 bytes then close
+        for &b in br#"{"project": "abcdefghi""# {
+            fst.advance(b);
+        }
+        // Now in the structural section between values, then enter slot 2
+        for &b in br#", "topics": "x"# {
+            fst.advance(b);
+        }
+        // wild_bytes should be 1 (just `x`), not carried over
+        assert_eq!(fst.wild_bytes, 1,
+            "wild_bytes counter must reset on slot exit");
     }
 
     #[test]

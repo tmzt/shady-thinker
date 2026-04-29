@@ -263,6 +263,16 @@ pub struct ModelConfig {
     /// Qwen3.5: gated attention output (Q outputs 2×head_dim, sigmoid gate applied)
     #[serde(default)]
     pub attn_output_gate: bool,
+    /// Whether the model has per-head Q/K RMSNorm weights
+    /// (`self_attn.q_norm.weight`, `self_attn.k_norm.weight`). Filled
+    /// in by `ModelConfig::from_file` based on `model_type` since
+    /// there's no explicit config.json field — Qwen3 family
+    /// (`qwen3`, `qwen3_5`, `qwen3_5_text`) all use QK norm; Qwen2.x
+    /// does not. Drives shader selection: with QK norm we use
+    /// `batched_qknorm_rope.wgsl` even when `attn_output_gate` is
+    /// false; without it we fall through to `batched_rope.wgsl`.
+    #[serde(default)]
+    pub use_qk_norm: bool,
     #[serde(default)]
     pub num_hidden_layers: u32,
     #[serde(default)]
@@ -384,6 +394,18 @@ impl ModelConfig {
                     config.partial_rotary_factor);
             }
         }
+        // QK norm presence: Qwen3 family (qwen3, qwen3_5, qwen3_5_text)
+        // applies per-head RMSNorm to Q and K. Qwen2 family does not.
+        // No explicit config.json field exists, so derive from
+        // `model_type`. The model_type prefix check is the canonical
+        // signal in HuggingFace's `transformers/modeling_qwen3.py`.
+        if config.model_type.starts_with("qwen3") {
+            config.use_qk_norm = true;
+        }
+        log::info!(
+            "[config] model_type={} attn_output_gate={} use_qk_norm={}",
+            config.model_type, config.attn_output_gate, config.use_qk_norm,
+        );
         config
     }
 
@@ -402,11 +424,17 @@ impl ModelConfig {
         (11, 22)
     }
 
-    /// Whether mRoPE uses interleaved rotation pairs (2d, 2d+1) vs (d, d+partial_half).
+    /// Whether mRoPE uses interleaved rotation pairs (2d, 2d+1) vs
+    /// (d, d+partial_half). Qwen3.5 explicitly sets this to true via
+    /// `rope_parameters.mrope_interleaved`. Qwen2.5 has no
+    /// `rope_parameters` block at all and uses non-interleaved
+    /// (half-format) RoPE — same convention as Llama-2/3 — so the
+    /// default when absent is **false**. Setting it true for Qwen2.5
+    /// rotates the wrong dimension pairs and the model emits gibberish.
     pub fn mrope_interleaved(&self) -> bool {
         self.rope_parameters
             .as_ref()
-            .map_or(true, |rp| rp.mrope_interleaved)
+            .map_or(false, |rp| rp.mrope_interleaved)
     }
 }
 
@@ -616,6 +644,23 @@ fn upload_f16_as_f32(gpu: &GpuContext, f16_bytes: &[u8], label: &str) -> wgpu::B
     gpu.upload_buffer(label, bytemuck::cast_slice(&f32_vals))
 }
 
+/// Convert an F16-encoded byte stream to BF16 bytes (via F32). Used for
+/// layernorm weights stored as F16 in some GPTQ-Int4 publishers (e.g.
+/// Qwen2.5-*-Instruct-GPTQ-Int4). The RMSNorm shaders unpack their
+/// weight buffer as BF16 (`bits << 16`), so an F16 source must be
+/// re-encoded to match. Range loss vs. F32 is negligible for the
+/// near-1.0 scale factors layernorm weights contain.
+fn f16_bytes_to_bf16(f16_bytes: &[u8]) -> Vec<u8> {
+    let f16_vals: &[u16] = bytemuck::cast_slice(f16_bytes);
+    let mut out = Vec::with_capacity(f16_vals.len() * 2);
+    for &bits in f16_vals {
+        let f32_val = half::f16::from_bits(bits).to_f32();
+        let bf16_bits = half::bf16::from_f32(f32_val).to_bits();
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
 /// Dequantize GPTQ INT4 symmetric weights to BF16 bytes.
 /// Matches the GPU shader convention: `f32(nibble) - 8.0` × scale.
 /// qweight: [packed_rows, N] as u32 (8 int4 per u32, row-major)
@@ -784,14 +829,46 @@ pub fn load_weights(
                 continue;
             }
 
-            // Defer oversized tensors — they need chunked upload after we know hidden_size
+            // Detect F16 storage upfront — Qwen2.5 / Qwen-official
+            // GPTQ-Int4 publishers ship layernorms, embed_tokens, and
+            // unquantized lm_head as F16. The relevant GPU shaders
+            // (RMSNorm, embedding lookup, lm_head matmul fallback) all
+            // unpack their weight buffers as **BF16** (`bits << 16`),
+            // so an F16 source must be re-encoded to BF16 at load time
+            // — otherwise every BF16-consuming kernel sees ~1/128×
+            // the intended values, hidden states collapse to near-zero
+            // through the layer stack, and the lm_head emits ~1e-7
+            // logits → uniform-random sampling → multilingual gibberish.
+            //
+            // Apply to non-quantized `.weight` tensors only; scales
+            // (`.scales`) and qweight (`.qweight`) bypass this and are
+            // consumed by the GPTQ kernels as native F16 / I32.
+            let is_bf16_consuming_weight = name.ends_with(".weight")
+                && !name.ends_with(".qweight")
+                && !name.contains(".q_norm.")  // handled separately as raw bytes
+                && !name.contains(".k_norm.")
+                && !name.contains(".in_proj_a.")  // DeltaNet merge path
+                && !name.contains(".in_proj_b.");
+            let f16_storage = format!("{:?}", view.dtype()) == "F16";
+            // Defer oversized tensors — they need chunked upload after we know hidden_size.
+            // Convert F16→BF16 here too so the chunked upload below uses BF16 bytes.
             if bytes.len() as u64 > max_binding && name.ends_with("embed_tokens.weight") {
-                oversized_raw.insert(name.to_string(), bytes.to_vec());
+                if is_bf16_consuming_weight && f16_storage {
+                    oversized_raw.insert(name.to_string(), f16_bytes_to_bf16(bytes));
+                } else {
+                    oversized_raw.insert(name.to_string(), bytes.to_vec());
+                }
                 continue;
             }
             // Defer MoE expert weights for packed buffer upload
             if config.num_experts > 0 && name.contains(".mlp.experts.") {
                 raw_bytes_map.insert(name.to_string(), bytes.to_vec());
+                continue;
+            }
+            if is_bf16_consuming_weight && f16_storage {
+                let bf16 = f16_bytes_to_bf16(bytes);
+                let buffer = gpu.upload_buffer(&name, &bf16);
+                tensor_map.insert(name.to_string(), buffer);
                 continue;
             }
             let buffer = gpu.upload_buffer(&name, bytes);

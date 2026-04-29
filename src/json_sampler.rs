@@ -110,8 +110,12 @@ impl JsonSampler {
     /// Enable schema-guided decoding with a single fixed-shape
     /// template `{"k1":"<wild>","k2":"<wild>",…}`. See
     /// `SchemaFST::with_string_keys`.
-    pub fn enable_schema_with_keys(&mut self, keys: &[&str]) {
-        let s = crate::json_schema::SchemaFST::with_string_keys(keys);
+    ///
+    /// `max_wild_bytes` caps the byte length of any single value
+    /// before the gate is narrowed to `"`, force-closing the value.
+    /// Use it on chatty models that loop inside a wild slot.
+    pub fn enable_schema_with_keys(&mut self, keys: &[&str], max_wild_bytes: Option<u32>) {
+        let s = crate::json_schema::SchemaFST::with_string_keys(keys, max_wild_bytes);
         self.schema_init = Some(s.clone());
         self.schema = Some(s);
     }

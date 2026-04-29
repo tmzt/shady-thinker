@@ -20,6 +20,13 @@ pub struct GpuContext {
     flush_probe_dst: Option<wgpu::Buffer>,
     /// Whether flush_probe_dst is currently in a mapped state.
     flush_probe_mapped: bool,
+    /// Per-request inference knobs. Lives on `GpuContext` (not just
+    /// `GpuRequestContext`) so the inference kernels — which take a
+    /// plain `&mut GpuContext` — can read sampling parameters without
+    /// re-plumbing every method's signature. `GpuRequestContext`
+    /// writes this at request dispatch and clears it at request end
+    /// (mirroring `stream_tx` / `disable_think_prefix`).
+    pub inference_config: common::handles::InferenceConfig,
 }
 
 /// Per-request GPU context wrapper.
@@ -55,14 +62,6 @@ pub struct GpuRequestContext {
     /// the think block mid-decode via `EpiphanyDispatcher`) is
     /// independent and configured per-model.
     pub disable_think_prefix: bool,
-    /// Bag of per-request knobs that aren't worth their own field on
-    /// this struct. Set by the thinker dispatch path before each
-    /// generation and reset to `Default::default()` afterward — same
-    /// lifecycle as `stream_tx` / `stream_tokenizer`. Hot-path
-    /// readers (e.g. the `JsonMode` check inside `generate_inner`)
-    /// look at this directly rather than going through a parallel
-    /// scattered-fields path.
-    pub inference_config: common::handles::InferenceConfig,
 }
 
 impl std::ops::Deref for GpuRequestContext {
@@ -87,7 +86,6 @@ impl GpuRequestContext {
             stream_tx: None,
             stream_tokenizer: None,
             disable_think_prefix: false,
-            inference_config: common::handles::InferenceConfig::default(),
         }
     }
 }
@@ -115,6 +113,7 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
+            inference_config: common::handles::InferenceConfig::default(),
         };
         ctx.init_flush_probe();
         ctx
@@ -189,6 +188,7 @@ impl GpuContext {
             flush_probe_src: None,
             flush_probe_dst: None,
             flush_probe_mapped: false,
+            inference_config: common::handles::InferenceConfig::default(),
         };
         ctx.init_flush_probe();
         ctx
