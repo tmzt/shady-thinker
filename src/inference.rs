@@ -347,10 +347,13 @@ impl InferenceSession {
                 // (matching braces, quoted keys, comma placement) and
                 // lets the model pick its own keys/values, which is
                 // the right primitive for free-shape structured
-                // extraction (notes_classifier, etc.).
+                // extraction.
                 //
-                // `set_min_keys(2)` is still useful: prevents the
-                // model from emitting `{}` and immediately closing.
+                // Caveat: `JsonSM::InKey/InString` gates are
+                // `AnyCharacter`, so a chatty model can ramble inside
+                // the first key string. Callers with a known key set
+                // should use a dedicated variant (e.g.
+                // `NotesClassifierJSON`) that pins the keys.
                 let mut sampler = crate::json_sampler::JsonSampler::new(
                     assets.token_bytes.clone(), assets.eos_ids.clone(),
                 );
@@ -359,6 +362,29 @@ impl InferenceSession {
                 self.tool_call_config = None;
                 log::info!("[shady-thinker:{}] AnyJSON sampler engaged (JsonSM only, no schema templates)",
                     self.gpu.role_tag);
+                true
+            }
+            common::handles::JsonMode::NotesClassifierJSON => {
+                // Fixed-shape constraint:
+                // `{"project": "<wild>", "topics": "<wild>", "summary": "<wild>"}`.
+                // The schema FST gate-forces every literal byte
+                // between WILD slots, so the model can't rename keys
+                // or write prose between them — only the three value
+                // strings are free-form. This is what `notes_classifier`
+                // wants; `AnyJSON` was too loose because chatty models
+                // used the unconstrained-key freedom to write
+                // paragraphs between the opening `{"` and the next
+                // closing `"`.
+                let mut sampler = crate::json_sampler::JsonSampler::new(
+                    assets.token_bytes.clone(), assets.eos_ids.clone(),
+                );
+                sampler.enable_schema_with_keys(&["project", "topics", "summary"]);
+                self.model.json_sampler = Some(sampler);
+                self.tool_call_config = None;
+                log::info!(
+                    "[shady-thinker:{}] NotesClassifierJSON sampler engaged (keys=project,topics,summary)",
+                    self.gpu.role_tag,
+                );
                 true
             }
             common::handles::JsonMode::ToolOnly | common::handles::JsonMode::ThinkingWithTools => {

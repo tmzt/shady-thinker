@@ -52,6 +52,33 @@ impl SchemaFST {
         Self { templates, pos: 0, alive, in_wild: false }
     }
 
+    /// Build a single-template schema for `{"k1":"<wild>","k2":"<wild>",…}`
+    /// where every key is a string-valued WILD slot. Used by callers
+    /// with a known fixed shape (e.g. notes_classifier's
+    /// `{"project","topics","summary"}`) so the model can't invent
+    /// keys or ramble inside the first key string.
+    ///
+    /// The produced template is byte-for-byte:
+    /// `{"k1": "\x00", "k2": "\x00", …, "kN": "\x00"}` with one WILD
+    /// per key. JSON whitespace after each comma matches what
+    /// `build_templates` already emits.
+    pub fn with_string_keys(keys: &[&str]) -> Self {
+        let mut t: Vec<u8> = Vec::new();
+        t.push(b'{');
+        for (i, k) in keys.iter().enumerate() {
+            if i > 0 { t.extend_from_slice(b", "); }
+            t.push(b'"');
+            t.extend_from_slice(k.as_bytes());
+            t.extend_from_slice(b"\": \"");
+            t.push(WILD);
+            t.push(b'"');
+        }
+        t.push(b'}');
+        let templates = vec![t];
+        let alive = vec![true; templates.len()];
+        Self { templates, pos: 0, alive, in_wild: false }
+    }
+
     /// Allowed bytes inside WILD (value) sections: ASCII alphanumeric + safe special chars + closing quote.
     /// Deliberately excludes { } [ ] < > to prevent the model from generating nested structures.
     fn wild_allowed() -> &'static [u8] {
@@ -471,5 +498,68 @@ mod tests {
         let alive: Vec<usize> = fst_exec.alive.iter().enumerate()
             .filter(|(_, &a)| a).map(|(i, _)| i).collect();
         assert_eq!(alive.len(), 1, "only execute_coder_plan starts with 'execute'");
+    }
+
+    // ── with_string_keys (notes-classifier shape) ──────────────────────
+
+    fn drive_keys(keys: &[&str], input: &[u8]) -> SchemaFST {
+        let mut fst = SchemaFST::with_string_keys(keys);
+        for (i, &b) in input.iter().enumerate() {
+            assert!(fst.is_active(), "FST died at pos {} byte {:?}", i, b as char);
+            if let Some(ref v) = fst.valid_next_bytes() {
+                assert!(v.contains(&b),
+                    "byte {:?} not in valid set ({} opts) at pos {}",
+                    b as char, v.len(), i);
+            }
+            fst.advance(b);
+        }
+        fst
+    }
+
+    #[test]
+    fn with_keys_full_classifier_shape() {
+        let fst = drive_keys(
+            &["project", "topics", "summary"],
+            br#"{"project": "alpha", "topics": "rust, gpu", "summary": "did things"}"#,
+        );
+        assert!(fst.is_done(), "full classifier object should complete");
+    }
+
+    #[test]
+    fn with_keys_blocks_wrong_first_key() {
+        // First literal byte after `{` must be `"`, then `p` (start of "project")
+        let fst = SchemaFST::with_string_keys(&["project", "topics", "summary"]);
+        let mut fst2 = fst.clone();
+        fst2.advance(b'{');
+        let valid = fst2.valid_next_bytes().unwrap();
+        assert_eq!(valid, vec![b'"'], "must start key with quote");
+        fst2.advance(b'"');
+        let valid = fst2.valid_next_bytes().unwrap();
+        assert_eq!(valid, vec![b'p'], "first key must start with 'p' (project)");
+    }
+
+    #[test]
+    fn with_keys_wild_holds_value() {
+        // After `{"project": "` we should be in a wild slot — the value
+        // can be free text, terminated by closing quote.
+        let fst = drive_keys(
+            &["project", "topics", "summary"],
+            br#"{"project": "anything goes here"#,
+        );
+        assert!(fst.in_wild, "should be inside wild value section");
+    }
+
+    #[test]
+    fn with_keys_blocks_premature_close() {
+        // Only one key emitted so far — the `,` continuation must be
+        // forced; `}` should be invalid because more keys are required.
+        let fst = drive_keys(
+            &["project", "topics", "summary"],
+            br#"{"project": "alpha""#,
+        );
+        let valid = fst.valid_next_bytes().unwrap();
+        assert!(valid.contains(&b','), "comma should be valid (more keys remain)");
+        assert!(!valid.contains(&b'}'),
+            "}} must NOT be valid — topics + summary still required");
     }
 }

@@ -78,13 +78,18 @@ pub const TOOL_SCHEMAS: &[ToolSchema] = &[
 pub struct JsonSampler {
     sm: JsonSM,
     schema: Option<crate::json_schema::SchemaFST>,
+    /// Pristine copy of `schema` captured at the time it was enabled.
+    /// `reset()` clones from here so per-request schema flavors
+    /// (tool-routing vs. fixed-shape `with_string_keys`) survive a
+    /// reset without losing their templates.
+    schema_init: Option<crate::json_schema::SchemaFST>,
     token_bytes: Vec<Vec<u8>>,
     eos_ids: Vec<u32>,
 }
 
 impl JsonSampler {
     pub fn new(token_bytes: Vec<Vec<u8>>, eos_ids: Vec<u32>) -> Self {
-        Self { sm: JsonSM::new(), schema: None, token_bytes, eos_ids }
+        Self { sm: JsonSM::new(), schema: None, schema_init: None, token_bytes, eos_ids }
     }
 
     /// Create an unconstrained sampler (no token_bytes filtering, no schema).
@@ -92,12 +97,23 @@ impl JsonSampler {
     /// The sampler enforces JSON structure via the state machine but does not
     /// mask individual tokens (token_bytes is empty → all tokens pass).
     pub fn new_unconstrained() -> Self {
-        Self { sm: JsonSM::new(), schema: None, token_bytes: Vec::new(), eos_ids: Vec::new() }
+        Self { sm: JsonSM::new(), schema: None, schema_init: None, token_bytes: Vec::new(), eos_ids: Vec::new() }
     }
 
     /// Enable schema-guided decoding with tool definitions.
     pub fn enable_schema(&mut self) {
-        self.schema = Some(crate::json_schema::SchemaFST::new());
+        let s = crate::json_schema::SchemaFST::new();
+        self.schema_init = Some(s.clone());
+        self.schema = Some(s);
+    }
+
+    /// Enable schema-guided decoding with a single fixed-shape
+    /// template `{"k1":"<wild>","k2":"<wild>",…}`. See
+    /// `SchemaFST::with_string_keys`.
+    pub fn enable_schema_with_keys(&mut self, keys: &[&str]) {
+        let s = crate::json_schema::SchemaFST::with_string_keys(keys);
+        self.schema_init = Some(s.clone());
+        self.schema = Some(s);
     }
 
     /// Set minimum number of key-value pairs before allowing } at the top level.
@@ -261,12 +277,12 @@ impl JsonSampler {
         }
     }
 
-    /// Reset for a new generation — fresh state machine + fresh schema FST.
+    /// Reset for a new generation — fresh state machine + fresh
+    /// schema FST cloned from the pristine copy captured when the
+    /// schema was enabled.
     pub fn reset(&mut self) {
         self.sm = JsonSM::new();
-        if self.schema.is_some() {
-            self.schema = Some(crate::json_schema::SchemaFST::new());
-        }
+        self.schema = self.schema_init.clone();
     }
 }
 
