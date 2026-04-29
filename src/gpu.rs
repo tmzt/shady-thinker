@@ -609,13 +609,22 @@ pub fn bind(binding: u32, buffer: &wgpu::Buffer) -> (u32, &wgpu::Buffer) {
     (binding, buffer)
 }
 
-/// Build a bind group cache key from pipeline name + buffer pointer addresses.
+/// Build a bind group cache key from pipeline name + buffer pointer
+/// addresses *and sizes*. Including the size guards against the
+/// pointer-collision case where a freshly-allocated buffer happens to
+/// land at the same Rust-side `&wgpu::Buffer` address as a now-dropped
+/// one with a different size — for example, the per-call local prefill
+/// scratch buffers (`pg_residual` etc.) which are created with different
+/// sizes for each `prefill_gptq` call. Without this guard the cache
+/// would serve a stale `BindGroup` pointing at the previous buffer's
+/// GPU memory, and dispatches reading those bindings would see zero
+/// (or worse, stale) data. (See the `continuation_prefill_eq` test.)
 fn make_bg_key(pipeline_name: &str, buffers: &[(u32, &wgpu::Buffer)]) -> BindGroupKey {
     use std::fmt::Write;
-    let mut key = String::with_capacity(pipeline_name.len() + buffers.len() * 20);
+    let mut key = String::with_capacity(pipeline_name.len() + buffers.len() * 28);
     key.push_str(pipeline_name);
     for (binding, buf) in buffers {
-        write!(key, ":{binding}:{:p}", &**buf).unwrap();
+        write!(key, ":{binding}:{:p}@{}", &**buf, buf.size()).unwrap();
     }
     key
 }
