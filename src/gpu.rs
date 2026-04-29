@@ -43,10 +43,16 @@ pub struct GpuRequestContext {
     /// streaming even if `stream_tx` is set".
     pub stream_tokenizer: Option<std::sync::Arc<common::tokenizer::Tokenizer>>,
     /// Whether to disable think-injection for the current request.
-    /// Set per-request from `ThinkerRequest.disable_think_injection`.
-    /// When true, forces the batched GPTQ chunked prefill path instead
-    /// of the per-token fallback (used for OpenAI API compatibility).
+    /// Read from `inference_config.disable_think_injection`. Kept as a
+    /// bare bool too so the hot path inside `generate_inner` doesn't
+    /// have to go through the struct on every iteration. Mirrors what
+    /// thinker_impl writes from `ThinkerRequest.disable_think_injection`.
     pub disable_think_injection: bool,
+    /// Bag of per-request knobs that aren't worth their own field on
+    /// this struct. Set by the thinker dispatch path before each
+    /// generation and reset to `Default::default()` afterward — same
+    /// lifecycle as `stream_tx` / `stream_tokenizer`.
+    pub inference_config: common::handles::InferenceConfig,
 }
 
 impl std::ops::Deref for GpuRequestContext {
@@ -71,6 +77,7 @@ impl GpuRequestContext {
             stream_tx: None,
             stream_tokenizer: None,
             disable_think_injection: false,
+            inference_config: common::handles::InferenceConfig::default(),
         }
     }
 }
