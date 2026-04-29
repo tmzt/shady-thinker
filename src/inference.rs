@@ -180,7 +180,7 @@ impl InferenceSession {
 
     /// Create an InferenceSession with an externally-provided GpuContext.
     /// Useful when multiple models share a GPU device or when request-specific
-    /// context (stream_tx, disable_think_injection) needs to be set before loading.
+    /// context (stream_tx, disable_think_prefix) needs to be set before loading.
     pub fn with_gpu(mut gpu: GpuContext, model_dir: PathBuf, max_seq_len: u32) -> Self {
         let t0 = std::time::Instant::now();
         log::info!("[shady-thinker] loading model from {:?} (max_seq={})", model_dir, max_seq_len);

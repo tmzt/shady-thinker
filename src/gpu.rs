@@ -42,12 +42,19 @@ pub struct GpuRequestContext {
     /// requests on the same long-lived GPU thread. None means "skip
     /// streaming even if `stream_tx` is set".
     pub stream_tokenizer: Option<std::sync::Arc<common::tokenizer::Tokenizer>>,
-    /// Whether to disable think-injection for the current request.
-    /// Read from `inference_config.disable_think_injection`. Kept as a
-    /// bare bool too so the hot path inside `generate_inner` doesn't
-    /// have to go through the struct on every iteration. Mirrors what
-    /// thinker_impl writes from `ThinkerRequest.disable_think_injection`.
-    pub disable_think_injection: bool,
+    /// Whether to skip prefilling the `<think>\n` prefix at the start
+    /// of the assistant turn for the current request. Read from
+    /// `inference_config.disable_think_prefix`. Kept as a bare bool
+    /// so the hot path inside `generate_inner` doesn't have to go
+    /// through the struct on every iteration. Mirrors what
+    /// thinker_impl writes from `ThinkerRequest.disable_think_prefix`.
+    ///
+    /// Naming note: this is the *prefix-prefill* knob — whether the
+    /// model is nudged into emitting a `<think>` block. Think
+    /// *injection* (splicing tool responses or RAG content *into*
+    /// the think block mid-decode via `EpiphanyDispatcher`) is
+    /// independent and configured per-model.
+    pub disable_think_prefix: bool,
     /// Bag of per-request knobs that aren't worth their own field on
     /// this struct. Set by the thinker dispatch path before each
     /// generation and reset to `Default::default()` afterward — same
@@ -79,7 +86,7 @@ impl GpuRequestContext {
             role_tag: "?",
             stream_tx: None,
             stream_tokenizer: None,
-            disable_think_injection: false,
+            disable_think_prefix: false,
             inference_config: common::handles::InferenceConfig::default(),
         }
     }
