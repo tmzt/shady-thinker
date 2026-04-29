@@ -105,7 +105,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let mask_bit = 1u << (pos & 31u);
         if (mask_word & mask_bit) == 0u { v = NEG_INF; }
 
-        v /= p.temperature;
+        // Divide by `max(temperature, 1e-30)` rather than `temperature`
+        // directly. At `temperature == 0` the bare divide would produce
+        // NaN for any v == 0 surviving the gate/mask, and ±∞ for
+        // others — both poison the post-shader softmax. With a tiny
+        // floor the divide stays finite and the order of survivors is
+        // preserved (a uniform positive scalar doesn't change argmax).
+        // Practical side-effect: tiny temperatures inflate the top-1
+        // margin enough that the CPU nucleus sampler picks top-1 with
+        // probability 1.0, giving effective greedy behaviour at
+        // temperature == 0 without a CPU-side branch.
+        v /= max(p.temperature, 1e-30);
         logits[pos] = v;
 
         // Insert into ascending heap: replace min (t0) if better, bubble up.

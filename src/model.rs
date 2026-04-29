@@ -1844,17 +1844,16 @@ impl Model {
         // from `common::handles::InferenceConfig`. Defaults match the
         // historical hardcoded values when callers don't override.
         //
-        // Temperature == 0 means argmax: take top-1 of whatever
-        // survives the penalty / gate / token-mask filtering. The
-        // shader's `v /= temperature` would NaN at 0, so we substitute
-        // 1.0 in the uniform (no rescaling, since softmax of survivors
-        // is irrelevant when we'll just take top-1) and force greedy
-        // top-1 selection on the CPU side via `force_greedy`.
+        // Temperature is passed through as-is. The shader divides by
+        // `max(temperature, 1e-30)` so temperature == 0 doesn't NaN —
+        // and after the divide, the top-1 / top-K margin in `logits`
+        // becomes huge, which makes the downstream nucleus sampler
+        // pick top-1 with probability 1.0 (effective greedy) without
+        // any per-token CPU branch on a `force_greedy` flag.
         let cfg = &gpu.inference_config;
         let rep_penalty = cfg.rep_penalty;
         let presence_penalty = cfg.presence_penalty;
-        let force_greedy = cfg.temperature <= f32::EPSILON;
-        let temperature = if force_greedy { 1.0 } else { cfg.temperature };
+        let temperature = cfg.temperature;
         let top_p = cfg.top_p;
 
         // ── Hard-ban: compute up to 6 banned token IDs on CPU ──────────────
@@ -1996,7 +1995,7 @@ impl Model {
 
         // ── At hard-gate positions, take top-1 (greedy) to avoid sampling valid-but-wrong tokens ──
         // e.g. at Root gate (requires '{'), greedy prevents selecting '{}_' over '{"'.
-        let at_hard_gate = force_greedy || self.json_sampler.as_ref()
+        let at_hard_gate = self.json_sampler.as_ref()
             .map(|js| !js.required_gate().is_any())
             .unwrap_or(false);
 
