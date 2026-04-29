@@ -335,14 +335,30 @@ impl InferenceSession {
                 false
             }
             common::handles::JsonMode::AnyJSON => {
+                // Plain JSON-structure constraint via `JsonSM` only —
+                // **deliberately** not calling `enable_schema()` here.
+                // `enable_schema` loads `SchemaFST::new()`, which is
+                // hardcoded with Fast-thinker tool-routing templates
+                // (`{"tool": "gmail_search", …}`, `{"tool":
+                // "calendar_events", …}`, etc.) — those force every
+                // output to match one of a fixed set of tool calls,
+                // which is exactly NOT what `AnyJSON` callers want.
+                // `JsonSM` alone enforces JSON-grammar validity
+                // (matching braces, quoted keys, comma placement) and
+                // lets the model pick its own keys/values, which is
+                // the right primitive for free-shape structured
+                // extraction (notes_classifier, etc.).
+                //
+                // `set_min_keys(2)` is still useful: prevents the
+                // model from emitting `{}` and immediately closing.
                 let mut sampler = crate::json_sampler::JsonSampler::new(
                     assets.token_bytes.clone(), assets.eos_ids.clone(),
                 );
                 sampler.set_min_keys(2);
-                sampler.enable_schema();
                 self.model.json_sampler = Some(sampler);
                 self.tool_call_config = None;
-                log::info!("[shady-thinker:{}] AnyJSON sampler engaged", self.gpu.role_tag);
+                log::info!("[shady-thinker:{}] AnyJSON sampler engaged (JsonSM only, no schema templates)",
+                    self.gpu.role_tag);
                 true
             }
             common::handles::JsonMode::ToolOnly | common::handles::JsonMode::ThinkingWithTools => {
