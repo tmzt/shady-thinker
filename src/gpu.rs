@@ -51,7 +51,10 @@ pub struct GpuRequestContext {
     /// Bag of per-request knobs that aren't worth their own field on
     /// this struct. Set by the thinker dispatch path before each
     /// generation and reset to `Default::default()` afterward — same
-    /// lifecycle as `stream_tx` / `stream_tokenizer`.
+    /// lifecycle as `stream_tx` / `stream_tokenizer`. Hot-path
+    /// readers (e.g. the `JsonMode` check inside `generate_inner`)
+    /// look at this directly rather than going through a parallel
+    /// scattered-fields path.
     pub inference_config: common::handles::InferenceConfig,
 }
 
