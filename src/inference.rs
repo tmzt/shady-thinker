@@ -146,6 +146,25 @@ pub struct PrefixSnapshot {
     pub(crate) dn: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Cached, model-load-time constrainer assets. Built once when the
+/// model is loaded so per-request `JsonMode` dispatch in
+/// `generate_inner` can construct a `JsonSampler` / `ToolCallConfig`
+/// without round-tripping through `enable_json_mode` /
+/// `set_tool_call_config` (and their expensive `first_bytes_buf` GPU
+/// upload) on every call. The GPU buffer upload happens once in
+/// `prepare_constrainers`; per-request setup is just sampler-state.
+pub struct ConstrainerAssets {
+    /// Token-id → byte-sequence map for the full vocabulary.
+    pub token_bytes: Vec<Vec<u8>>,
+    /// EOS / stop token IDs to suppress mid-JSON.
+    pub eos_ids: Vec<u32>,
+    /// Token-id sequence that opens a tool call (e.g. `<tool_call>`),
+    /// or empty if the tokenizer doesn't have it.
+    pub tool_call_start_ids: Vec<u32>,
+    /// Token-id sequence that closes a tool call (e.g. `</tool_call>`).
+    pub tool_call_end_ids: Vec<u32>,
+}
+
 /// Pure inference session: model + GPU context.
 pub struct InferenceSession {
     pub model: Model,
@@ -154,6 +173,11 @@ pub struct InferenceSession {
     pub think_config: Option<ThinkConfig>,
     /// Tool call detection for think-then-constrain models (Qwen3.5 Fast).
     pub tool_call_config: Option<ToolCallConfig>,
+    /// Cached at model-load via `prepare_constrainers`. Read by the
+    /// per-request `JsonMode` dispatch in `generate_inner` to build
+    /// `JsonSampler` / `ToolCallConfig` without re-passing tokenizer
+    /// data on every call.
+    pub constrainer_assets: Option<ConstrainerAssets>,
     /// KV cache position after prefix prefill. Each generate() call resets
     /// seq_len to this value so the cached system prompt is never re-run.
     pub prefix_len: u32,
@@ -243,7 +267,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu: GpuRequestContext::new(gpu), config, think_config: None, tool_call_config: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
+        let mut session = Self { model, gpu: GpuRequestContext::new(gpu), config, think_config: None, tool_call_config: None, constrainer_assets: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -269,6 +293,91 @@ impl InferenceSession {
 
     pub fn set_tool_call_config(&mut self, config: ToolCallConfig) {
         self.tool_call_config = Some(config);
+    }
+
+    /// Cache constrainer assets and upload the JSON sampler's
+    /// first-byte GPU table once. Call at model load time so the
+    /// per-request `JsonMode` dispatch in `generate_inner` doesn't
+    /// re-upload on every call.
+    pub fn prepare_constrainers(&mut self, assets: ConstrainerAssets) {
+        // Upload first-byte table to GPU once. Per-request sampler
+        // construction reads from `assets.token_bytes` directly; the
+        // GPU buffer is shared across all subsequent samplers.
+        let vocab = self.model.config.vocab_size as usize;
+        let mut fb = vec![0u32; vocab];
+        for (i, bytes) in assets.token_bytes.iter().enumerate() {
+            if i < vocab {
+                fb[i] = bytes.first().copied().unwrap_or(0) as u32;
+            }
+        }
+        let fb_bytes: Vec<u8> = fb.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.write_buffer(&self.model.state.first_bytes_buf, 0, &fb_bytes);
+        log::info!(
+            "[shady-thinker:{}] prepared constrainer assets: vocab={} tool_call=({},{})",
+            self.gpu.role_tag, vocab,
+            assets.tool_call_start_ids.len(), assets.tool_call_end_ids.len(),
+        );
+        self.constrainer_assets = Some(assets);
+    }
+
+    /// Configure `model.json_sampler` and `tool_call_config` from
+    /// `gpu.inference_config.json_mode` using the cached
+    /// `constrainer_assets`. Called at the start of each `generate_*`
+    /// path. Returns `true` when the per-request mode applied any
+    /// state — `reset_json_mode` only tears down what `apply_json_mode`
+    /// installed, leaving load-time-configured constrainers (e.g.
+    /// the Fast role's always-on JSON sampler) intact.
+    fn apply_json_mode(&mut self) -> bool {
+        let Some(ref assets) = self.constrainer_assets else { return false; };
+        match self.gpu.inference_config.json_mode {
+            common::handles::JsonMode::None => {
+                // Don't touch load-time-configured state.
+                false
+            }
+            common::handles::JsonMode::AnyJSON => {
+                let mut sampler = crate::json_sampler::JsonSampler::new(
+                    assets.token_bytes.clone(), assets.eos_ids.clone(),
+                );
+                sampler.set_min_keys(2);
+                sampler.enable_schema();
+                self.model.json_sampler = Some(sampler);
+                self.tool_call_config = None;
+                log::info!("[shady-thinker:{}] AnyJSON sampler engaged", self.gpu.role_tag);
+                true
+            }
+            common::handles::JsonMode::ToolOnly | common::handles::JsonMode::ThinkingWithTools => {
+                if assets.tool_call_start_ids.is_empty() || assets.tool_call_end_ids.is_empty() {
+                    log::warn!(
+                        "[shady-thinker:{}] {:?} requested but tool_call markers not in vocab",
+                        self.gpu.role_tag, self.gpu.inference_config.json_mode,
+                    );
+                    return false;
+                }
+                self.tool_call_config = Some(ToolCallConfig {
+                    tool_call_start_ids: assets.tool_call_start_ids.clone(),
+                    tool_call_end_ids: assets.tool_call_end_ids.clone(),
+                });
+                // JsonSampler stays None — the decode-loop state machine
+                // engages it dynamically on `<tool_call>` detection.
+                self.model.json_sampler = None;
+                log::info!(
+                    "[shady-thinker:{}] tool-call constrainer engaged (mode={:?})",
+                    self.gpu.role_tag, self.gpu.inference_config.json_mode,
+                );
+                true
+            }
+        }
+    }
+
+    /// Reset per-request constrainer state after a `generate_*` pass
+    /// when `apply_json_mode` returned `true`. Idempotent on `false` —
+    /// load-time-configured constrainers (Fast role's always-on
+    /// sampler, etc.) stay intact across `JsonMode::None` requests.
+    fn reset_json_mode(&mut self, was_applied: bool) {
+        if was_applied {
+            self.model.json_sampler = None;
+            self.tool_call_config = None;
+        }
     }
 
     /// Load the ASR audio encoder from the model directory.
@@ -892,7 +1001,17 @@ impl InferenceSession {
         inject_think: bool,
         dispatcher: Option<&dyn EpiphanyDispatcher>,
     ) -> GenerateResult {
+        // Configure constrainers from this request's `JsonMode` before
+        // anything else touches the sampler. The boolean is `true`
+        // only when a per-request mode (AnyJSON / ToolOnly /
+        // ThinkingWithTools) installed state — `JsonMode::None` is a
+        // no-op and leaves load-time-configured constrainers (e.g.
+        // Fast role's always-on JSON sampler) untouched. We reset on
+        // every exit path with that same boolean so the teardown is
+        // symmetric.
+        let json_mode_applied = self.apply_json_mode();
         if input_ids.is_empty() {
+            self.reset_json_mode(json_mode_applied);
             return GenerateResult {
                 token_ids: Vec::new(), token_count: 0,
                 tokens_per_sec: 0.0, state: GenerateState::Complete, epiphany_count: 0,
@@ -1314,6 +1433,11 @@ impl InferenceSession {
         let tps = if count > 0 { count as f64 / elapsed.as_secs_f64() } else { 0.0 };
         log::info!("[shady-thinker:{}] decode: {} tokens in {:.0}ms ({:.1} tok/s), {} epiphanies",
             self.gpu.role_tag, count, elapsed.as_millis(), tps, epiphany_count);
+
+        // Reset constrainer state so a stale sampler from this
+        // request can't bleed into the next one — but only if we
+        // actually installed something; load-time configs survive.
+        self.reset_json_mode(json_mode_applied);
 
         GenerateResult {
             token_ids: generated,
