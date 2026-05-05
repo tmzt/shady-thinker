@@ -198,6 +198,13 @@ pub struct InferenceSession {
     /// loop to skip a re-load when the next request's prefix key
     /// matches what's already in memory.
     pub current_prefix_key: Option<String>,
+    /// FNV-1a hash of every byte committed to this session's KV cache,
+    /// as carried in the v3 cache file header. 0 when no cache has
+    /// been loaded, or when a v2 file (which doesn't carry the field)
+    /// was loaded. Callers compare against the chat-host-supplied
+    /// expected hash before treating the cache as authoritative;
+    /// mismatch → fall back to a fresh prefill.
+    pub session_cache_hash: u64,
     /// Optional ASR encoder for audio input (Qwen3-ASR models).
     pub asr_encoder: Option<crate::asr_encoder::AsrEncoder>,
     /// ASR-specific prefix cache (built by asr_decoder, not from system prompt text).
@@ -275,7 +282,7 @@ impl InferenceSession {
         // One sync here ensures the GPU has all weights before the first forward pass.
         gpu.flush_and_wait();
 
-        let mut session = Self { model, gpu: GpuRequestContext::new(gpu), config, think_config: None, tool_call_config: None, constrainer_assets: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, asr_encoder: None, asr_prefix_cache: None };
+        let mut session = Self { model, gpu: GpuRequestContext::new(gpu), config, think_config: None, tool_call_config: None, constrainer_assets: None, prefix_len: 0, prefix_snapshot: None, current_prefix_key: None, session_cache_hash: 0, asr_encoder: None, asr_prefix_cache: None };
 
         // Warm-up: run one token through the model to force Vulkan pipeline compilation.
         // This makes the first real inference fast (cache hit instead of JIT compile).
@@ -835,7 +842,7 @@ impl InferenceSession {
 
     /// Save the full conversation KV state (up to `model.seq_len` tokens).
     /// Same binary v2 format as prefix cache — the loader doesn't distinguish.
-    pub fn save_session_cache(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    pub fn save_session_cache(&mut self, path: &std::path::Path, cache_hash: u64) -> std::io::Result<()> {
         use std::io::Write;
         let nkv  = self.config.num_key_value_heads as u64;
         let hd   = self.config.head_dim as u64;
@@ -853,14 +860,21 @@ impl InferenceSession {
         let hist_bytes  = 3 * dn_total_ch * 4;
         let state_bytes = dn_nhv * dn_kd * dn_vd * 4;
 
+        // v3 header is 8 bytes longer than v2 (cache_hash u64 inserted
+        // after seq_len). Buffer capacity bumped accordingly.
         let mut buf = Vec::with_capacity(
-            44 + attn_layers.len() * (4 + 2 * sa_stride as usize)
+            52 + attn_layers.len() * (4 + 2 * sa_stride as usize)
                + num_linear * (4 + hist_bytes as usize + state_bytes as usize),
         );
 
         buf.write_all(&0xCA5E_CAFE_u32.to_le_bytes())?;
-        buf.write_all(&2_u32.to_le_bytes())?;
+        buf.write_all(&3_u32.to_le_bytes())?;
         buf.write_all(&(self.model.seq_len).to_le_bytes())?;
+        // v3-only: chat-host-supplied FNV-1a hash of committed
+        // conversation content. Loader stores this on
+        // `session_cache_hash` so the next Append request can verify
+        // the on-disk state matches what the chat-host expects.
+        buf.write_all(&cache_hash.to_le_bytes())?;
         buf.write_all(&(attn_layers.len() as u32).to_le_bytes())?;
         buf.write_all(&(nkv as u32).to_le_bytes())?;
         buf.write_all(&(hd  as u32).to_le_bytes())?;
@@ -869,6 +883,9 @@ impl InferenceSession {
         buf.write_all(&(dn_nhv as u32).to_le_bytes())?;
         buf.write_all(&(dn_kd  as u32).to_le_bytes())?;
         buf.write_all(&(dn_vd  as u32).to_le_bytes())?;
+        // Stash the hash on the session so callers querying after
+        // save can read it without rereading the file.
+        self.session_cache_hash = cache_hash;
 
         let readback_timeout = std::time::Duration::from_secs(20);
 
@@ -934,6 +951,7 @@ impl InferenceSession {
 
         match version {
             2 => self.try_load_prefix_cache_v2(data),
+            3 => self.try_load_prefix_cache_v3(data),
             v => { log::warn!("[shady-thinker:{}] prefix cache: unsupported version {v}", self.gpu.role_tag); false }
         }
     }
@@ -1023,7 +1041,101 @@ impl InferenceSession {
         self.model.seq_len = plen;
         self.prefix_len = plen;
         self.prefix_snapshot = Some(PrefixSnapshot { kv: snap_kv, dn: snap_dn });
+        // v2 had no cache_hash field — leave it at 0 so callers
+        // doing hash verification know to treat the cache as
+        // unverifiable (and either accept or fall back).
+        self.session_cache_hash = 0;
         log::info!("[shady-thinker:{}] loaded prefix cache v2: prefix_len={plen} \
+            ({n_sa_layers} sa + {n_la_layers} la layers, {} bytes)", self.gpu.role_tag, data.len());
+        true
+    }
+
+    /// v3 = v2 + 8-byte `cache_hash` field after `seq_len`. Otherwise
+    /// identical layout. Same KV / DeltaNet validation.
+    fn try_load_prefix_cache_v3(&mut self, data: &[u8]) -> bool {
+        if data.len() < 52 { return false; }
+        let plen        = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let cache_hash  = u64::from_le_bytes(data[12..20].try_into().unwrap());
+        let n_sa_layers = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        let nkv         = u32::from_le_bytes(data[24..28].try_into().unwrap());
+        let hd          = u32::from_le_bytes(data[28..32].try_into().unwrap());
+        let n_la_layers = u32::from_le_bytes(data[32..36].try_into().unwrap());
+        let dn_total_ch = u32::from_le_bytes(data[36..40].try_into().unwrap());
+        let dn_nhv      = u32::from_le_bytes(data[40..44].try_into().unwrap());
+        let dn_kd       = u32::from_le_bytes(data[44..48].try_into().unwrap());
+        let dn_vd       = u32::from_le_bytes(data[48..52].try_into().unwrap());
+
+        if nkv != self.config.num_key_value_heads || hd != self.config.head_dim {
+            log::warn!("[shady-thinker:{}] prefix cache v3: KV dim mismatch ({nkv}×{hd} vs {}×{})",
+                self.gpu.role_tag, self.config.num_key_value_heads, self.config.head_dim);
+            return false;
+        }
+        let exp_nhv = self.config.linear_num_value_heads;
+        let exp_kd  = self.config.linear_key_head_dim;
+        let exp_vd  = self.config.linear_value_head_dim;
+        let exp_nkh = self.config.linear_num_key_heads;
+        let exp_ch  = exp_nkh * exp_kd * 2 + exp_nhv * exp_vd;
+        if dn_nhv != exp_nhv || dn_kd != exp_kd || dn_vd != exp_vd || dn_total_ch != exp_ch {
+            log::warn!("[shady-thinker:{}] prefix cache v3: DeltaNet dim mismatch", self.gpu.role_tag);
+            return false;
+        }
+
+        let sa_stride   = plen as usize * nkv as usize * hd as usize * 4;
+        let hist_bytes  = 3 * dn_total_ch as usize * 4;
+        let state_bytes = dn_nhv as usize * dn_kd as usize * dn_vd as usize * 4;
+
+        let num_layers  = self.model.weights.layers.len();
+        let mut snap_kv = vec![(Vec::new(), Vec::new()); num_layers];
+        let mut snap_dn = Vec::with_capacity(n_la_layers as usize);
+
+        let mut pos = 52usize;
+
+        for _ in 0..n_sa_layers {
+            if pos + 4 + 2 * sa_stride > data.len() {
+                log::warn!("[shady-thinker:{}] prefix cache v3: truncated (sa section)", self.gpu.role_tag);
+                return false;
+            }
+            let li = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if li >= self.model.state.k_cache.len() {
+                log::warn!("[shady-thinker:{}] prefix cache v3: sa layer {li} out of range", self.gpu.role_tag);
+                return false;
+            }
+            self.gpu.write_buffer(&self.model.state.k_cache[li], 0, &data[pos..pos+sa_stride]);
+            snap_kv[li].0 = data[pos..pos+sa_stride].to_vec();
+            pos += sa_stride;
+            self.gpu.write_buffer(&self.model.state.v_cache[li], 0, &data[pos..pos+sa_stride]);
+            snap_kv[li].1 = data[pos..pos+sa_stride].to_vec();
+            pos += sa_stride;
+        }
+
+        let num_linear = self.model.state.deltanet_hist.len();
+        for lin_idx in 0..(n_la_layers as usize) {
+            if pos + 4 + hist_bytes + state_bytes > data.len() {
+                log::warn!("[shady-thinker:{}] prefix cache v3: truncated (la section)", self.gpu.role_tag);
+                return false;
+            }
+            let _layer_idx = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+            pos += 4;
+            if lin_idx >= num_linear {
+                log::warn!("[shady-thinker:{}] prefix cache v3: lin_idx {lin_idx} out of range", self.gpu.role_tag);
+                return false;
+            }
+            self.gpu.write_buffer(&self.model.state.deltanet_hist[lin_idx],  0, &data[pos..pos+hist_bytes]);
+            let h = data[pos..pos+hist_bytes].to_vec();
+            pos += hist_bytes;
+            self.gpu.write_buffer(&self.model.state.deltanet_state[lin_idx], 0, &data[pos..pos+state_bytes]);
+            let s = data[pos..pos+state_bytes].to_vec();
+            pos += state_bytes;
+            snap_dn.push((h, s));
+        }
+
+        self.gpu.flush_and_wait();
+        self.model.seq_len = plen;
+        self.prefix_len = plen;
+        self.prefix_snapshot = Some(PrefixSnapshot { kv: snap_kv, dn: snap_dn });
+        self.session_cache_hash = cache_hash;
+        log::info!("[shady-thinker:{}] loaded prefix cache v3: prefix_len={plen} cache_hash={cache_hash:016x} \
             ({n_sa_layers} sa + {n_la_layers} la layers, {} bytes)", self.gpu.role_tag, data.len());
         true
     }
