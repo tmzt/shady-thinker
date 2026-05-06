@@ -1436,6 +1436,15 @@ impl InferenceSession {
         let tc_config_start = self.tool_call_config.as_ref().map(|c| c.tool_call_start_ids.clone());
         let tc_config_end = self.tool_call_config.as_ref().map(|c| c.tool_call_end_ids.clone());
         let think_end = self.think_config.as_ref().map(|c| c.think_end_ids.clone());
+        // Track whether the model is currently inside a `<think>` block
+        // for the purposes of *streaming* tokens to the caller. Distinct
+        // from `gen_state` (which only flips for tool_call_config-bearing
+        // models / Fast thinker). When think-injection is active we
+        // start inside; once `</think>` is detected in `generated`
+        // (whether emitted by the model or auto-injected by the
+        // dispatcher after a tool_response), `inside_think` flips false
+        // and per-token `stream_tx` emissions begin.
+        let mut inside_think = self.think_config.is_some() && think_end.is_some();
 
         // Track whether `</think>` has been emitted naturally so we
         // can force-inject it before the budget runs out — otherwise
@@ -1657,22 +1666,39 @@ impl InferenceSession {
                 self.gpu.stream_tx.is_some(),
                 self.gpu.stream_tokenizer.is_some());
 
+            // Flip inside_think → false the first time `</think>` is
+            // detected in `generated`. Stays false thereafter — the
+            // model isn't expected to re-open a think block within
+            // the same assistant turn.
+            if inside_think {
+                if let Some(ref end_ids) = think_end {
+                    if ends_with_ids(&generated, end_ids) {
+                        inside_think = false;
+                        log::info!("[shady-thinker:{}] streaming gate opened (</think> seen)", self.gpu.role_tag);
+                    }
+                }
+            }
+
             // Per-token streaming: when a tokenizer is installed on the
             // GpuContext for this generation, decode the new token so
             // its text is visible. The decoded text is always logged
             // (great for debugging — confirms the model is producing
             // something coherent without needing an SSE consumer).
-            // When `stream_tx` is also set we additionally push it as
-            // a `StreamChunk`; SSE / chat consumers drain that side.
+            // When `stream_tx` is also set AND we're past `</think>`,
+            // push the chunk to the SSE / chat consumer. Tokens inside
+            // the think block are logged but withheld from streaming
+            // so the chat pane sees only the user-facing reply text.
             if let Some(ref tok) = self.gpu.stream_tokenizer {
                 let text = tok.decode(&[token], true).unwrap_or_default();
                 if !text.is_empty() {
                     log::info!("[shady-thinker:{}] streaming token: {} → '{}'", self.gpu.role_tag, token, text);
-                    if let Some(ref tx) = self.gpu.stream_tx {
-                        let _ = tx.try_send(common::handles::StreamChunk {
-                            delta_text: text,
-                            finish_reason: None,
-                        });
+                    if !inside_think {
+                        if let Some(ref tx) = self.gpu.stream_tx {
+                            let _ = tx.try_send(common::handles::StreamChunk {
+                                delta_text: text,
+                                finish_reason: None,
+                            });
+                        }
                     }
                 }
             }
