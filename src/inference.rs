@@ -16,11 +16,22 @@ use crate::lora::LoraState;
 
 /// Query-length threshold below which the incremental-prefill path stays on
 /// per-token `forward_kv_only` instead of switching to batched
-/// `prefill_gptq` continuation. For tiny queries (chat-style follow-ups
-/// like "hello, how are you?") the per-token loop's overhead is negligible
-/// and avoids the batched path's per-call buffer allocation; for sizable
-/// queries (notes_classifier chunks, etc.) the batched path wins by ~20×.
-pub const SMALL_QUERY_THRESHOLD: usize = 32;
+/// `prefill_gptq` continuation.
+///
+/// Set to 0 — i.e., the batched path is always used. Original tuning was
+/// done on the 9B int4 fast model where per-token forward had negligible
+/// dispatch overhead and avoided the batched path's per-call buffer
+/// allocation. Measurements on the 14B GPTQ deep model show the opposite:
+/// per-token prefill runs at ~1.5 tok/s vs ~10 tok/s for the batched
+/// continuation path, an order of magnitude slower. The dispatch
+/// overhead per token dominates at deep-model scale, dwarfing the
+/// batched path's allocation cost.
+///
+/// Rather than tuning this per-model (the right answer probably varies
+/// with hidden_size × layers), default to batched everywhere. If a
+/// future small-model regression shows up, this can become a per-config
+/// knob.
+pub const SMALL_QUERY_THRESHOLD: usize = 0;
 
 /// Hash of all dispatched shader sources — used to key the Vulkan pipeline cache file.
 /// Any shader change produces a new hash, a new cache filename, and a fresh compilation.
