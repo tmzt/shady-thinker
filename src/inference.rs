@@ -1574,7 +1574,16 @@ impl InferenceSession {
                                     ToolCost::Instant => {
                                         // Execute inline, inject immediately
                                         let result = dispatcher.execute_sync(call_body);
-                                        let response = format!("\n<tool_response>\n{}\n</tool_response>\n", result.response);
+                                        // Auto-close `</think>` after the tool_response so the
+                                        // model is forced out of the think block on the next
+                                        // decode token — no risk of it generating a second
+                                        // tool_call or stopping mid-think without producing a
+                                        // user-visible reply. Multi-tool-per-turn chains are
+                                        // explicitly disallowed by the chitin system prompt.
+                                        let response = format!(
+                                            "\n<tool_response>\n{}\n</tool_response>\n</think>\n",
+                                            result.response,
+                                        );
                                         let response_ids = dispatcher.tokenize(&response);
 
                                         // Truncate to avoid blowing context window — max 512 tokens per tool response.
