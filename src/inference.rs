@@ -612,12 +612,17 @@ impl InferenceSession {
     }
 
     /// Prefill the KV cache with a fixed prefix (e.g., system prompt).
-    /// After this call, every generate() starts from prefix_len — the prefix
-    /// is never re-run. Call once after model load, before serving requests.
     /// Capture the current GPU state (KV caches + DeltaNet hist/state) into an
-    /// in-memory snapshot.  Called after set_prefix() and after loading a prefix
-    /// cache from disk so each generate() can restore from this snapshot cheaply.
-    pub(crate) fn capture_prefix_snapshot(&mut self) {
+    /// in-memory snapshot, sized by `self.prefix_len`. Called after
+    /// `set_prefix()` and after loading a prefix cache from disk so each
+    /// `generate()` can restore from this snapshot cheaply.
+    ///
+    /// Also called by `gpu_slot` post-turn for `add_turn` requests: the
+    /// caller sets `prefix_len = seq_len` (the post-turn position), invokes
+    /// this, and the in-memory snapshot is now the post-turn state — so the
+    /// next turn's auto-restore lands at "all prior turns committed" instead
+    /// of rewinding to the system-prompt baseline.
+    pub fn capture_prefix_snapshot(&mut self) {
         let nkv  = self.config.num_key_value_heads as u64;
         let hd   = self.config.head_dim as u64;
         let plen = self.prefix_len as u64;
