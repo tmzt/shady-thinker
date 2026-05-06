@@ -746,7 +746,34 @@ impl InferenceSession {
         eos_ids: &[u32],
         cancel: Option<&AtomicBool>,
     ) -> GenerateResult {
-        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, false, None)
+        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, false, None, false)
+    }
+
+    /// Append-mode generation: caller asserts `delta_ids` is the
+    /// new turn's delta, and a prefix snapshot is already loaded
+    /// via `try_load_prefix_cache`. Prefills `delta_ids` at
+    /// `pos_offset = prefix_len` (no slicing) and decodes. Errors
+    /// (empty result) if no prefix is loaded.
+    pub fn generate_append_tokens(
+        &mut self,
+        delta_ids: &[u32],
+        max_tokens: u32,
+        eos_ids: &[u32],
+        cancel: Option<&AtomicBool>,
+    ) -> GenerateResult {
+        self.generate_inner(delta_ids, max_tokens, eos_ids, cancel, true, None, true)
+    }
+
+    /// Append-mode + epiphanies (tool injection during decode).
+    pub fn generate_append_with_epiphanies(
+        &mut self,
+        delta_ids: &[u32],
+        max_tokens: u32,
+        eos_ids: &[u32],
+        cancel: Option<&AtomicBool>,
+        dispatcher: &dyn EpiphanyDispatcher,
+    ) -> GenerateResult {
+        self.generate_inner(delta_ids, max_tokens, eos_ids, cancel, true, Some(dispatcher), true)
     }
 
     /// Generate with think token injection (reasoning mode, no epiphanies).
@@ -1158,7 +1185,7 @@ impl InferenceSession {
         eos_ids: &[u32],
         cancel: Option<&AtomicBool>,
     ) -> GenerateResult {
-        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, true, None)
+        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, true, None, false)
     }
 
     /// Generate with think injection + RLM epiphanies.
@@ -1171,7 +1198,7 @@ impl InferenceSession {
         cancel: Option<&AtomicBool>,
         dispatcher: &dyn EpiphanyDispatcher,
     ) -> GenerateResult {
-        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, true, Some(dispatcher))
+        self.generate_inner(input_ids, max_tokens, eos_ids, cancel, true, Some(dispatcher), false)
     }
 
     fn generate_inner(
@@ -1182,6 +1209,7 @@ impl InferenceSession {
         cancel: Option<&AtomicBool>,
         inject_think: bool,
         dispatcher: Option<&dyn EpiphanyDispatcher>,
+        is_delta_only: bool,
     ) -> GenerateResult {
         // Configure constrainers from this request's `JsonMode` before
         // anything else touches the sampler. The boolean is `true`
@@ -1242,9 +1270,26 @@ impl InferenceSession {
             if use_gptq { "gptq-batch" } else { "kv-only-loop" });
         let first_decode_token = if use_gptq {
             // ── Phase 1: prefill ──
-            let use_incremental = self.prefix_len > 0
-                && self.prefix_snapshot.is_some()
-                && input_ids.len() > self.prefix_len as usize;
+            // Delta-only callers (generate_append_*) bring just the new
+            // turn's tokens and require a prefix snapshot to be loaded
+            // already. Non-delta callers pass the full prompt; the
+            // existing length-vs-prefix_len comparison decides whether
+            // an incremental path is safe.
+            if is_delta_only && (self.prefix_len == 0 || self.prefix_snapshot.is_none()) {
+                log::warn!(
+                    "[shady-thinker:{}] generate_append_tokens called without a loaded prefix snapshot — bailing",
+                    self.gpu.role_tag,
+                );
+                self.reset_json_mode(json_mode_applied);
+                return GenerateResult {
+                    token_ids: Vec::new(), token_count: 0,
+                    tokens_per_sec: 0.0, state: GenerateState::Complete, epiphany_count: 0,
+                };
+            }
+            let use_incremental = is_delta_only
+                || (self.prefix_len > 0
+                    && self.prefix_snapshot.is_some()
+                    && input_ids.len() > self.prefix_len as usize);
 
             if use_incremental {
                 // Restore prefix snapshot, then prefill only the new query tail.
@@ -1254,7 +1299,14 @@ impl InferenceSession {
                 // you?") fall back to the per-token forward path — its
                 // setup overhead is negligible there.
                 self.restore_prefix_snapshot();
-                let query_ids = &input_ids[self.prefix_len as usize..];
+                // Delta-only callers pass the delta directly; non-delta
+                // callers pass the full prompt and we slice off the
+                // already-cached prefix.
+                let query_ids: &[u32] = if is_delta_only {
+                    input_ids
+                } else {
+                    &input_ids[self.prefix_len as usize..]
+                };
                 let n_query = query_ids.len();
                 if n_query <= SMALL_QUERY_THRESHOLD {
                     // forward_kv_only is preferred for very short queries:
