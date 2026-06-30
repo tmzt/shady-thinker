@@ -1702,6 +1702,12 @@ impl InferenceSession {
                             let _ = tx.try_send(common::handles::StreamChunk {
                                 delta_text: text,
                                 finish_reason: None,
+                                // `phase` was added to common::handles::StreamChunk on
+                                // main-drm to support per-card streaming subchannels
+                                // (text vs thinking). shady-thinker doesn't emit
+                                // thinking blocks here — None preserves "visible
+                                // answer text" semantics.
+                                phase: None,
                             });
                         }
                     }
